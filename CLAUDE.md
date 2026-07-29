@@ -6,8 +6,9 @@ Single Next.js app (App Router) — one repo, one Node.js runtime. Full architec
 Next.js 16 + React 19 · TypeScript · LangChain JS (prebuilt agent from @langchain/langgraph) · OpenAI/OpenRouter · Playwright (Node) · Prisma + PostgreSQL · Zod · Clerk · Inngest · Pino · LangSmith
 
 ## Commands
-- `pnpm dev` — run locally
-- `pnpm build && pnpm start` — production build
+- `npm run dev` — run locally
+- `npm run build && npm start` — production build
+- `npm run lint` — ESLint
 - `npx prisma migrate dev` — DB migrations (once Prisma is wired)
 - `npx prisma studio` — inspect the DB
 
@@ -23,4 +24,4 @@ Next.js 16 + React 19 · TypeScript · LangChain JS (prebuilt agent from @langch
 - Route Handlers stay thin: auth → Zod validation → service call → stream. Logic lives in `src/services/<name>/`.
 - Tools in `src/tools/` are thin adapters over services — no scraping, SQL, or rendering inside a tool.
 - Secrets come only from env, validated in `src/lib/env.ts`. Never log secrets; Pino redaction paths cover credentials, cookies, storageState, authorization headers.
-- Prefer editing existing files over creating new ones; keep the project tree matching docs/ARCHITECTURE.md Section 18.
+- Prefer editing existing files over creating new ones; keep the project tree matching docs/ARCHITECTURE.md Section 18, with one deliberate deviation: the App Router lives at `src/app/`, not the root `app/` shown in Section 18. Everything else under `src/` matches. Route Handlers therefore live at `src/app/api/<name>/route.ts`.
