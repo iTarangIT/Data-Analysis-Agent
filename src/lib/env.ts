@@ -3,12 +3,20 @@ import { z } from "zod";
 /**
  * Zod-validated environment (SAD §16 Configuration).
  *
- * Milestone 1 validates only the variables the interactive agent loop needs.
- * Later milestones extend this schema — DATABASE_URL, CLERK_*, INNGEST_*,
- * CREDENTIAL_ENCRYPTION_KEY, SESSION_STORE_DIR — as those features land.
- * A missing or malformed variable fails at boot, never at request time.
+ * Milestone 1 validated the variables the interactive agent loop needs;
+ * Milestone 2A adds DATABASE_URL. Later milestones extend this schema —
+ * CLERK_*, INNGEST_*, CREDENTIAL_ENCRYPTION_KEY, SESSION_STORE_DIR — as those
+ * features land. A missing or malformed variable fails at boot, never at
+ * request time.
  */
 const envSchema = z.object({
+  DATABASE_URL: z
+    .string()
+    .min(1, "DATABASE_URL must not be empty")
+    .refine(
+      (url) => url.startsWith("postgresql://") || url.startsWith("postgres://"),
+      "DATABASE_URL must be a PostgreSQL connection string"
+    ),
   OPENROUTER_API_KEY: z.string().min(1, "OPENROUTER_API_KEY must not be empty"),
   OPENROUTER_MODEL: z.string().min(1, "OPENROUTER_MODEL must not be empty"),
   OPENROUTER_BASE_URL: z.string().min(1).default("https://openrouter.ai/api/v1"),

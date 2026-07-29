@@ -9,8 +9,8 @@ Next.js 16 + React 19 · TypeScript · LangChain JS (prebuilt agent from @langch
 - `npm run dev` — run locally
 - `npm run build && npm start` — production build
 - `npm run lint` — ESLint
-- `npx prisma migrate dev` — DB migrations (once Prisma is wired)
-- `npx prisma studio` — inspect the DB
+- `npm run db:migrate` — create/apply a migration · `db:status`, `db:deploy`, `db:generate`
+- `npm run db:studio` — inspect the DB
 
 ## Hard rules — never violate
 1. The agent NEVER touches credentials, cookies, tokens, or Playwright storageState. Only `src/services/credentials/` and `src/services/session/` may.
@@ -23,5 +23,6 @@ Next.js 16 + React 19 · TypeScript · LangChain JS (prebuilt agent from @langch
 ## Conventions
 - Route Handlers stay thin: auth → Zod validation → service call → stream. Logic lives in `src/services/<name>/`.
 - Tools in `src/tools/` are thin adapters over services — no scraping, SQL, or rendering inside a tool.
+- Prisma: schema at `prisma/schema.prisma`, CLI config at `prisma.config.ts` (loads `.env.local` — `DATABASE_URL` has exactly one home, never a committed default). Generated client at `src/generated/prisma`, gitignored and rebuilt by `postinstall`. Telemetry is imported manually — no seed script (docs/DATA-IMPORT.md).
 - Secrets come only from env, validated in `src/lib/env.ts`. Never log secrets; Pino redaction paths cover credentials, cookies, storageState, authorization headers.
 - Prefer editing existing files over creating new ones; keep the project tree matching docs/ARCHITECTURE.md Section 18, with one deliberate deviation: the App Router lives at `src/app/`, not the root `app/` shown in Section 18. Everything else under `src/` matches. Route Handlers therefore live at `src/app/api/<name>/route.ts`.

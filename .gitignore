@@ -39,3 +39,10 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# prisma — generated client is rebuilt by `prisma generate` (npm postinstall).
+# prisma/migrations/ is NOT ignored: migrations are source of truth and must be committed.
+/src/generated/
+
+# telemetry datasets — imported manually, never committed (see docs/DATA-IMPORT.md)
+/data/

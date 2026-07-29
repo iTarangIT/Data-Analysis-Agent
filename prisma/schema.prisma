@@ -1,0 +1,142 @@
+// Tarang — Prisma schema (SAD §12 Database Architecture).
+//
+// Derived from the Battery, GPS and CAN telemetry datasets in data/samples/,
+// not from generic models. Telemetry is imported manually (docs/DATA-IMPORT.md);
+// there is no seed script.
+//
+// Conventions applied throughout:
+//   - Tables and columns are snake_case, so manual `\copy` in psql needs no
+//     quoted identifiers. Column names mirror the CSV headers wherever the
+//     source column survives unchanged.
+//   - Physical measurements are Decimal, never Float. The CAN sample already
+//     shows float artifacts (battery_temp = 47.150000000000034); Decimal keeps
+//     aggregates exact for the Analysis Tool.
+//   - Timestamps are timestamptz(3). The datasets are UTC with millisecond
+//     precision ("2026-06-16 23:56:34.784+00").
+//   - Every measurement column is nullable. The Battery sample has five 100%
+//     empty columns and one 99% empty, and 100 rows cannot prove non-nullability
+//     at scale. Tightening a column later is a cheap migration; a failed bulk
+//     import halfway through a large file is not.
+//   - No unique constraint on (vehicle, recorded_at). GPS holds 47 duplicate
+//     rows and CAN 21; both are byte-identical, so deduplication happens during
+//     import (docs/DATA-IMPORT.md §6), per the agreed design decision.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// Vehicle dimension — the shared join key for all three telemetry tables.
+/// `vehicle_no` is the fleet identifier carried by every dataset
+/// (format TK-#####-##@@-######, uniform across all 300 sample rows). It is
+/// unique but not the primary key: a surrogate bigint keeps the foreign key in
+/// the telemetry tables 8 bytes wide instead of ~20.
+model Vehicle {
+  id        BigInt   @id @default(autoincrement())
+  vehicleNo String   @unique @map("vehicle_no")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  batteryTelemetry BatteryTelemetry[]
+  gpsTelemetry     GpsTelemetry[]
+  canTelemetry     CanTelemetry[]
+
+  @@map("vehicles")
+}
+
+/// Battery telemetry — source: data/samples/telemetry_battery.csv
+///
+/// Kept separate from CanTelemetry by design, despite CAN's payload carrying
+/// overlapping quantities (soc, soh, current, battery_voltage, battery_temp).
+/// The two are distinct feeds and are not merged.
+///
+/// pack_voltage, pack_temp_c, cell_min_mv, cell_max_mv and charging are empty
+/// in the sample; their types and units below follow the column names and the
+/// field spec, and are the one part of this model not confirmed by data.
+model BatteryTelemetry {
+  id         BigInt   @id @default(autoincrement())
+  vehicleId  BigInt   @map("vehicle_id")
+  recordedAt DateTime @map("recorded_at") @db.Timestamptz(3)
+
+  socPct      Decimal? @map("soc_pct") @db.Decimal(5, 2) // percent
+  sohPct      Decimal? @map("soh_pct") @db.Decimal(5, 2) // percent
+  packVoltage Decimal? @map("pack_voltage") @db.Decimal(8, 3) // volts   — empty in sample
+  packCurrent Decimal? @map("pack_current") @db.Decimal(8, 3) // amperes
+  packTempC   Decimal? @map("pack_temp_c") @db.Decimal(6, 2) // °C      — empty in sample
+  cellMinMv   Int?     @map("cell_min_mv") // millivolts — empty in sample
+  cellMaxMv   Int?     @map("cell_max_mv") // millivolts — empty in sample
+  charging    Boolean? // empty in sample
+
+  ingestedAt DateTime @default(now()) @map("ingested_at") @db.Timestamptz(3)
+
+  vehicle Vehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  @@index([vehicleId, recordedAt])
+  @@index([recordedAt])
+  @@map("battery_telemetry")
+}
+
+/// GPS telemetry — source: data/samples/telemetry_gps.csv
+///
+/// Fields are preserved exactly as received. Two known contradictions in the
+/// sample are stored as-is rather than corrected or reinterpreted:
+///   - `ignition` is always false while `speed_kph` reaches 27.2
+///   - `ext_voltage` reads 53–57 V, which is pack-level, not an auxiliary
+///     supply. It is NOT merged with BatteryTelemetry.packVoltage.
+model GpsTelemetry {
+  id         BigInt   @id @default(autoincrement())
+  vehicleId  BigInt   @map("vehicle_id")
+  recordedAt DateTime @map("recorded_at") @db.Timestamptz(3)
+
+  lat        Decimal? @db.Decimal(9, 6) // degrees, WGS84
+  lon        Decimal? @db.Decimal(9, 6) // degrees, WGS84
+  speedKph   Decimal? @map("speed_kph") @db.Decimal(6, 2) // km/h
+  heading    Decimal? @db.Decimal(5, 2) // degrees, 0–360
+  ignition   Boolean?
+  gpsFix     Boolean? @map("gps_fix")
+  extVoltage Decimal? @map("ext_voltage") @db.Decimal(6, 2) // volts
+
+  ingestedAt DateTime @default(now()) @map("ingested_at") @db.Timestamptz(3)
+
+  vehicle Vehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  @@index([vehicleId, recordedAt])
+  @@index([recordedAt])
+  @@map("gps_telemetry")
+}
+
+/// CAN telemetry — source: data/samples/telemetry_can.csv
+///
+/// The payload is stored raw and unflattened. It is a nested map of
+/// signal -> { value, timestamp }, holding ~112 distinct signals of which any
+/// given row carries between 44 and 112. Flattening would mean 112 mostly-null
+/// columns AND would discard the per-signal timestamps — which are not
+/// decorative: `recorded_at` equals only the freshest signal's timestamp, while
+/// other signals in the same row can be days older (one sample row carries an
+/// `mfh` reading stamped six days before its row time). Most rows carry three
+/// distinct signal timestamps.
+///
+/// Stored as jsonb. PostgreSQL represents jsonb numbers as arbitrary-precision
+/// `numeric`, so the oversized BMS identifiers (bms_serial_no_1 ≈ 3.47e18,
+/// beyond the 2^53 exact-integer limit) survive the database intact. They do
+/// NOT survive being read through a JavaScript number — extract those fields as
+/// text in SQL (`payload -> 'bms_serial_no_1' ->> 'value'`) and handle them as
+/// strings, per the agreed design decision.
+model CanTelemetry {
+  id         BigInt   @id @default(autoincrement())
+  vehicleId  BigInt   @map("vehicle_id")
+  recordedAt DateTime @map("recorded_at") @db.Timestamptz(3)
+
+  payload Json @db.JsonB
+
+  ingestedAt DateTime @default(now()) @map("ingested_at") @db.Timestamptz(3)
+
+  vehicle Vehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
+  @@index([vehicleId, recordedAt])
+  @@index([recordedAt])
+  @@map("can_telemetry")
+}

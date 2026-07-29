@@ -298,11 +298,18 @@ PostgreSQL, accessed exclusively through Prisma, is the system of record for eve
 | User / UserSettings    | Application users (linked to the Clerk user ID) and their preferences                     |
 | CredentialVault        | Encrypted Intellicar credentials: ciphertext, IV, auth tag, key version — never plaintext |
 | PortalSession          | Session metadata only: status, last validated time, storage reference — never raw cookies |
-| TelemetryReading       | Historical battery / fleet telemetry                                                      |
+| Vehicle                | Vehicle / device dimension; the shared join key for all three telemetry tables            |
+| BatteryTelemetry       | Historical battery telemetry, typed to the Battery dataset                                |
+| GpsTelemetry           | Historical position and movement telemetry, typed to the GPS dataset                      |
+| CanTelemetry           | Historical CAN bus telemetry, typed to the CAN dataset                                    |
 | Conversation / Message | Chat threads; the persistence layer for short-term memory                                 |
 | UserMemory             | Long-term memory entries: preferred fleet, dashboard, FAQs, business context              |
 | Report                 | Generated report metadata and file references                                             |
 | AuditLog               | Security-relevant events: credential and session operations, logins, report access        |
+
+Telemetry is modelled as three dataset-shaped tables rather than one generic reading table. The Battery, GPS and CAN datasets carry genuinely different columns, and a single wide table would be mostly nulls and would hide unit and precision differences behind a shared column name. They join through the Vehicle dimension on (vehicleId, recordedAt). Telemetry is loaded manually from files (see docs/DATA-IMPORT.md); there is no seed script.
+
+Prisma 7 note: the client has no built-in database driver — a WASM query compiler builds query plans and a driver adapter (@prisma/adapter-pg) executes them. The adapter is constructed from the same DATABASE_URL and is confined to src/lib/prisma.ts; nothing else in the system observes it.
 
 Two rules are absolute: raw credentials and browser cookies never enter the database, and the agent's raw-SQL escape hatch is SELECT-only, executed under a read-only database role.
 
