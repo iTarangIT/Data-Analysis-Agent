@@ -18,6 +18,18 @@ export interface ToolResult<TData = unknown> {
   data: TData;
   /** How the value was computed — merged into source.method (SAD §6). */
   method?: Record<string, unknown>;
+  /**
+   * Where this particular result came from, overriding the spec's origin.
+   *
+   * A tool reading a single source declares `origin` once on its spec and never
+   * sets this. A tool that can read several — the Analysis Tool reports metrics
+   * from three telemetry tables — must name the one it actually used, or the
+   * Sources block would attribute a CAN signal to battery_telemetry. The
+   * registry still builds the envelope and still owns its format (CLAUDE.md
+   * rule 2); this only lets a multi-source tool be truthful about which source
+   * answered.
+   */
+  origin?: string;
 }
 
 export interface ToolSpec<TSchema extends z.ZodObject = z.ZodObject> {
@@ -27,7 +39,11 @@ export interface ToolSpec<TSchema extends z.ZodObject = z.ZodObject> {
   description: string;
   /** Zod schema validating tool input. */
   schema: TSchema;
-  /** Where the data came from, recorded in every envelope. */
+  /**
+   * Where the data came from, recorded in every envelope. A result may override
+   * it per call (see ToolResult.origin); for a multi-source tool this is the
+   * fallback used when the handler throws before a source is chosen.
+   */
   origin: string;
   handler: (
     input: z.output<TSchema>
@@ -53,7 +69,7 @@ function defineTool<TSchema extends z.ZodObject>(spec: ToolSpec<TSchema>) {
           data: result.data,
           source: {
             tool: spec.name,
-            origin: spec.origin,
+            origin: result.origin ?? spec.origin,
             params,
             timestamp,
             ...(result.method ? { method: result.method } : {}),

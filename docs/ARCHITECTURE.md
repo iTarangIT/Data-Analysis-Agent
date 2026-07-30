@@ -542,6 +542,22 @@ tarang-agent/
 
 - SQL-first analytics in TypeScript replaces Pandas. Battery analytics at Level 1 — degradation trends, cycle counts, utilisation — is aggregation, which PostgreSQL does natively; TypeScript finishes the last mile. A Python analytics worker is deliberately deferred until a genuinely statistical workload appears.
 
+- One authoritative feed per quantity (Milestone 2C). The three telemetry feeds carry overlapping quantities: battery_telemetry has its own pack_voltage / pack_current / pack_temp_c, can_telemetry carries its own soh, and gps_telemetry carries a pack-level ext_voltage. Each user-facing quantity is therefore assigned to exactly one feed, so a reported number cannot change meaning depending on which table answered it:
+
+  | Quantity | Authoritative feed |
+  |---|---|
+  | State of health | battery_telemetry.soh_pct |
+  | State of charge, pack voltage, pack current, pack temperature, charge cycles, all cell-level metrics | can_telemetry payload signals |
+  | Location and speed — and nothing else | gps_telemetry |
+
+  These assignments are architectural decisions, not inferences from which columns happen to be populated in the current sample. Reassigning any of them — including switching state of health to the CAN soh / soh_1 signals — requires an explicit design decision amending this section, never a silent reaction to a new dataset. Two exclusions are part of the decision: gps_telemetry.ignition is not exposed at all (it reads false in every sampled row while speed reaches 27.2 km/h), and where CAN carries competing signals for one quantity the catalogue names the winner and records why the alternatives were rejected.
+
+- Metric catalogue lives in the Analysis Tool, not in an analytics service (Milestone 2C). Milestone 2C exposes latest-value readouts: one measured signal each, with the time it was measured. That is retrieval and mapping, not analysis, so it stays in src/tools/analysis.tool.ts as a pure catalogue over the JSON records the Database Tool returns. src/services/analytics/ is deliberately not created until there is real analysis to put in it — trends, degradation, cycle-rate and utilisation — which is also why alarm and protection bitfield decoding is deferred: it needs a firmware bit map that is not available.
+
+- Per-result source attribution for multi-source tools (Milestone 2C). ToolResult carries an optional origin that overrides the spec's, because the Analysis Tool now reads three tables and a fixed spec-level origin would attribute a CAN signal to battery_telemetry in the user-facing Sources block. The Tool Registry still builds and owns the envelope (Section 6); the override only lets a tool name the source that actually answered. A single-source tool declares origin once on its spec and never sets it.
+
+- Missing telemetry is reported, not thrown (Milestone 2C). A vehicle with no rows in a feed, or a row whose signal is absent or holds a placeholder, returns available: false with a human-readable reason and a null value — never a zero standing in for absence. Only genuine faults (an unregistered vehicle, a failed query) become envelope errors. This keeps a metric's identity and provenance intact instead of collapsing them into an error string, and matches the Database Service's existing treatment of an empty time window as an answer rather than a failure.
+
 - Script Runner deferred to Level 2. Arbitrary LLM-generated code execution is the highest-risk, lowest-value tool at this stage and overlaps the Analysis Tool. It returns at Level 2 as a properly sandboxed capability (isolated process or ephemeral container).
 
 - Playwright doubles as the PDF engine. page.pdf() on the already-managed Chromium avoids a second headless-browser dependency for reports.
