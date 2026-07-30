@@ -13,7 +13,7 @@ Next.js 16 + React 19 · TypeScript · LangChain JS (prebuilt agent from @langch
 - `npm run db:studio` — inspect the DB
 
 ## Hard rules — never violate
-1. The agent NEVER touches credentials, cookies, tokens, or Playwright storageState. Only `src/services/credentials/` and `src/services/session/` may.
+1. The agent NEVER touches credentials, cookies, tokens, or Playwright storageState. Only `src/services/credentials/` and `src/services/session/` may. Authentication is never agent-callable at any level — no tool, no registry entry, no prompt text. A service asks `withAuthenticatedContext()` for a context; a tool never does. Enforced in both directions by the import zones in `eslint.config.mjs`.
 2. Every tool result is wrapped by the Tool Registry in the source envelope `{ data, source: { tool, origin, params, timestamp } }`. Numeric claims in answers must cite envelope sources from tool calls that actually ran — never invented ones.
 3. `/api/chat` runs ONLY the interactive agent loop. Everything else (reports, scheduled sync, email, approvals) is emitted as an Inngest event.
 4. The Playwright browser and PrismaClient are `globalThis` singletons.
@@ -24,5 +24,6 @@ Next.js 16 + React 19 · TypeScript · LangChain JS (prebuilt agent from @langch
 - Route Handlers stay thin: auth → Zod validation → service call → stream. Logic lives in `src/services/<name>/`.
 - Tools in `src/tools/` are thin adapters over services — no scraping, SQL, or rendering inside a tool.
 - Prisma: schema at `prisma/schema.prisma`, CLI config at `prisma.config.ts` (loads `.env.local` — `DATABASE_URL` has exactly one home, never a committed default). Generated client at `src/generated/prisma`, gitignored and rebuilt by `postinstall`. Telemetry is imported manually — no seed script (docs/DATA-IMPORT.md).
-- Secrets come only from env, validated in `src/lib/env.ts`. Never log secrets; Pino redaction paths cover credentials, cookies, storageState, authorization headers.
+- Secrets come only from env, validated in `src/lib/env.ts` — eagerly for application config, lazily via `authEnv()` for the Intellicar domain, so the telemetry path never depends on portal configuration. Never log secrets; Pino redaction in `src/lib/logger.ts` covers credentials, cookies, storageState and authorization headers. Redaction matches field *paths*, not free text, so never interpolate a secret into a message.
+- Intellicar authentication (docs/AUTH-SETUP.md): `session-manager.ts` is the only public entry point; every portal URL and selector lives in the one `INTELLICAR` constants block in `authenticator.ts`, where `TODO(intellicar)` marks values still unverified against the live portal.
 - Prefer editing existing files over creating new ones; keep the project tree matching docs/ARCHITECTURE.md Section 18, with one deliberate deviation: the App Router lives at `src/app/`, not the root `app/` shown in Section 18. Everything else under `src/` matches. Route Handlers therefore live at `src/app/api/<name>/route.ts`.

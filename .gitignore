@@ -46,3 +46,13 @@ next-env.d.ts
 
 # telemetry datasets — imported manually, never committed (see docs/DATA-IMPORT.md)
 /data/
+
+# Encrypted Intellicar session state (SESSION_STORE_DIR). A stored storageState
+# is a LIVE SESSION — equivalent to a bearer token — so it must never be
+# committable, even sealed. Default location; keep in step with .env.local.
+/.sessions/
+
+# Playwright diagnostics: failure screenshots, traces, downloads.
+/auth-artifacts/
+/test-results/
+/playwright-report/
