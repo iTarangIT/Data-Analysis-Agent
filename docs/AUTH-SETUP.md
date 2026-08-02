@@ -94,8 +94,9 @@ Procedure:
 
 | Constant | What it must become | Why it matters |
 |---|---|---|
-| `AUTHENTICATED_INDICATOR` | A selector for an element that appears **only when logged in** — per the Milestone 3 brief, the "Intellicar Dashboard" navigation link | **The most important constant in the system.** If it also matches on the login page, a failed login is indistinguishable from a successful one. |
+| `AUTHENTICATED_INDICATOR` | **Validated** — `#pac-input` (dashboard places-autocomplete input; absent before login, created only once the dashboard has initialised) and `#intellicarSSODropWidget .ICSSOprofileDropdown` (populates from the authenticated identity). The unverified placeholders below them are kept as fallbacks only | **The most important constant in the system.** If it also matches on the login page, a failed login is indistinguishable from a successful one. |
 | `DASHBOARD_PATH` | The lightest authenticated page that redirects to login when the session dies | Runs on every request as the validity probe; a heavy dashboard makes every question slower |
+| `SESSION_VERIFY_PATH` | The call the portal's own SPA makes at startup to check the restored session — `/sso/verifytoken` on the live portal | The probe waits for this before judging the session. Wrong value ⇒ the probe falls back to judging a page that may still be booting (see the still-booting trap below) |
 | `LOGIN_PATH` | The login form's path | Wrong value ⇒ `UNEXPECTED_PAGE` |
 | `EMAIL_INPUT`, `PASSWORD_INPUT`, `SUBMIT_BUTTON` | The real field selectors | Candidates are tried in order; narrowing to the real one is faster and less fragile |
 | `LOGIN_ERROR_TEXT` | The portal's real rejection wording | Turns "wrong password" into an immediate `INVALID_CREDENTIALS` instead of three slow failures (§6). Keep the wording specific — a loose pattern like `/invalid\|incorrect/i` would match help text on the login page and reject every attempt |
@@ -128,6 +129,22 @@ Measured against a portal reproducing this markup:
 | after announcer exclusion | 0 matches | 0 matches |
 
 If you add a new container selector, prefer one specific to authentication, and assume it may be present-but-empty until proven otherwise.
+
+### The still-booting trap — observed on the real portal
+
+A probe reported `expired` for a session that was **completely valid**. The stored cookies restored, the portal answered `POST /sso/verifytoken` with a 200, and the app went straight on to authenticated XHRs (`getinfo`, `getmygroups`, …) that all succeeded — while the probe was already declaring the session dead.
+
+The cause was the probe's own sequencing, not a selector. It navigated with `waitUntil: "domcontentloaded"` and then asked `isAuthenticated` immediately. On a SPA, `domcontentloaded` fires when the shell HTML is parsed — before the bundle executes. So the indicator race's `PROBE_TIMEOUT_MS` budget had to cover bundle execution, the verification round trip, the startup data fetches **and** the render, and when it did not, "the app is still initializing" came out as "authentication failed". The successful verification was sitting in the probe's own network trace, unread by the decision path.
+
+The fix is `waitForAppStartup`, which runs between the navigation and `isAuthenticated`. It waits for the **application's** startup sequence — a 200 from `SESSION_VERIFY_PATH` followed by a successful authenticated XHR on the portal host — and only then starts the indicator clock.
+
+Three properties worth keeping if you touch it:
+
+1. **It never returns a verdict.** All four of its outcomes lead to the same `isAuthenticated` call, which still requires a non-login URL *and* a visible authenticated-only element. A readiness signal can make the probe look later; it can never make it answer yes.
+2. **It does not delay a genuinely expired session.** A non-200 verification, or a bounce to the login screen, ends the wait at once — and `isAuthenticated`'s URL guard then answers immediately.
+3. **It is not `networkidle`.** A fleet portal holds map tiles and telemetry streams open, so socket quiescence may arrive late or never, and says nothing about whether the session was accepted.
+
+Read the `startup-settled` entry in the `DEBUG: probe timeline.` log line to see which of the four fired.
 
 **If MFA turns out to exist**, silent re-authentication (SAD §10) is not achievable and this milestone's guarantee that "the user is never asked to log in again" no longer holds. The flow will report `CHALLENGE_REQUIRED`; escalate that as a design change rather than working around it.
 

@@ -1,6 +1,9 @@
 import { mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+// TODO(debug): type-only, used solely by the temporary describeContextStorage.
+import type { BrowserContext } from "playwright";
+
 import { authEnv } from "@/lib/env";
 import { childLogger } from "@/lib/logger";
 import {
@@ -136,6 +139,134 @@ async function writeSessionFile(file: SessionFile): Promise<void> {
   await rename(temporary, target);
 }
 
+/* -------------------------------------------------------------------------- */
+/*  TEMPORARY DEBUG CAPTURE — remove once the Local Storage question is settled */
+/*                                                                            */
+/*  Answers "does the captured session actually carry the portal's Local      */
+/*  Storage auth keys, and do they survive the round trip into a restored     */
+/*  context". Delete this block — `describeStorageState`,                     */
+/*  `describeContextStorage` and their constants — plus the call sites in     */
+/*  `save` here and in session-manager's restore path (each marked            */
+/*  TODO(debug)) to revert. Nothing else depends on it, and no call site      */
+/*  affects control flow.                                                      */
+/* -------------------------------------------------------------------------- */
+
+/** Set to false to silence the storage-key dump without deleting it. */
+const DEBUG_TRACE_STORAGE_KEYS = true;
+
+/**
+ * The origin whose Local Storage is under investigation, and the keys expected
+ * to be in it.
+ *
+ * Portal-specific knowledge, which by CLAUDE.md convention belongs in the one
+ * `INTELLICAR` constants block in authenticator.ts. It is knowingly parked here
+ * instead because this whole block is temporary and self-deleting: putting it
+ * in the permanent constants block would outlive the question it answers, and
+ * would make session-store — which is deliberately portal-agnostic — import
+ * from the authenticator. If this diagnostic ever becomes permanent, that is
+ * the move to make.
+ */
+const DEBUG_EXPECTED_ORIGIN = "https://track.intellicar.in";
+const DEBUG_EXPECTED_KEYS = ["auth", "main-auth"] as const;
+
+/** Trailing-slash and case differences are not real differences between origins. */
+function normalizeOrigin(origin: string): string {
+  return origin.replace(/\/+$/, "").toLowerCase();
+}
+
+/**
+ * Log the Local Storage KEY NAMES held in a storage state, per origin.
+ *
+ * ## Names only, never values
+ *
+ * `item.value` is never read. For an origin like this one the value under a key
+ * called `auth` is, by its own name, the session — logging it would be the
+ * exact leak the seal-at-rest design exists to prevent (src/lib/logger.ts rule
+ * 1). Key names are structure, not secrets: knowing a key called `auth` exists
+ * says nothing a reader could authenticate with.
+ *
+ * ## Reading the `expected` field
+ *
+ * `present: false` means the origin contributed NO Local Storage at all to this
+ * storage state, which is a different fault from the origin being there with
+ * the keys missing — hence both are reported rather than one boolean.
+ *
+ * Worth knowing before concluding anything from a miss: Playwright's
+ * storageState captures cookies and Local Storage ONLY. sessionStorage is not
+ * persisted at all, so a key that lives in sessionStorage is absent here by
+ * design and no amount of session-store fixing would bring it back.
+ *
+ * The payload deliberately avoids a field named `storageState`, `key` or
+ * `cookies` — all are redacted paths in src/lib/logger.ts, and a censored
+ * diagnostic is worse than none because it still looks like it ran.
+ */
+export function describeStorageState(phase: string, state: StorageState): void {
+  if (!DEBUG_TRACE_STORAGE_KEYS) return;
+
+  try {
+    const origins = (state.origins ?? []).map((entry) => ({
+      origin: entry.origin,
+      keyCount: entry.localStorage.length,
+      keys: entry.localStorage.map((item) => item.name),
+    }));
+
+    const target =
+      origins.find(
+        (entry) => normalizeOrigin(entry.origin) === normalizeOrigin(DEBUG_EXPECTED_ORIGIN)
+      ) ?? null;
+
+    log.info(
+      {
+        phase,
+        originCount: origins.length,
+        cookieCount: (state.cookies ?? []).length,
+        origins,
+        expected: {
+          origin: DEBUG_EXPECTED_ORIGIN,
+          present: target !== null,
+          foundKeys: DEBUG_EXPECTED_KEYS.filter(
+            (name) => target?.keys.includes(name) ?? false
+          ),
+          missingKeys: DEBUG_EXPECTED_KEYS.filter(
+            (name) => !(target?.keys.includes(name) ?? false)
+          ),
+        },
+      },
+      "DEBUG: local storage keys in the session storage state."
+    );
+  } catch (error) {
+    // Diagnostics must never change the outcome being diagnosed.
+    log.warn({ err: error, phase }, "DEBUG: failed to describe the storage state.");
+  }
+}
+
+/**
+ * As `describeStorageState`, but reading the LIVE context rather than a saved
+ * blob — what the browser actually holds, not what the file says it should.
+ *
+ * The two can disagree, and that disagreement is the whole point of having both
+ * at restore time: the file is the claim, the context is the fact.
+ *
+ * `context.storageState()` is a read, but not a free one — Playwright services
+ * it by opening an internal page and visiting each known origin. That is why it
+ * sits behind the same flag rather than being inlined at the call site: with
+ * the flag off, the call is never made.
+ */
+export async function describeContextStorage(
+  phase: string,
+  context: BrowserContext
+): Promise<void> {
+  if (!DEBUG_TRACE_STORAGE_KEYS) return;
+
+  try {
+    describeStorageState(phase, await context.storageState());
+  } catch (error) {
+    log.warn({ err: error, phase }, "DEBUG: failed to read the context storage state.");
+  }
+}
+
+/* --------------------------- end temporary block -------------------------- */
+
 /**
  * Seal and persist a storage state, replacing any existing session.
  * Returns the metadata written.
@@ -144,6 +275,11 @@ export async function save(
   storageState: StorageState
 ): Promise<SessionMetadata> {
   const savedAt = new Date().toISOString();
+
+  // TODO(debug): remove. This is the captured state exactly as
+  // `context.storageState()` produced it in session-manager's loginAndRun —
+  // before sealing, so what is logged is what is about to be persisted.
+  describeStorageState("save", storageState);
 
   await writeSessionFile({
     version: FORMAT_VERSION,

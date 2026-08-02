@@ -323,6 +323,13 @@ export function withAuthenticatedContext<T>(
 
       if (stored !== null) {
         const attempt = await withContext(stored.storageState, async (context) => {
+          // TODO(debug): remove both. The first is the claim the file makes,
+          // the second is what `browser.newContext({ storageState })` actually
+          // materialised — logged before the probe navigates so neither can be
+          // confused with something the portal set.
+          store.describeStorageState("restore:from-disk", stored.storageState);
+          await store.describeContextStorage("restore:in-context", context);
+
           const probe = await probeSession(context);
 
           if (probe === "valid") {

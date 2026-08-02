@@ -11,7 +11,8 @@ import { z } from "zod";
  * Milestone 3 adds a SECOND schema below for the Intellicar authentication
  * domain, validated lazily rather than at boot. See `authEnv()` for why.
  */
-const envSchema = z.object({
+const envSchema = z
+  .object({
   DATABASE_URL: z
     .string()
     .min(1, "DATABASE_URL must not be empty")
@@ -26,7 +27,41 @@ const envSchema = z.object({
   LOG_LEVEL: z
     .enum(["fatal", "error", "warn", "info", "debug", "trace"])
     .default("info"),
-});
+
+  /**
+   * LangSmith tracing (SAD §16, Milestone 3.5 Step 3). Optional, and OFF unless
+   * explicitly configured.
+   *
+   * These are declared here so the configuration has one documented home and a
+   * misconfiguration fails at boot — but note what this schema does NOT do:
+   * @langchain/core reads `process.env.LANGSMITH_TRACING` itself
+   * (utils/callbacks.js) and never consults this object. Validating the value
+   * here therefore describes and checks the setting; it does not enable it. The
+   * default below is a statement about the unset case, not something written
+   * back to the environment.
+   *
+   * Enabling this sends prompts, model outputs and tool results to an external
+   * service. That is architecturally sanctioned (SAD §16) but is a deployment
+   * decision, which is why nothing here turns it on.
+   */
+  LANGSMITH_TRACING: z.enum(["true", "false"]).default("false"),
+  LANGSMITH_API_KEY: z.string().min(1).optional(),
+  /** Groups runs in the LangSmith UI. Defaults to LangSmith's own default. */
+  LANGSMITH_PROJECT: z.string().min(1).optional(),
+  })
+  /**
+   * Tracing turned on without a key is the failure worth catching: the
+   * application starts, claims to be traced, and silently records nothing.
+   */
+  .superRefine((value, ctx) => {
+    if (value.LANGSMITH_TRACING === "true" && value.LANGSMITH_API_KEY === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["LANGSMITH_API_KEY"],
+        message: 'LANGSMITH_API_KEY is required when LANGSMITH_TRACING is "true"',
+      });
+    }
+  });
 
 export type Env = z.infer<typeof envSchema>;
 
