@@ -14,7 +14,7 @@ Architecture: SAD §8 (sessions), §9 (credentials), §10 (login flow), §11 (Pl
 | `src/services/credentials/crypto.ts` | AES-256-GCM seal/open. Pure; the key is a parameter. |
 | `src/services/session/playwright-manager.ts` | Chromium lifecycle. Launched on demand, cached on `globalThis`. |
 | `src/services/session/session-store.ts` | The encrypted storageState on disk, plus its metadata. |
-| `src/services/session/authenticator.ts` | The login flow, and **every Intellicar-specific URL and selector**. |
+| `src/services/session/authenticator.ts` | The login flow, and **every URL and selector the login flow needs**. Dashboard-module selectors belong to their extractor (SAD §19, Milestone 4A). |
 | `src/services/session/session-manager.ts` | **The only public entry point.** Reuse → validate → refresh → latch. |
 
 Consumers call exactly one function:
@@ -84,7 +84,9 @@ AUTH_TIMEOUT_MS="30000"
 
 ## 4. Replacing the portal placeholders — DO THIS BEFORE PRODUCTION TESTING
 
-Every Intellicar-specific value lives in one block, `INTELLICAR`, at the top of [`src/services/session/authenticator.ts`](../src/services/session/authenticator.ts). Each entry marked `TODO(intellicar)` is an **unverified guess** at conventional markup. Nothing else in the codebase needs to change.
+Every value the **login flow** needs lives in one block, `INTELLICAR`, at the top of [`src/services/session/authenticator.ts`](../src/services/session/authenticator.ts). Each entry marked `TODO(intellicar)` is an **unverified guess** at conventional markup. Nothing else in the authentication path needs to change.
+
+This block covers signing in, and only that. A dashboard module's path and selectors are declared with that module under `src/services/portal/extractors/`, and are verified per module as each extractor is built — do not add them here.
 
 Procedure:
 

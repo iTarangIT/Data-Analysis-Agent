@@ -2,6 +2,7 @@ import { tool, type ToolRunnableConfig } from "@langchain/core/tools";
 import type { z } from "zod";
 
 import { analysisToolSpec } from "@/tools/analysis.tool";
+import { portalToolSpec } from "@/tools/portal.tool";
 import type { ToolEnvelope } from "@/types/chat";
 
 /**
@@ -337,12 +338,19 @@ export function parseToolEnvelope(output: unknown): ToolEnvelope | null {
 
 /**
  * Level 1 registers exactly four tools: portal, database, analysis, report.
- * Milestone 1 implements analysis only; the rest are added here as their
- * services land, with no change to the agent core.
+ * Milestone 1 implemented analysis; Milestone 4B adds portal, once a live
+ * capability existed to put behind it. Report follows the same way — a service,
+ * a thin adapter, and one line here, with no change to the agent core.
+ *
+ * Each spec is wrapped by its own `defineTool` call rather than mapped over an
+ * array of them. Two tools have two different Zod schemas, so an array of specs
+ * infers a UNION, and a union cannot satisfy one `TSchema` — the handler's input
+ * type is contravariant, so the array form stopped compiling the moment a second
+ * tool existed. Binding each spec at its own type is what keeps every tool
+ * end-to-end typed, instead of erasing the schemas with a cast to get the map
+ * back.
  */
-const specs = [analysisToolSpec];
-
-const tools = specs.map((spec) => defineTool(spec));
+const tools = [defineTool(analysisToolSpec), defineTool(portalToolSpec)];
 
 export function getTools() {
   return tools;

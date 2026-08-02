@@ -57,19 +57,18 @@ const log = childLogger("session-manager");
 /**
  * Whether Chromium is shut down after each authentication run.
  *
- * TRUE for Milestone 3: authentication is the only browser consumer, so leaving
- * a few hundred megabytes of Chromium resident between logins buys nothing. The
- * cost is a ~1s relaunch, and it is paid only on the uncommon path — a reuse
- * still needs a browser, but a browser is only launched when there is work.
- *
- * MILESTONE 4: flip this to `false`. Once the Portal Service scrapes on the
- * request path, SAD §11's warm singleton is what keeps per-question latency
- * down. This is deliberately a single named constant so that change is one line
- * with a visible rationale, not a refactor.
+ * FALSE from Milestone 4B. At Milestone 3 authentication was the only browser
+ * consumer, so a resident Chromium bought nothing and this was `true`. The
+ * Portal Service now scrapes on the request path, which is exactly the case
+ * SAD §11's warm singleton exists for: a relaunch is ~1s added to every
+ * question a user asks, and the browser is still launched lazily, so a process
+ * that never scrapes never pays for one.
  */
-const CLOSE_BROWSER_AFTER_RUN = true;
+const CLOSE_BROWSER_AFTER_RUN = false;
 
 export type SessionErrorCode =
+  /** The caller's run was cancelled. Not a fault, and never counted as one. */
+  | "CANCELLED"
   /** No usable credential/config. Nothing can be attempted. */
   | "NOT_CONFIGURED"
   /** The portal rejected the credential; latched until the credential changes. */
@@ -222,29 +221,56 @@ function toSessionError(code: AuthFailureCode, cause?: unknown): SessionError {
   }
 }
 
+/**
+ * A cancelled run, as a SessionError.
+ *
+ * Its own code because cancellation must never be mistaken for a portal fault:
+ * a fault is counted towards the lockout ceiling, and a cancellation is not.
+ */
+function cancelled(): SessionError {
+  return new SessionError(
+    "CANCELLED",
+    "The request was cancelled before the Intellicar session could be used."
+  );
+}
+
 /** Log in, persist the sealed state, and hand the fresh context to `run`. */
 async function loginAndRun<T>(
-  run: (context: BrowserContext) => Promise<T>
+  run: (context: BrowserContext) => Promise<T>,
+  signal?: AbortSignal
 ): Promise<T> {
-  return await withContext(undefined, async (context) => {
-    const outcome = await credentials.withCredential((credential) =>
-      authenticate(context, credential)
-    );
+  return await withContext(
+    undefined,
+    async (context) => {
+      const outcome = await credentials.withCredential((credential) =>
+        authenticate(context, credential)
+      );
 
-    if (!outcome.ok) {
-      await noteLoginFailure(outcome.code);
-      throw toSessionError(outcome.code, outcome.cause);
-    }
+      if (!outcome.ok) {
+        // CHECKED BEFORE CLASSIFICATION, and this ordering is load-bearing.
+        // Cancelling closes the context, which makes the login fail — normally
+        // as UNEXPECTED_PAGE. Counting that would mean three cancelled requests
+        // (a user closing a tab three times) latch authentication off for the
+        // life of the process. A cancelled login is not a failed login.
+        if (signal?.aborted) throw cancelled();
 
-    consecutiveLoginFailures = 0;
+        await noteLoginFailure(outcome.code);
+        throw toSessionError(outcome.code, outcome.cause);
+      }
 
-    // Persist BEFORE running the caller's work: the session is valuable
-    // independently of whether `run` succeeds, and a crash inside `run` should
-    // not cost a login that already happened.
-    await store.save(await context.storageState());
+      consecutiveLoginFailures = 0;
 
-    return await run(context);
-  });
+      // Persist BEFORE running the caller's work: the session is valuable
+      // independently of whether `run` succeeds, and a crash inside `run` should
+      // not cost a login that already happened. It is also what makes a
+      // timed-out first portal request cheap — the login it paid for is saved,
+      // so the user's retry takes the reuse path.
+      await store.save(await context.storageState());
+
+      return await run(context);
+    },
+    signal
+  );
 }
 
 /**
@@ -288,20 +314,41 @@ async function noteLoginFailure(code: AuthFailureCode): Promise<void> {
   }
 }
 
+/** Per-call options. Additive: every existing caller passes none. */
+export interface AuthenticatedContextOptions {
+  /**
+   * Cancellation for the caller's run, propagated from the agent (Milestone
+   * 3.5) and honoured by CLOSING THE CONTEXT (SAD §19) — Playwright accepts no
+   * AbortSignal of its own.
+   *
+   * The payoff is not just a faster failure: an aborted scrape settles this
+   * call, which releases the serialisation queue below. A bare timeout in the
+   * Tool Registry cannot do that — it stops the waiting, not the work, and the
+   * next portal request would queue behind a zombie.
+   */
+  signal?: AbortSignal;
+}
+
 /**
  * Obtain an authenticated Intellicar browser context and run `use` with it.
  *
  * The context is valid only for the duration of the call — it is closed
- * afterwards, along with the browser (see CLOSE_BROWSER_AFTER_RUN). Callers must
- * not retain the context, a page, or a cookie from it.
+ * afterwards. Callers must not retain the context, a page, or a cookie from it.
  *
- * This is the API Milestone 4's Portal Service consumes. It needs no knowledge
- * of whether a login happened.
+ * This is the API the Portal Service consumes, and the only caller in the
+ * system. It needs no knowledge of whether a login happened.
  */
 export function withAuthenticatedContext<T>(
-  run: (context: BrowserContext) => Promise<T>
+  run: (context: BrowserContext) => Promise<T>,
+  options: AuthenticatedContextOptions = {}
 ): Promise<T> {
+  const { signal } = options;
+
   return serialize(async () => {
+    // Checked after the queue rather than before it: a run cancelled while
+    // waiting its turn must not launch a browser or touch the session at all.
+    if (signal?.aborted) throw cancelled();
+
     if (!isAuthEnvConfigured()) {
       // Deliberately not the underlying Zod report: that names the missing
       // variables, which is operator information for the logs and setup docs,
@@ -339,11 +386,17 @@ export function withAuthenticatedContext<T>(
           }
 
           return { outcome: probe };
-        });
+        }, signal);
 
         if (attempt.outcome === "used") return attempt.value;
 
         if (attempt.outcome === "unreachable") {
+          // Same ordering rule as the login path: closing the context on abort
+          // makes the probe's navigation fail, which `probeSession` reports as
+          // "unreachable". Reporting a cancelled request as a portal outage
+          // would be a false incident.
+          if (signal?.aborted) throw cancelled();
+
           // Leave the stored session alone: it may be perfectly good, and the
           // portal being down is not a reason to throw it away and log in.
           throw new SessionError(
@@ -352,12 +405,15 @@ export function withAuthenticatedContext<T>(
           );
         }
 
+        // An expired verdict reached by cancelling is not an expired session.
+        if (signal?.aborted) throw cancelled();
+
         log.info("Stored Intellicar session has expired; re-authenticating.");
       } else {
         log.info("No stored Intellicar session; authenticating.");
       }
 
-      return await loginAndRun(run);
+      return await loginAndRun(run, signal);
     } finally {
       if (CLOSE_BROWSER_AFTER_RUN) await closeBrowser();
     }

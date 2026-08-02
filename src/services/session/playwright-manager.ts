@@ -73,10 +73,24 @@ export async function getBrowser(): Promise<Browser> {
  *
  * The default timeout applies to every action inside the context, so a portal
  * that stops responding fails the run instead of hanging it.
+ *
+ * ## `signal` — cancellation, implemented as closing the resource
+ *
+ * Playwright accepts no AbortSignal anywhere in its API (SAD §19), so a
+ * cancelled run cannot be forwarded into it. Closing the CONTEXT is the
+ * mechanism instead: it rejects every in-flight operation on every page it
+ * owns, which is what turns "the client went away" into a scrape that actually
+ * stops rather than one that keeps a browser and the Session Manager's queue
+ * busy for a response nobody will read.
+ *
+ * This is the only place that closing happens, and it stays inside
+ * src/services/session/ deliberately: the signal travels INWARD and no
+ * BrowserContext ever travels back out.
  */
 export async function withContext<T>(
   storageState: StorageState | undefined,
-  run: (context: BrowserContext) => Promise<T>
+  run: (context: BrowserContext) => Promise<T>,
+  signal?: AbortSignal
 ): Promise<T> {
   const browser = await getBrowser();
   const context = await browser.newContext(
@@ -84,9 +98,27 @@ export async function withContext<T>(
   );
   context.setDefaultTimeout(authEnv().AUTH_TIMEOUT_MS);
 
+  // Fire-and-forget: the abort handler's job is to make the in-flight work
+  // reject, and it is `run`'s rejection — not this close — that the caller
+  // awaits. A close failure here means the context is already going away.
+  const onAbort = () => {
+    log.info("Run cancelled; closing the browser context.");
+    void context.close().catch(() => {});
+  };
+
+  signal?.addEventListener("abort", onAbort, { once: true });
+  // Aborted between entering this function and reaching here: `addEventListener`
+  // on an already-aborted signal never fires, so the close is triggered by hand.
+  if (signal?.aborted) onAbort();
+
   try {
     return await run(context);
   } finally {
+    // `once: true` covers the fired case; this covers the far commoner one where
+    // the run finished and the listener never fired, which would otherwise
+    // accumulate one listener per call on a long-lived request signal.
+    signal?.removeEventListener("abort", onAbort);
+
     // A close failure must not mask the real error from `use`, and there is
     // nothing to recover: the browser is about to be discarded anyway.
     await context.close().catch((error: unknown) => {
