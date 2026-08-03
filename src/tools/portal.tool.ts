@@ -76,7 +76,14 @@ export const portalToolSpec: ToolSpec<typeof schema> = {
     "device, model, variant, last talk time, speed, fuel and location — and " +
     "REQUIRES the vehicle's fleet identifier as `target`. It reads one vehicle " +
     "per call and each call scrapes the live portal, so ask for the specific " +
-    "vehicle in question rather than looping over a fleet.",
+    "vehicle in question rather than looping over a fleet. " +
+    "battery_analytics reports the CURRENT FLEET-WIDE battery picture as three " +
+    "distributions — state of charge, battery temperature and cell temperature " +
+    "— each as a count of vehicles per band, and takes no target. It answers " +
+    "'how is the fleet's battery doing right now', never one vehicle's battery: " +
+    "the portal publishes no per-vehicle battery readout. For one vehicle's " +
+    "charge level use vehicle_summary's fuel field, and for historical battery " +
+    "trends use the analysis tool.",
   schema,
   origin: "Intellicar portal (live)",
   timeoutMs: PORTAL_TOOL_TIMEOUT_MS,

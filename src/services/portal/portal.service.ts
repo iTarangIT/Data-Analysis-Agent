@@ -8,10 +8,12 @@ import {
   withAuthenticatedContext,
 } from "@/services/session/session-manager";
 
+import { batteryAnalyticsCapability } from "./extractors/battery-analytics";
 import { fleetOverviewCapability } from "./extractors/fleet-overview";
 import { vehicleSummaryCapability } from "./extractors/vehicle-summary";
 import {
   normalizeVehicleNo,
+  type BatteryAnalytics,
   type FleetOverview,
   type Normalizer,
   type VehicleSummary,
@@ -135,7 +137,7 @@ export type PortalModule = (typeof PORTAL_MODULES)[number];
  * types its own arm, and `defineCapability` constrains `TData` to this union, so
  * the service's public return type is sound without a cast anywhere.
  */
-export type PortalData = FleetOverview | VehicleSummary;
+export type PortalData = FleetOverview | VehicleSummary | BatteryAnalytics;
 
 /** What to fetch. Plain data — nothing here names a browser or a transport. */
 export interface PortalRequest {
@@ -412,6 +414,7 @@ export function defineCapability<TRaw, TData extends PortalData>(
 const CAPABILITIES: Partial<Record<PortalModule, PortalCapability>> = {
   fleet_overview: fleetOverviewCapability,
   vehicle_summary: vehicleSummaryCapability,
+  battery_analytics: batteryAnalyticsCapability,
 };
 
 /* -------------------------------------------------------------------------- */

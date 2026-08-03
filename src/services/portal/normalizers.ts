@@ -19,9 +19,9 @@ import { z } from "zod";
  * "Intellicar changed its markup" and "we parsed it wrong" different bugs with
  * different fixes.
  *
- * fixtures/fleet-overview.raw.json is a real capture from the live dashboard,
- * and it is what makes that claim true rather than aspirational: the normalizer
- * below can be run against it with no browser, no session and no network.
+ * The files under fixtures/ are real captures from the live dashboard, and they
+ * are what makes that claim true rather than aspirational: every normalizer
+ * below can be run against one with no browser, no session and no network.
  *
  * That is why this module MUST NOT import Playwright. It is enforced
  * mechanically by the Portal zone in eslint.config.mjs, not left to review: a
@@ -691,4 +691,326 @@ export function normalizeVehicleSummary(raw: VehicleSummaryRaw): unknown {
     capturedAt: raw.capturedAt,
     fields,
   };
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Battery Analytics                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The Battery Analytics catalogue, VERIFIED against the live dashboard on
+ * 2026-08-03 (Milestone 4D discovery).
+ *
+ * ## Why this module is account-wide, and what discovery actually found
+ *
+ * Milestone 4D was proposed as a TARGETED per-vehicle battery readout. Discovery
+ * against the live portal found no such view, and the milestone was amended:
+ *
+ *   - None of the sixteen LeftPane controls opens a battery view.
+ *   - Selecting a vehicle leaves the URL unchanged and opens no battery panel;
+ *     the RightPane dial set is ICE-oriented (Speed, RPM, Engine Temp, Fuel
+ *     Level) and renders no battery quantity at all.
+ *   - The `.InGraphControl` panel that carries "Start SOC" / "End SOC" is a TRIP
+ *     PLAYBACK control, not a live readout: it was byte-identical before any
+ *     selection and after selecting each of two different vehicles — same device
+ *     id, every value "No Data". Those two figures are trip aggregates that need
+ *     a trip and a date range, which is historical work, not live telemetry.
+ *
+ * What the portal does render live is three FLEET-WIDE distributions, on the
+ * landing view, beneath the status counts — the same buckets Milestone 4B
+ * deliberately excluded from Fleet Overview and assigned to this module. So this
+ * is the Battery Analytics module SAD §11 always named, and it is account-wide.
+ *
+ * ## Why `state_of_charge` is the portal's own word here
+ *
+ * Milestone 4C refused to relabel the Table View's `Fuel` column as state of
+ * charge, because renaming a portal column would put two quantities behind one
+ * word. This is the opposite case and the same rule: the portal itself titles
+ * this row "SoC", so the name is READ rather than reinterpreted.
+ *
+ * These are LIVE PORTAL readings and they do NOT amend §19's authoritative-feed
+ * table, which governs which of the three historical feeds answers a quantity. A
+ * live fleet distribution and a historical CAN signal are different source
+ * classes, kept apart by the envelope's `origin` rather than by wording.
+ */
+export const BATTERY_ANALYTICS_DISTRIBUTIONS = [
+  "state_of_charge",
+  "battery_temperature",
+  "cell_temperature",
+] as const;
+
+export type BatteryDistributionKey =
+  (typeof BATTERY_ANALYTICS_DISTRIBUTIONS)[number];
+
+/**
+ * Every bucket key any distribution can carry.
+ *
+ * The union of the two band vocabularies below. One flat enum rather than a key
+ * type per distribution: the schema validates a single bucket shape, and the
+ * per-distribution catalogue is what decides which keys actually appear.
+ */
+export const BATTERY_BUCKET_KEYS = [
+  "no_reading",
+  "below_0",
+  "at_0",
+  "1_25",
+  "25_50",
+  "50_75",
+  "above_75",
+  "1_15",
+  "15_30",
+  "30_45",
+  "above_45",
+] as const;
+
+/** How many buckets each distribution renders. Both vocabularies carry seven. */
+export const BATTERY_BUCKET_COUNT = 7;
+
+/**
+ * One band, matched by the LABEL the portal renders — never by position.
+ *
+ * `match` is that label squashed and lower-cased; `label` is what is carried
+ * through to the answer. Matching is exact string equality, so the neighbouring
+ * bands cannot collide: "0%" never matches "<0%" or ">75%".
+ */
+interface BatteryBucketSpec {
+  key: (typeof BATTERY_BUCKET_KEYS)[number];
+  match: string;
+  label: string;
+}
+
+/** The SoC bands, exactly as the portal renders them. */
+const SOC_BUCKETS: readonly BatteryBucketSpec[] = [
+  { key: "no_reading", match: "no soc", label: "No SoC" },
+  { key: "below_0", match: "<0%", label: "<0%" },
+  { key: "at_0", match: "0%", label: "0%" },
+  { key: "1_25", match: "1-25%", label: "1-25%" },
+  { key: "25_50", match: "25-50%", label: "25-50%" },
+  { key: "50_75", match: "50-75%", label: "50-75%" },
+  { key: "above_75", match: ">75%", label: ">75%" },
+];
+
+/**
+ * The temperature bands, shared by the Battery Temp and Cell Temp rows — the
+ * portal renders the same seven for both.
+ */
+const TEMP_BUCKETS: readonly BatteryBucketSpec[] = [
+  { key: "no_reading", match: "no temp", label: "No Temp" },
+  { key: "below_0", match: "<0°c", label: "<0°C" },
+  { key: "at_0", match: "0°c", label: "0°C" },
+  { key: "1_15", match: "1-15°c", label: "1-15°C" },
+  { key: "15_30", match: "15-30°c", label: "15-30°C" },
+  { key: "30_45", match: "30-45°c", label: "30-45°C" },
+  { key: "above_45", match: ">45°c", label: ">45°C" },
+];
+
+/**
+ * How each distribution is found, matched by the ROW TITLE the portal renders.
+ *
+ * `rowName` is that title lower-cased. Matching by title rather than by the
+ * container's class is deliberate: the three rows carry the classes
+ * `newSocSwitch`, `newTempSwitch` and `newswitch`, and the last is generic
+ * enough that a future unrelated row could take it. A title that stops matching
+ * produces one honest `available: false`.
+ *
+ * `unit` is the unit of the BANDS, not of the counts — the counts are vehicles.
+ */
+const BATTERY_DISTRIBUTION_SPECS: Record<
+  BatteryDistributionKey,
+  {
+    rowName: string;
+    label: string;
+    unit: string;
+    buckets: readonly BatteryBucketSpec[];
+  }
+> = {
+  state_of_charge: {
+    rowName: "soc",
+    label: "State of Charge",
+    unit: "%",
+    buckets: SOC_BUCKETS,
+  },
+  battery_temperature: {
+    rowName: "battery temp",
+    label: "Battery Temperature",
+    unit: "°C",
+    buckets: TEMP_BUCKETS,
+  },
+  cell_temperature: {
+    rowName: "cell temp",
+    label: "Cell Temperature",
+    unit: "°C",
+    buckets: TEMP_BUCKETS,
+  },
+};
+
+/**
+ * What the Battery Analytics extractor hands over: rendered text, unparsed.
+ *
+ * Strings on purpose, as everywhere in this file. The extractor's job ends at
+ * "this is what the page said".
+ */
+export interface BatteryAnalyticsRaw {
+  /** When the extraction ran, ISO 8601. Stamped by the extractor. */
+  capturedAt: string;
+  /** The fleet/group label the portal displayed, if it displayed one. */
+  fleet: string | null;
+  /** One entry per rendered distribution row, in render order. */
+  rows: { name: string; buckets: { label: string; count: string }[] }[];
+}
+
+const batteryBucketSchema = z.discriminatedUnion("available", [
+  z.object({
+    key: z.enum(BATTERY_BUCKET_KEYS),
+    label: z.string().min(1),
+    available: z.literal(true),
+    /** Vehicles in this band. A count, not a measurement. */
+    count: z.number().int().nonnegative(),
+  }),
+  z.object({
+    key: z.enum(BATTERY_BUCKET_KEYS),
+    label: z.string().min(1),
+    available: z.literal(false),
+    /** Safe to show a user, and safe to hand the model. */
+    reason: z.string().min(1),
+  }),
+]);
+
+const batteryDistributionSchema = z.discriminatedUnion("available", [
+  z.object({
+    key: z.enum(BATTERY_ANALYTICS_DISTRIBUTIONS),
+    label: z.string().min(1),
+    available: z.literal(true),
+    /** The unit of the BANDS. The bucket counts are vehicles. */
+    unit: z.string().min(1),
+    buckets: z.array(batteryBucketSchema).length(BATTERY_BUCKET_COUNT),
+    /**
+     * Vehicles across all bands, or null if any band failed to read.
+     *
+     * Null rather than a partial sum: a total assembled from six of seven bands
+     * would look like a fleet size and be one. It is deliberately NOT assumed to
+     * equal the Fleet Overview vehicle count either — on the live dashboard the
+     * Battery Temp row summed to 317 while the fleet was 320, because a vehicle
+     * reporting no battery temperature at all is in none of these bands.
+     */
+    total: z.number().int().nonnegative().nullable(),
+  }),
+  z.object({
+    key: z.enum(BATTERY_ANALYTICS_DISTRIBUTIONS),
+    label: z.string().min(1),
+    available: z.literal(false),
+    reason: z.string().min(1),
+  }),
+]);
+
+/**
+ * The validated Battery Analytics payload.
+ *
+ * The `.length()` constraints are the same load-bearing ones the other two
+ * modules use: three distributions, seven bands each, always. A row the portal
+ * stops rendering comes back as one `available: false` with a reason, never as a
+ * shorter array that reads like "nothing to report".
+ */
+export const batteryAnalyticsSchema = z.object({
+  /**
+   * The fleet these distributions describe, as the portal labels it.
+   *
+   * Null means the account-wide view, which is what this deployment renders —
+   * the same finding as Fleet Overview, and reported rather than invented.
+   */
+  fleet: z.string().min(1).nullable(),
+  capturedAt: z.iso.datetime(),
+  distributions: z
+    .array(batteryDistributionSchema)
+    .length(BATTERY_ANALYTICS_DISTRIBUTIONS.length),
+});
+
+export type BatteryAnalytics = z.output<typeof batteryAnalyticsSchema>;
+
+/**
+ * Turn a raw Battery Analytics extraction into the validated shape.
+ *
+ * Pure: same input, same output, no clock and no I/O. Exercisable against
+ * fixtures/battery-analytics.raw.json without a portal.
+ */
+export function normalizeBatteryAnalytics(raw: BatteryAnalyticsRaw): unknown {
+  // Row title -> its bands, built once. A page rendering an unexpected extra
+  // row costs one lookup rather than a scan per distribution.
+  const byRowName = new Map<string, { label: string; count: string }[]>();
+  for (const row of raw.rows) {
+    const key = squash(row.name).toLowerCase();
+    if (key.length > 0 && !byRowName.has(key)) byRowName.set(key, row.buckets);
+  }
+
+  const distributions = BATTERY_ANALYTICS_DISTRIBUTIONS.map((key) => {
+    const spec = BATTERY_DISTRIBUTION_SPECS[key];
+    const label = spec.label;
+    const rendered = byRowName.get(spec.rowName);
+
+    if (rendered === undefined) {
+      return {
+        key,
+        label,
+        available: false,
+        reason: `The Intellicar dashboard did not show a "${label}" distribution.`,
+      };
+    }
+
+    const byLabel = new Map<string, string>();
+    for (const bucket of rendered) {
+      const bandKey = squash(bucket.label).toLowerCase();
+      if (bandKey.length > 0 && !byLabel.has(bandKey)) {
+        byLabel.set(bandKey, bucket.count);
+      }
+    }
+
+    // Tracked while mapping so a partial read can never be totalled: one
+    // unreadable band makes the whole total null rather than plausibly small.
+    let complete = true;
+    let total = 0;
+
+    const buckets = spec.buckets.map((bucket) => {
+      const text = byLabel.get(bucket.match);
+
+      if (text === undefined) {
+        complete = false;
+        return {
+          key: bucket.key,
+          label: bucket.label,
+          available: false,
+          reason:
+            `The Intellicar dashboard did not show a "${bucket.label}" band ` +
+            `for "${label}".`,
+        };
+      }
+
+      const count = parseCount(text);
+
+      if (count === null) {
+        complete = false;
+        return {
+          key: bucket.key,
+          label: bucket.label,
+          available: false,
+          reason:
+            `The Intellicar dashboard showed no usable number for the ` +
+            `"${bucket.label}" band of "${label}".`,
+        };
+      }
+
+      total += count;
+      return { key: bucket.key, label: bucket.label, available: true, count };
+    });
+
+    return {
+      key,
+      label,
+      available: true,
+      unit: spec.unit,
+      buckets,
+      total: complete ? total : null,
+    };
+  });
+
+  return { fleet: raw.fleet, capturedAt: raw.capturedAt, distributions };
 }

@@ -7,6 +7,7 @@ import { config as loadDotenv } from "dotenv";
  *
  *   npm run portal:fetch                    # fleet_overview
  *   npm run portal:fetch -- fleet_overview
+ *   npm run portal:fetch -- battery_analytics
  *   npm run portal:fetch -- vehicle_summary TK-51105-06GY-112765
  *
  * The third argument is the module's TARGET. A targeted module (vehicle_summary)

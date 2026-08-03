@@ -1,0 +1,67 @@
+{
+  "_comment": [
+    "A REAL raw extraction, captured from the live Intellicar dashboard's landing",
+    "view on 2026-08-03 by replaying the extractor's own DOM read — the same",
+    "selectors, the same evaluateAll shape, the same capturedAt/fleet stamping.",
+    "Not hand-written sample data.",
+    "",
+    "This is the input side of normalizeBatteryAnalytics(): exactly what the",
+    "extractor hands over — rendered text, unparsed — so the normalizer, which is",
+    "pure, can be exercised and reviewed without a browser, a session or a",
+    "network.",
+    "",
+    "Note the ROW ORDER: the portal renders these rows Cell Temp, Battery Temp,",
+    "SoC in the DOM, which is not the order they read on screen. That is why rows",
+    "are matched by their rendered TITLE and bands by their rendered LABEL, never",
+    "by position — a positional reader would have silently reported the cell",
+    "temperature distribution as the state of charge (SAD §19, Milestone 4D).",
+    "",
+    "Note also that the Battery Temp bands sum to 317 while the fleet is 320. A",
+    "vehicle reporting no battery temperature at all falls in none of the bands,",
+    "so a distribution total is NOT the fleet size and is never assumed to be.",
+    "",
+    "Values are live from that moment and are expected to differ from any later",
+    "reading. Nothing here is a secret: fleet-wide counts from a dashboard the",
+    "account owner already sees."
+  ],
+  "capturedAt": "2026-08-03T06:21:06.786Z",
+  "fleet": null,
+  "rows": [
+    {
+      "name": "Cell Temp",
+      "buckets": [
+        { "label": "No Temp", "count": "0" },
+        { "label": "<0°C", "count": "0" },
+        { "label": "0°C", "count": "0" },
+        { "label": "1-15°C", "count": "0" },
+        { "label": "15-30°C", "count": "1" },
+        { "label": "30-45°C", "count": "312" },
+        { "label": ">45°C", "count": "7" }
+      ]
+    },
+    {
+      "name": "Battery Temp",
+      "buckets": [
+        { "label": "No Temp", "count": "0" },
+        { "label": "<0°C", "count": "0" },
+        { "label": "0°C", "count": "0" },
+        { "label": "1-15°C", "count": "0" },
+        { "label": "15-30°C", "count": "11" },
+        { "label": "30-45°C", "count": "304" },
+        { "label": ">45°C", "count": "2" }
+      ]
+    },
+    {
+      "name": "SoC",
+      "buckets": [
+        { "label": "No SoC", "count": "0" },
+        { "label": "<0%", "count": "0" },
+        { "label": "0%", "count": "1" },
+        { "label": "1-25%", "count": "3" },
+        { "label": "25-50%", "count": "39" },
+        { "label": "50-75%", "count": "101" },
+        { "label": ">75%", "count": "176" }
+      ]
+    }
+  ]
+}
