@@ -36,10 +36,34 @@ const BROWSER_ZONE = {
 };
 
 const DATA_ZONE = {
-  group: ["@/services/database/*", "@/tools/*", "@/agent/*", "@/lib/prisma"],
+  group: [
+    "@/services/database/*",
+    "@/services/analytics/*",
+    "@/tools/*",
+    "@/agent/*",
+    "@/lib/prisma",
+  ],
   message:
     "The portal and authentication paths must not depend on the data path " +
-    "(SAD §9, §11). They are consumed BY the tool layer; they consume none of it.",
+    "(SAD §9, §11). They are consumed BY the tool layer and by the Analysis " +
+    "Engine; they consume neither.",
+};
+
+/**
+ * What a PROVIDER may not reach (Milestone 5B).
+ *
+ * The Analysis Engine sits ABOVE the Portal Service and the Database Service and
+ * depends on both; neither depends on it. That direction is the entire argument
+ * for placing the engine where it is — it is what lets the engine combine two
+ * sources without either source learning that the other exists — so it is
+ * checked rather than remembered.
+ */
+const ANALYTICS_ZONE = {
+  group: ["@/services/analytics/*", "@/services/analytics/**"],
+  message:
+    "The Analysis Engine consumes the Portal and Database services; they never " +
+    "consume it (SAD §4, Milestone 5B). A provider that reached upward into the " +
+    "engine would make the dependency circular and the engine unremovable.",
 };
 
 /* -------------------------------------------------------------------------- */
@@ -77,8 +101,38 @@ const authIsolation = [
     },
   },
   {
-    // The tool layer and the Database Service.
-    files: ["src/services/database/**", "src/tools/**"],
+    /**
+     * The Database Service — a pure PROVIDER. It is consumed by the tool layer
+     * and by the Analysis Engine, and consumes neither, so the restriction is
+     * wider than the tool layer's below. Split from the tool object at Milestone
+     * 5B, when there was finally something above it that could be reached
+     * upward for.
+     */
+    files: ["src/services/database/**"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            AUTH_ZONE,
+            BROWSER_ZONE,
+            ANALYTICS_ZONE,
+            {
+              group: ["@/services/portal/*", "@/tools/*", "@/agent/*"],
+              message:
+                "The Database Service is the bottom of the data path. It knows " +
+                "nothing of the portal, the tools or the agent (SAD §4, §12).",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    // The tool layer. It MAY reach the Analysis Engine — that is what makes the
+    // Analysis Tool a thin adapter — and may never reach authentication or a
+    // browser.
+    files: ["src/tools/**"],
     rules: {
       "no-restricted-imports": ["error", { patterns: [AUTH_ZONE, BROWSER_ZONE] }],
     },
@@ -189,11 +243,110 @@ const portalIsolation = [
   },
 ];
 
+/* -------------------------------------------------------------------------- */
+/*  Analytics (SAD §4, §6, Milestone 5B)                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The Analysis Engine is the only module that may hold two source classes at
+ * once, so it is the only one whose zone permits both providers. What it may
+ * NOT do is the part worth enforcing:
+ *
+ *   - It never reaches authentication or Playwright. It asks the Portal Service
+ *     for validated JSON, exactly as a tool does, so a page, a context or a
+ *     cookie can no more reach the engine than it can reach the agent
+ *     (CLAUDE.md rule 1). The engine being a service buys it no privilege here.
+ *   - It never reaches the tool layer or the agent. It is consumed by a tool
+ *     adapter; it consumes none of them, and it knows nothing of the result
+ *     envelope (CLAUDE.md rule 2).
+ *   - It never reaches Prisma. Database access goes through the Database
+ *     Service, which is the only Prisma caller (SAD §12).
+ *
+ * The PURE half is restricted further, in the second object. observations.ts
+ * declares types, projections.ts reads an already-fetched record, and
+ * reconcile.ts chooses between values already in memory — none of the three may
+ * import anything that performs I/O. That is what makes them exercisable against
+ * fixtures/telemetry-records.json with no database, and it is the same boundary,
+ * drawn for the same reason, as the Portal Service's normalizers.
+ *
+ * telemetry.records.ts is deliberately NOT in that restriction: it declares
+ * record shapes and conversions and performs no I/O, which is precisely why the
+ * reads were split out into telemetry.reader.ts at this milestone.
+ */
+const ANALYTICS_PATHS = ["src/services/analytics/**"];
+const ANALYTICS_PURE = [
+  "src/services/analytics/observations.ts",
+  "src/services/analytics/projections.ts",
+  "src/services/analytics/reconcile.ts",
+];
+
+const AGENT_ZONE = {
+  group: ["@/tools/*", "@/agent/*"],
+  message:
+    "The Analysis Engine is consumed BY a tool adapter and consumes none of the " +
+    "tool or agent layer (SAD §6). It does not know the result envelope exists.",
+};
+
+const analyticsIsolation = [
+  {
+    files: ANALYTICS_PATHS,
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            AUTH_ZONE,
+            BROWSER_ZONE,
+            AGENT_ZONE,
+            {
+              group: ["@/lib/prisma"],
+              message:
+                "Database access goes through the Database Service, the only " +
+                "Prisma caller (SAD §12). The engine reads telemetry, not rows.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+  {
+    // The pure half. Listed last so it wins over the module-wide object above,
+    // which it deliberately restates and extends.
+    files: ANALYTICS_PURE,
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            AUTH_ZONE,
+            BROWSER_ZONE,
+            AGENT_ZONE,
+            {
+              group: [
+                "@/services/portal/*",
+                "@/services/database/telemetry.service",
+                "@/services/database/telemetry.reader",
+                "@/lib/prisma",
+              ],
+              message:
+                "These modules are pure functions over data already in memory " +
+                "(Milestone 5B). They import no module that performs I/O, which " +
+                "is what lets them run against fixtures with no database and no " +
+                "portal — the same boundary normalizers.ts holds.",
+            },
+          ],
+        },
+      ],
+    },
+  },
+];
+
 const eslintConfig = defineConfig([
   ...nextVitals,
   ...nextTs,
   ...authIsolation,
   ...portalIsolation,
+  ...analyticsIsolation,
   // Override default ignores of eslint-config-next.
   globalIgnores([
     // Default ignores of eslint-config-next:

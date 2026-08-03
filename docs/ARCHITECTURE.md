@@ -86,6 +86,7 @@ The application is organised as a modular service layer inside the Next.js codeb
 | Credential Manager | Encrypted storage and retrieval of Intellicar credentials; update and revocation; never returns secrets to the agent.                                                |
 | Playwright Manager | Singleton Chromium lifecycle, browser context creation and crash recovery. Pure infrastructure — contains no business or AI logic.                                   |
 | Database Service   | Typed telemetry queries plus a guarded read-only SQL path; the Prisma access layer.                                                                                  |
+| Analysis Engine    | Deterministic reasoning over grounded sources: plans what to acquire, deduplicates the reads, reconciles live against historical by declared precedence, computes metrics, and assembles findings that carry their own provenance. Calls no LLM. |
 | Memory Manager     | Short-term conversation state and long-term user preferences; enforces the memory storage exclusions in Section 7.                                                   |
 | Report Service     | Markdown assembly, PDF rendering, report persistence and download links.                                                                                             |
 
@@ -123,7 +124,7 @@ Four LangChain tools are registered at Level 1. Each tool is a thin, Zod-validat
 |---------------|-----------------------|-------------------------------------------|-----------------------------------------------------------------|
 | Portal Tool   | Portal Service        | Dashboard module + battery / fleet target | Live normalised JSON from Intellicar                            |
 | Database Tool | Database Service      | Typed query intent or read-only SQL       | Rows of historical telemetry                                    |
-| Analysis Tool | Analytics module (TS) | Rows / JSON from other tools              | Computed metrics: degradation trends, cycle counts, utilisation |
+| Analysis Tool | Analysis Engine (src/services/analytics/) | Subject + quantities (+ window, from 5C)  | Findings, each carrying the source that answered it |
 | Report Tool   | Report Service        | Results + report template                 | Markdown / PDF report with download link                        |
 
 The Tool Registry (src/agent/tool-registry.ts) is the single catalogue of capabilities. Each entry pairs a Zod input schema, a description the LLM reasons over, and the service call it wraps. Adding a capability at Level 2 means adding a service, a thin tool adapter and one registry entry — the agent core does not change.
@@ -472,11 +473,31 @@ tarang-agent/
 
 │ │ ├── database/
 
-│ │ │ └── telemetry.service.ts
+│ │ │ ├── telemetry.service.ts \# Prisma access layer
 
-│ │ ├── analytics/
+│ │ │ ├── telemetry.records.ts \# JSON-safe shapes + conversions; no I/O
 
-│ │ │ └── battery-metrics.ts \# Degradation, cycles, utilisation
+│ │ │ └── telemetry.reader.ts \# Typed reads returning those records
+
+│ │ ├── analytics/ \# Analysis Engine (Milestone 5B)
+
+│ │ │ ├── analysis-engine.ts \# Public entry; orchestrates the six stages
+
+│ │ │ ├── planner.ts \# Stage 1 — request → requirements (pure)
+
+│ │ │ ├── quantity-registry.ts \# Stage 2 — quantity ↔ provider vocabulary
+
+│ │ │ ├── acquisition.ts \# Stage 3 — the only impure stage; deduplicated
+
+│ │ │ ├── projections.ts \# Reading → measured quantity (pure)
+
+│ │ │ ├── reconcile.ts \# Stage 4 — source precedence P0-P7 (pure)
+
+│ │ │ ├── observations.ts \# The universal data model (types only)
+
+│ │ │ ├── battery-metrics.ts \# Stage 5 — trends, cycles, utilisation (5C)
+
+│ │ │ └── fixtures/ \# Captured records; pure stages testable offline
 
 │ │ └── reports/
 
@@ -534,7 +555,7 @@ tarang-agent/
 | Session Manager / Playwright Manager | src/services/session/                |
 | Credential Manager                   | src/services/credentials/            |
 | Database Service                     | src/services/database/               |
-| Analytics                            | src/services/analytics/              |
+| Analysis Engine                      | src/services/analytics/              |
 | Report Service                       | src/services/reports/                |
 | Background jobs                      | src/jobs/ + app/api/inngest/route.ts |
 
@@ -649,6 +670,26 @@ tarang-agent/
 - A distribution total is not a fleet size (Milestone 4D). `total` is the sum of a distribution's bands, and it is nullable: one unreadable band makes it null rather than a partial sum that would look like a fleet count and be one. It is also not assumed to equal the Fleet Overview vehicle count — on the live dashboard the Battery Temp bands summed to 317 while the fleet was 320, because a vehicle reporting no battery temperature at all falls in none of the bands. This is the same rule the metric catalogues follow: missing data is reported, never substituted with a zero.
 
 - A rendered timestamp carries the offset it was rendered with (Milestone 4C). "03-Aug-2026 03:13" is a wall clock with no zone, and this portal is a React SPA that formats dates client-side — so the zone is the BROWSER's, not a property of the data. The extractor therefore reads the page's own `getTimezoneOffset()` and hands it over alongside the text; the normalizer applies it, staying pure because the offset is an input rather than a clock read. The verbatim `rendered` string is always carried too, so the payload remains truthful even if a deployment's browser timezone is ever wrong.
+
+- The Analysis Engine is a service, and the model is no longer where two sources meet (Milestone 5A/5B). Before this milestone the Analysis Tool read one column of one table, the Portal Tool read one dashboard module, and NOTHING in the system held both at once — so every cross-source judgement happened inside the LLM's context window. That is where a grounded system stops being grounded: not by fabricating a number, but by making an unrecorded choice between two real ones. `src/services/analytics/` is created to own that choice, and it is created now rather than earlier because Milestone 2C's condition — "not until there is real analysis to put in it" — is finally met. It is a SERVICE, reached in-process by src/tools/analysis.tool.ts exactly as the Portal Service is reached by the Portal Tool: no fifth tool, no registry entry, no new agent-callable surface, and Level 1 still registers exactly four tools.
+
+- The engine never calls an LLM (Milestone 5A). Planning, reconciliation and computation are ordinary TypeScript, so an answer is reproducible from its inputs and a source decision is auditable rather than fluent. An LLM asked to choose between two numbers chooses confidently and unaccountably; the whole value of moving the choice into code is that the choice can be named, logged and reviewed. The model narrates what the engine decided.
+
+- The engine sits ABOVE both providers, and no existing arrow is reversed (Milestone 5B). The Portal Service still cannot see the database and the Database Service still cannot see the portal; the dependency runs analytics → portal and analytics → database, never the other way. A new Analytics zone in eslint.config.mjs enforces it in both directions, and the engine is barred from the Session Manager, the Credential Manager and Playwright exactly as a tool is — being a service buys it no privilege, so CLAUDE.md rule 1 holds by linter rather than by convention. The Database Service's own zone was split from the tool layer's at this milestone, because for the first time something existed above it that it could reach upward for.
+
+- Telemetry records moved below both consumers, and the reads were split from them (Milestone 5B). The record shapes and their Decimal/BigInt conversions lived in src/tools/database.tool.ts; the engine needs them, and a service importing from src/tools/ would invert the layering. They now live in src/services/database/telemetry.records.ts, which performs NO I/O — and that is why the reads were split into telemetry.reader.ts rather than left beside them. The pure half of the engine may import the records and could not be trusted to leave a reader alone, so the split is what makes the Analytics purity zone enforceable rather than aspirational. The same reasoning keeps normalizers.ts away from Playwright. `DatabaseToolError` became `TelemetryReadError` in the move: the type is now thrown on a path with no tool on it. Every MESSAGE is unchanged, which is what reaches the model.
+
+- Observation is the universal data model (Milestone 5A). No number enters the engine that is not boxed with the source that produced it, its source class, and both times that matter — when the quantity was measured, and when the row or page carrying it was reported. A bare number has nowhere to record any of that. This is the Tool Registry's envelope discipline applied one layer down: the envelope makes a tool RESULT traceable, and the Observation makes each VALUE INSIDE one traceable, which is what a multi-source answer needs and a single-source tool never did.
+
+- Source class is a second axis and does not amend the authoritative-feed table (Milestone 5A). §19's one-authoritative-feed rule governs which of the three HISTORICAL feeds answers a quantity and is restated verbatim in quantity-registry.ts, unchanged. `sourceClass` answers a question that table never spoke to: live dashboard reading, or recorded history. Keeping the two axes separate is what stops "the portal shows 62%" and "CAN recorded 41% six days ago" from being treated as rival answers to one question when they are answers to two.
+
+- Precedence rules are implemented only where they are reachable (Milestone 5B). The approved ruleset is P0–P7. Milestone 5B declares one provider per quantity, so only P2 (the authoritative feed), P5 (availability is not precedence — an unavailable source is reported, never silently replaced) and P6 (one reported number, one provider) can be reached, and only those are written. P0 needs a fleet-scope provider to exclude (5E); P1, P3 and P4 all rank a live candidate against a historical one and there are no live candidates until 5D. Writing them now would mean branches no test could enter — the judgement already recorded for TARGET_AMBIGUOUS. Averaging two sources is not a rule that had to be disabled: `ReconciledValue.chosen` is a single Observation carrying a single Provenance, so a blended number is unrepresentable.
+
+- Deduplication is a correctness mechanism, not an optimisation (Milestone 5B). Six of the ten quantities read `can_telemetry`. Fetching that row once per quantity would be wrong in a way worse than slow: three reads can return three different rows if telemetry arrives between them, and the answer would then present three quantities from three moments as one snapshot of the pack. Acquisitions are keyed by (source class, container, subject) — the planner's own key, so the cache is its decision made concrete rather than a second judgement — and the map holds the in-flight PROMISE rather than the resolved value, so concurrent requirements share one fetch instead of racing an empty cache. Measured: ten quantities cost four database reads, and all six CAN quantities carry one row time.
+
+- Milestone 5B changes nothing the model or the user can see, and that is the test (Milestone 5B). The Analysis Tool's input schema, description, default metric, result shape, field ORDER, envelope, `origin` and every reason string are byte-identical to Milestone 2C's — verified differentially against the live database over 8 vehicles × 10 metrics plus the catalogue text and the VEHICLE_NOT_FOUND throw path, 81 comparisons with no mismatch. Field order is part of the claim because `JSON.stringify` emits keys in insertion order, so a reordered result is a different string in the model's context and in every trace for identical data. An engine that answers the same questions the same way is an engine whose foundations can be trusted before 5C and 5D start asking it new ones.
+
+- Stage 5 and the live half are genuinely absent, not stubbed (Milestone 5B). battery-metrics.ts is not created, because 5B reports latest values only and there is nothing to compute; `Derivation` and `Conflict` are not declared, because nothing can produce them; `contributingSources` is not added to SourceAttribution, because there is never more than one source to list. Each arrives in the slice that fills it — computation at 5C, the live provider and conflict disclosure at 5D. This is the rule this codebase has applied since it declined to create src/lib/langsmith.ts.
 
 - Script Runner deferred to Level 2. Arbitrary LLM-generated code execution is the highest-risk, lowest-value tool at this stage and overlaps the Analysis Tool. It returns at Level 2 as a properly sandboxed capability (isolated process or ephemeral container).
 

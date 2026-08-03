@@ -1,0 +1,78 @@
+{
+  "_comment": [
+    "Captured telemetry records (Milestone 5B) — real rows from data/samples/,",
+    "converted to the JSON-safe shape src/services/database/telemetry.records.ts",
+    "produces. This is what makes projections.ts purity useful rather than merely",
+    "true: every projection can be exercised against these with no database, no",
+    "connection and no Prisma, exactly as a portal normalizer runs against",
+    "src/services/portal/fixtures/.",
+    "",
+    "PROVENANCE. battery and gps are row 2 of telemetry_battery.csv and",
+    "telemetry_gps.csv (vehicle TK-51105-02AZ-179386, 2026-06-16). can is row 2 of",
+    "telemetry_can.csv (vehicle TK-51105-06DZ-215008, 2026-06-25). The CAN payload",
+    "is TRIMMED from its 113 signals to the ones the catalogue reads plus four kept",
+    "as evidence; no value was altered and none was invented.",
+    "",
+    "WHAT THE KEPT EVIDENCE SHOWS.",
+    "- battery_temp reads 41.05000000000001 — the upstream float artifact that is",
+    "  why projections round to the precision the source actually carries.",
+    "- mfh and soh_1 are stamped 1781850017186, which is 5.7 DAYS older than the",
+    "  row's own recordedAt. The payload is a last-known-value snapshot, so",
+    "  recordedAt equals only the freshest signal — which is why every CAN",
+    "  observation carries its own measuredAt (docs/DATA-IMPORT.md §7).",
+    "- soh reads 100 and soh_1 reads 99 in the same row: the two competing CAN",
+    "  state-of-health signals SAD §19 rejects in favour of battery_telemetry.soh_pct.",
+    "- cell_voltage_20 reads 0 V against no_of_cells = 16 — a zero-padded slot",
+    "  beyond the pack's real cell count, which is why cell_balance reads the",
+    "  BMS-computed extremes instead of aggregating the numbered slots."
+  ],
+
+  "battery": {
+    "vehicleNo": "TK-51105-02AZ-179386",
+    "recordedAt": "2026-06-16T23:56:34.784Z",
+    "socPct": 100,
+    "sohPct": 100,
+    "packVoltage": null,
+    "packCurrent": null,
+    "packTempC": null,
+    "cellMinMv": null,
+    "cellMaxMv": null,
+    "charging": null
+  },
+
+  "gps": {
+    "vehicleNo": "TK-51105-02AZ-179386",
+    "recordedAt": "2026-06-16T23:09:41.459Z",
+    "lat": 25.433644,
+    "lon": 82.10832,
+    "speedKph": 0.23,
+    "heading": 0,
+    "ignition": false,
+    "gpsFix": true,
+    "extVoltage": 57.05
+  },
+
+  "can": {
+    "vehicleNo": "TK-51105-06DZ-215008",
+    "recordedAt": "2026-06-25T00:02:40.886Z",
+    "payload": {
+      "soc": { "value": 85, "timestamp": 1782345760886 },
+      "battery_voltage": { "value": 52.92, "timestamp": 1782345760886 },
+      "current": { "value": 21.51, "timestamp": 1782345760886 },
+      "battery_temp": { "value": 41.05000000000001, "timestamp": 1782345760886 },
+      "charge_cycle": { "value": 47, "timestamp": 1782345760886 },
+      "minimum_cell_voltage": { "value": 3.285, "timestamp": 1782345760886 },
+      "maximum_cell_voltage": { "value": 3.319, "timestamp": 1782345760886 },
+      "minimum_cell_temperature": {
+        "value": 38.950000000000045,
+        "timestamp": 1782345760886
+      },
+      "maximum_cell_temperature": { "value": 39.75, "timestamp": 1782345760886 },
+      "soh": { "value": 100, "timestamp": 1782345760886 },
+      "soh_1": { "value": 99, "timestamp": 1781850017186 },
+      "mfh": { "value": 0, "timestamp": 1781850017186 },
+      "no_of_cells": { "value": 16, "timestamp": 1782345760886 },
+      "cell_voltage_20": { "value": 0, "timestamp": 1782345760886 }
+    }
+  }
+}
