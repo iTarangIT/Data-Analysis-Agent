@@ -14,8 +14,8 @@ import {
   planAnalysis,
   type AnalysisPlan,
   type AnalysisRequest,
+  type CandidateSource,
   type DerivationRequest,
-  type SourceRequirement,
 } from "./planner";
 import type { Projection } from "./projections";
 import {
@@ -23,6 +23,7 @@ import {
   provenanceOf,
   QUANTITY_REGISTRY,
   type HistoricalProvider,
+  type LiveProvider,
   type QuantityKey,
 } from "./quantity-registry";
 import { reconcile } from "./reconcile";
@@ -120,7 +121,7 @@ export interface AnalysisOptions {
  */
 function projectOne(
   provider: HistoricalProvider,
-  snapshot: FeedSnapshot,
+  snapshot: Exclude<FeedSnapshot, { mode: "live" }>,
   reading: unknown
 ): Projection {
   switch (provider.feed) {
@@ -378,39 +379,112 @@ function observeDerived(
 /* -------------------------------------------------------------------------- */
 
 /**
- * Turn one acquisition into one Observation.
+ * Turn one live dashboard reading into an Observation (Milestone 5D-3).
  *
- * Absence is reported here, never thrown — "this vehicle has no CAN data" is a
- * correct answer to a question about its state of charge, and reporting it keeps
- * the quantity's identity and provenance intact instead of collapsing them into
- * an error string (SAD §19, Milestone 2C).
+ * The two times land exactly where the historical path puts them, which is what
+ * lets everything downstream treat a portal reading and a CAN signal as the same
+ * kind of thing:
+ *
+ *   - `measuredAt` is when the VEHICLE last reported, taken from the portal's
+ *     own Last Talk Time by the projection. Not `capturedAt`.
+ *   - `reportedAt` is `capturedAt`, when Tarang read the page — the exact
+ *     counterpart of a row's `recorded_at`.
+ *
+ * A failed portal read arrives here as `ok: false` and becomes an unavailable
+ * observation carrying the Portal Service's own message, which is already
+ * written to be safe to show. P5 then reports the historical value and names the
+ * substitution; nothing is silently swapped.
+ */
+function observeLive(
+  base: ObservationBaseFields,
+  provider: LiveProvider,
+  snapshot: Extract<FeedSnapshot, { mode: "live" }>
+): Observation {
+  if (!snapshot.ok) {
+    return {
+      ...base,
+      available: false,
+      measuredAt: null,
+      reportedAt: null,
+      reason: snapshot.reason,
+    };
+  }
+
+  const reportedAt = snapshot.summary.capturedAt;
+  const projection = provider.project(snapshot.summary);
+
+  if (!projection.ok) {
+    return {
+      ...base,
+      available: false,
+      measuredAt: null,
+      reportedAt,
+      reason: projection.reason,
+    };
+  }
+
+  return {
+    ...base,
+    available: true,
+    value: projection.value,
+    measuredAt: projection.measuredAt,
+    reportedAt,
+    ...(projection.detail ? { detail: projection.detail } : {}),
+  };
+}
+
+/**
+ * Turn one acquired candidate into one Observation.
+ *
+ * Absence is reported here, never thrown — "this vehicle has no CAN data" and
+ * "the dashboard does not list this vehicle" are both correct answers, and
+ * reporting them keeps the quantity's identity and provenance intact instead of
+ * collapsing them into an error string (SAD §19, Milestone 2C).
  */
 function observe(
-  requirement: SourceRequirement,
+  quantity: QuantityKey,
+  candidate: CandidateSource,
   acquisitions: Acquisitions,
   derivation: DerivationRequest | undefined
 ): Observation {
-  const { quantity, provider } = requirement;
   const { label, unit } = QUANTITY_REGISTRY[quantity];
   const base: ObservationBaseFields = {
     quantity,
     label,
     unit,
-    provenance: provenanceOf(provider),
+    provenance: provenanceOf(candidate.provider),
   };
 
-  const snapshot = acquisitions.get(requirement.acquisitionKey);
+  const snapshot = acquisitions.get(candidate.acquisitionKey);
 
   // Missing from the map is a wiring-bug class: the planner produced the key and
   // the acquirer fetched every key it produced. It fails loudly rather than
   // reporting a data gap that is really a code gap.
   if (snapshot === undefined) {
     throw new Error(
-      `Quantity "${quantity}" was planned against "${requirement.acquisitionKey}", which was never acquired.`
+      `Quantity "${quantity}" was planned against "${candidate.acquisitionKey}", which was never acquired.`
     );
   }
 
-  if (snapshot.mode === "latest") return observeLatest(base, provider, snapshot);
+  if (candidate.sourceClass === "live") {
+    if (snapshot.mode !== "live") {
+      throw new Error(
+        `Quantity "${quantity}" planned a live source but acquired a ${snapshot.mode} snapshot.`
+      );
+    }
+
+    return observeLive(base, candidate.provider, snapshot);
+  }
+
+  if (snapshot.mode === "live") {
+    throw new Error(
+      `Quantity "${quantity}" planned a historical source but acquired a live snapshot.`
+    );
+  }
+
+  if (snapshot.mode === "latest") {
+    return observeLatest(base, candidate.provider, snapshot);
+  }
 
   if (derivation === undefined) {
     throw new Error(
@@ -418,7 +492,7 @@ function observe(
     );
   }
 
-  return observeDerived(base, provider, snapshot, derivation);
+  return observeDerived(base, candidate.provider, snapshot, derivation);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -451,20 +525,23 @@ export async function runAnalysis(
 
   // 4/6 — Reconcile each quantity, then assemble.
   //
-  // Every requirement produces exactly ONE candidate at 5C, so `reconcile`
-  // reports P2 on every finding. The single-element array is not ceremony: it is
-  // the shape 5D fills with a second candidate, and building the finding any
-  // other way would mean rewriting this loop rather than extending it.
+  // The candidate list the planner ordered becomes a list of Observations in the
+  // same order, and reconcile applies P4 and P5 over it. From Milestone 5D-3 that
+  // list can hold two members; the loop is unchanged from 5B, which is what the
+  // single-element array was always for.
   const findings = plan.requirements.map<Finding>((requirement) => {
-    const { label, unit } = QUANTITY_REGISTRY[requirement.quantity];
+    const { label, unit, reconciliation } =
+      QUANTITY_REGISTRY[requirement.quantity];
+
+    const candidates = requirement.candidates.map((candidate) =>
+      observe(requirement.quantity, candidate, acquisitions, plan.derivation)
+    );
 
     return {
       quantity: requirement.quantity,
       label,
       unit,
-      reconciled: reconcile(requirement.quantity, [
-        observe(requirement, acquisitions, plan.derivation),
-      ]),
+      reconciled: reconcile(requirement.quantity, candidates, reconciliation),
     };
   });
 

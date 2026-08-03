@@ -5,14 +5,20 @@ import { runAnalysis, type Finding } from "@/services/analytics/analysis-engine"
 import {
   DERIVATION_OPERATIONS,
   type AnalysisWindow,
+  type Conflict,
   type Derivation,
+  type Observation,
   type ObservationValue,
+  type PrecedenceRule,
+  type ReconciliationDisposition,
+  type SourceClass,
 } from "@/services/analytics/observations";
 import {
   DERIVABLE_QUANTITIES,
   QUANTITIES,
   QUANTITY_CATALOGUE_TEXT,
 } from "@/services/analytics/quantity-registry";
+import type { ContributingSource } from "@/types/chat";
 
 /**
  * Analysis Tool (SAD §6) — the Tool layer's adapter over the Analysis Engine.
@@ -49,6 +55,23 @@ import {
  * Registry, so this declares only where its numbers came from and how they were
  * obtained.
  */
+
+/**
+ * Ceiling for one analysis, overriding the registry's 30s default
+ * (Milestone 5D-3).
+ *
+ * The second sanctioned use of `ToolSpec.timeoutMs` (SAD §19, Milestone 3.5),
+ * and for the same reason the Portal Tool has one: this tool's work is now a
+ * genuinely different shape from an in-process read. A latest-value request for
+ * a quantity the dashboard can answer may open a browser context, wait on a
+ * client-rendered SPA, and page a 320-row table — work the Portal Tool already
+ * budgets 90 seconds for — and the database leg runs alongside it.
+ *
+ * 120s is that 90 plus room for the historical read and the engine's own work.
+ * It is a CEILING, not a delay: a request with no live provider still returns in
+ * milliseconds, and a derivation makes no portal call at all.
+ */
+export const ANALYSIS_TOOL_TIMEOUT_MS = 120_000;
 
 /** Ceiling on a relative window, so a runaway request cannot ask for decades. */
 const MAX_WINDOW_DAYS = 3650;
@@ -108,6 +131,40 @@ interface MetricResult {
    * not be computed, which is what makes an insufficiency answer actionable.
    */
   derivation?: Derivation;
+  /**
+   * Present exactly when MORE THAN ONE source was consulted (Milestone 5D-3).
+   *
+   * Absent for every quantity the portal cannot answer, and for every windowed
+   * derivation — a derivation is historical by definition and admits no live
+   * candidate. Its absence is therefore not a silence about reconciliation; it
+   * means there was nothing to reconcile, and the result is byte-identical to
+   * what Milestone 5C produced.
+   */
+  reconciliation?: {
+    /** Which class actually answered. */
+    sourceClass: SourceClass;
+    /** The precedence rule that selected it. Never inferred, always stated. */
+    rule: PrecedenceRule;
+    disposition: ReconciliationDisposition;
+    /** Set when the sources disagreed by more than tolerance. */
+    conflict?: Conflict;
+    /**
+     * Every source that did not answer, with what it said.
+     *
+     * Carried in `data` rather than only in the envelope because the model needs
+     * the OTHER value to hand: when the disposition is "disputed" it must report
+     * both rather than lead with one, and it cannot do that from a value it was
+     * never given.
+     */
+    otherSources: {
+      origin: string;
+      sourceClass: SourceClass;
+      available: boolean;
+      value: ObservationValue | null;
+      measuredAt: string | null;
+      reason?: string;
+    }[];
+  };
 }
 
 /**
@@ -119,8 +176,82 @@ interface MetricResult {
  * data. `derivation` is appended LAST for the same reason — it must not displace
  * a key that a derivation-free request already emits.
  */
+/**
+ * The attribution list for the envelope's Sources block, when more than one
+ * source took part (Milestone 5D-4).
+ *
+ * Built MECHANICALLY from the reconciliation — every entry corresponds to an
+ * Observation the engine actually produced in this run, so a fabricated source
+ * is structurally impossible for the same reason a fabricated citation is: the
+ * list is derived from what happened, never from what the answer claims.
+ *
+ * Returns undefined for a single-source result, which keeps every envelope that
+ * had one source before this milestone byte-identical to what it was.
+ */
+function toContributingSources(
+  finding: Finding
+): ContributingSource[] | undefined {
+  const { chosen, alternatives } = finding.reconciled;
+
+  if (alternatives.length === 0) return undefined;
+
+  const describe = (
+    observation: Observation,
+    role: ContributingSource["role"]
+  ): ContributingSource => ({
+    origin: observation.provenance.origin,
+    sourceClass: observation.provenance.sourceClass,
+    quantity: finding.quantity,
+    role,
+    available: observation.available,
+    measuredAt: observation.measuredAt,
+    reportedAt: observation.reportedAt,
+    ...(observation.derivation ? { basis: observation.derivation.basis } : {}),
+  });
+
+  return [
+    describe(chosen, "chosen"),
+    ...alternatives.map((alternative) => describe(alternative, "alternative")),
+  ];
+}
+
+function summariseSource(observation: Observation) {
+  return {
+    origin: observation.provenance.origin,
+    sourceClass: observation.provenance.sourceClass,
+    available: observation.available,
+    value: observation.available ? observation.value : null,
+    measuredAt: observation.measuredAt,
+    ...(observation.available ? {} : { reason: observation.reason }),
+  };
+}
+
+/**
+ * The reconciliation block, or nothing at all.
+ *
+ * Emitted ONLY when a second source was consulted. That keeps every quantity the
+ * portal cannot answer, and every windowed derivation, byte-identical to
+ * Milestone 5C — the disclosure appears exactly where there is something to
+ * disclose, rather than adding an empty ceremony to every answer in the system.
+ */
+function toReconciliation(finding: Finding): MetricResult["reconciliation"] {
+  const { chosen, rule, alternatives, conflict, disposition } =
+    finding.reconciled;
+
+  if (alternatives.length === 0) return undefined;
+
+  return {
+    sourceClass: chosen.provenance.sourceClass,
+    rule,
+    disposition,
+    ...(conflict === undefined ? {} : { conflict }),
+    otherSources: alternatives.map(summariseSource),
+  };
+}
+
 function toMetricResult(finding: Finding, vehicleNo: string): MetricResult {
   const { chosen } = finding.reconciled;
+  const reconciliation = toReconciliation(finding);
 
   const base = {
     metric: finding.quantity,
@@ -138,6 +269,7 @@ function toMetricResult(finding: Finding, vehicleNo: string): MetricResult {
       reportedAt: chosen.reportedAt,
       reason: chosen.reason,
       ...(chosen.derivation ? { derivation: chosen.derivation } : {}),
+      ...(reconciliation ? { reconciliation } : {}),
     };
   }
 
@@ -149,6 +281,7 @@ function toMetricResult(finding: Finding, vehicleNo: string): MetricResult {
     reportedAt: chosen.reportedAt,
     ...(chosen.detail ? { detail: chosen.detail } : {}),
     ...(chosen.derivation ? { derivation: chosen.derivation } : {}),
+    ...(reconciliation ? { reconciliation } : {}),
   };
 }
 
@@ -304,8 +437,15 @@ export const analysisToolSpec: ToolSpec<typeof analysisInputSchema> = {
     "When a metric comes back with available=false, the vehicle has no such " +
     "reading, or the period holds too little data to compute it — the reason " +
     "says which. Report that gap rather than substituting another metric, and " +
-    "do not retry the same window expecting a different answer.",
+    "do not retry the same window expecting a different answer. " +
+    "For speed and last_known_location this tool also reads the live Intellicar " +
+    "dashboard and reconciles it against recorded telemetry; that costs a page " +
+    "load, so ask about the specific vehicle in question rather than looping " +
+    "over a fleet. When a result carries a `reconciliation` block, more than " +
+    "one source was consulted: report which one the value came from, and if it " +
+    "carries a `conflict`, say so and give both figures.",
   schema: analysisInputSchema,
+  timeoutMs: ANALYSIS_TOOL_TIMEOUT_MS,
   // Per-result origin names the table actually read; this is the fallback the
   // registry uses when the handler throws before a source answers.
   origin: "postgres:tarang_dev",
@@ -340,6 +480,8 @@ export const analysisToolSpec: ToolSpec<typeof analysisInputSchema> = {
     const { provenance } = finding.reconciled.chosen;
     const projected = toMetricResult(finding, vehicleNo);
 
+    const contributingSources = toContributingSources(finding);
+
     return {
       data: projected,
       // Attribution names the exact table and column the number came from, so
@@ -348,6 +490,9 @@ export const analysisToolSpec: ToolSpec<typeof analysisInputSchema> = {
       // here, so the cited source is by construction the one that answered.
       origin: provenance.origin,
       method: describeMethod(projected, provenance.container, provenance.field),
+      // Present only when a second source was consulted, so the envelope of a
+      // single-source answer is unchanged.
+      ...(contributingSources ? { contributingSources } : {}),
     };
   },
 };
@@ -367,6 +512,21 @@ function describeMethod(
   table: string,
   column: string
 ): Record<string, unknown> {
+  // A live reading is not a table and a column, and calling it one would put a
+  // dashboard module behind a word that means "database table" everywhere else
+  // in this system. It gets its own shape, and the precedence rule travels with
+  // it so the Sources block can say why this source answered.
+  if (result.reconciliation?.sourceClass === "live") {
+    return {
+      basis: "live dashboard reading",
+      module: table,
+      field: column,
+      rule: result.reconciliation.rule,
+      measuredAt: result.measuredAt,
+      reportedAt: result.reportedAt,
+    };
+  }
+
   if (result.derivation === undefined) {
     return {
       basis: "latest telemetry reading",
@@ -374,6 +534,9 @@ function describeMethod(
       column,
       measuredAt: result.measuredAt,
       reportedAt: result.reportedAt,
+      // Present only when a second source was consulted, so a quantity the
+      // portal cannot answer keeps the Milestone 5C shape exactly.
+      ...(result.reconciliation ? { rule: result.reconciliation.rule } : {}),
     };
   }
 

@@ -3,7 +3,7 @@ import type { z } from "zod";
 
 import { analysisToolSpec } from "@/tools/analysis.tool";
 import { portalToolSpec } from "@/tools/portal.tool";
-import type { ToolEnvelope } from "@/types/chat";
+import type { ContributingSource, ToolEnvelope } from "@/types/chat";
 
 /**
  * Tool Registry (SAD §6) — the single catalogue of agent capabilities.
@@ -57,6 +57,20 @@ export interface ToolResult<TData = unknown> {
    * answered.
    */
   origin?: string;
+  /**
+   * Every source that took part, when more than one did (Milestone 5D-4).
+   *
+   * The companion to `origin` rather than a replacement for it: `origin` still
+   * names the source that ANSWERED, and this names the ones that were consulted.
+   * A tool reading a single source omits it, and its envelope is unchanged.
+   *
+   * The registry copies it; it does not build it. A tool knows which sources it
+   * weighed and the registry does not, so this follows exactly the split that
+   * already applies to `method` and `origin` — the tool declares the CONTENT of
+   * the attribution and the registry owns its SHAPE and the guarantee that one
+   * exists at all (CLAUDE.md rule 2).
+   */
+  contributingSources?: ContributingSource[];
 }
 
 /**
@@ -281,6 +295,11 @@ function defineTool<TSchema extends z.ZodObject>(spec: ToolSpec<TSchema>) {
             params,
             timestamp,
             ...(result.method ? { method: result.method } : {}),
+            // Spread conditionally, exactly as `method` is, so a single-source
+            // result produces the same bytes it always has.
+            ...(result.contributingSources
+              ? { contributingSources: result.contributingSources }
+              : {}),
           },
         };
         return JSON.stringify(envelope);

@@ -4,11 +4,16 @@ import type {
   GpsReadingRecord,
 } from "@/services/database/telemetry.records";
 
+import type { VehicleSummary } from "@/services/portal/normalizers";
+
+import type { ComparisonSpec } from "./conflict";
 import type { Provenance, SourceClass } from "./observations";
 import {
   batteryHealth,
   canScalar,
   canSpread,
+  liveCoordinates,
+  liveScalar,
   location,
   speed,
   TEMPERATURE_FLOOR_C,
@@ -145,7 +150,29 @@ export type HistoricalProvider = {
   | { feed: "gps"; project: (reading: GpsReadingRecord) => Projection }
 );
 
-export interface QuantityDefinition {
+/**
+ * A live provider: one portal module, one of its fields, and the pure projection
+ * that reads it (Milestone 5D-2).
+ *
+ * `module` is a plain string rather than the Portal Service's `PortalModule`
+ * type on purpose. Importing that type would pull portal.service.ts — and
+ * through it the Session Manager and Playwright — into the registry, and
+ * therefore into the Analysis Tool, at import time. The engine reaches the
+ * portal from exactly one file (acquisition.ts, at 5D-3), and the vocabulary
+ * does not need a browser to describe itself.
+ */
+export interface LiveProvider {
+  sourceClass: Extract<SourceClass, "live">;
+  /** Portal module id, resolved against PORTAL_MODULES where it is used. */
+  module: string;
+  /** Envelope-facing origin, e.g. "intellicar:vehicle_summary". */
+  origin: string;
+  /** The module's own field key, as its catalogue names it. */
+  field: string;
+  project: (summary: VehicleSummary) => Projection;
+}
+
+interface QuantityBase {
   key: QuantityKey;
   /** Human-readable name, for prose. */
   label: string;
@@ -188,6 +215,37 @@ export interface QuantityDefinition {
    */
   historical: HistoricalProvider;
 }
+
+/**
+ * One quantity, and — when the portal can also answer it — how the two sources
+ * are compared.
+ *
+ * A DISCRIMINATED PAIR, not two loose optional fields: a quantity that declares
+ * a live provider MUST declare how its two sources are compared, and the
+ * compiler rejects one without the other. Without that pairing a live provider
+ * could be added and the comparison forgotten, and the engine would then hold
+ * two values for one quantity with no declared notion of what counts as
+ * disagreement — so it would either report them as agreeing or invent a
+ * threshold at the point of use.
+ *
+ * This is the same reasoning `defineCapability()` applies at Milestone 4C, where
+ * `targeted: true` requires both `resolve` and `assertIdentity`: a capability
+ * that reports one entity cannot be declared without the step that proves which
+ * entity it read.
+ */
+export type QuantityDefinition = QuantityBase &
+  (
+    | {
+        /** No live provider: this quantity is answerable only from history. */
+        live?: undefined;
+        reconciliation?: undefined;
+      }
+    | {
+        live: LiveProvider;
+        /** REQUIRED by this arm. Calibrated in the 5D-1 discovery pass. */
+        reconciliation: ComparisonSpec;
+      }
+  );
 
 /* -------------------------------------------------------------------------- */
 /*  The catalogue                                                             */
@@ -376,7 +434,15 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
     },
   },
 
-  /** Latest measured speed, and — from Milestone 5C — aggregates over a window. */
+  /**
+   * Latest measured speed, aggregates over a window (5C), and — from 5D — a
+   * live counterpart on the dashboard's Table View.
+   *
+   * The portal titles this column "Speed" and renders it in km/h, which is the
+   * same quantity in the same unit as `gps_telemetry.speed_kph`. It is READ
+   * rather than reinterpreted, so the naming discipline of Milestone 4C is
+   * untouched: nothing is being relabelled to make a match.
+   */
   speed: {
     key: "speed",
     label: "Speed",
@@ -391,11 +457,51 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
       column: "speed_kph",
       project: speed({ decimals: 2 }),
     },
+    live: {
+      sourceClass: "live",
+      module: "vehicle_summary",
+      origin: "intellicar:vehicle_summary",
+      field: "speed",
+      project: liveScalar({ field: "speed", label: "speed", decimals: 2 }),
+    },
+    reconciliation: {
+      comparison: "scalar",
+      deltaUnit: "km/h",
+      /**
+       * CALIBRATED, 2026-08-03. Consecutive GPS samples for the one vehicle
+       * carrying this feed move by a median of 0.30 km/h and a 95th percentile
+       * of 19.82 km/h, so 2 km/h sits above sampling noise while staying far
+       * below a real change of pace. The one genuine cross-source pair in this
+       * deployment differs by 0.23 km/h — correctly inside tolerance, and
+       * therefore not a conflict.
+       */
+      threshold: 2,
+      /**
+       * An upper bound on physical change, not an observed one. The measured
+       * maximum across consecutive samples is 559 km/h per hour, but those
+       * samples are minutes apart and a vehicle can change pace far faster than
+       * that within one; 3600 km/h per hour is one km/h per second, a modest
+       * sustained acceleration, and roughly six times the observed figure.
+       *
+       * The consequence is deliberate and correct: speed is a high-frequency
+       * quantity, so almost any difference across a meaningful gap IS explained
+       * by the gap. Comparing a live speed against a GPS row from seven weeks
+       * ago tells you nothing about a disagreement, and the engine says so
+       * rather than manufacturing one.
+       */
+      plausibleChangePerHour: 3_600,
+    },
   },
 
   /**
    * Position as a single value. Latitude and longitude are never separated, and
    * this is the one quantity no derivation applies to — see `derivable`.
+   *
+   * The portal's counterpart is the Table View's Address column, which on this
+   * deployment renders coordinates rather than a street address — measured at
+   * 320 of 320 rows during the Milestone 5D-1 discovery pass. A cell that ever
+   * holds a genuine address is reported as unavailable by the live projection
+   * rather than geocoded.
    */
   last_known_location: {
     key: "last_known_location",
@@ -410,6 +516,42 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
       table: "gps_telemetry",
       column: "lat, lon",
       project: location({ decimals: 6 }),
+    },
+    live: {
+      sourceClass: "live",
+      module: "vehicle_summary",
+      origin: "intellicar:vehicle_summary",
+      field: "location",
+      project: liveCoordinates({
+        field: "location",
+        label: "a location",
+        decimals: 6,
+      }),
+    },
+    reconciliation: {
+      /**
+       * Positions are compared as a great-circle DISTANCE, never as a scalar
+       * difference in degrees: a degree of longitude is 111 km at the equator
+       * and nothing at the pole, so degrees are not a distance.
+       */
+      comparison: "distance",
+      deltaUnit: "m",
+      /**
+       * CALIBRATED, 2026-08-03. Consecutive fixes taken while the vehicle was
+       * effectively stationary scatter by at most 11.26 m (n=15, p95 = max), so
+       * 50 m sits roughly four times above the noise floor while still being a
+       * short walk. A parked vehicle must not report a conflict with itself
+       * every time it is read.
+       */
+      threshold: 50,
+      /**
+       * The physical ceiling for a road vehicle, 120 km/h expressed in metres.
+       * The fastest movement measured in this fleet is far below it — 16 km/h
+       * between consecutive fixes, and 32 km/h on the live dashboard — so the
+       * bound is deliberately generous: its job is to decide what is POSSIBLE,
+       * not to describe what is typical.
+       */
+      plausibleChangePerHour: 120_000,
     },
   },
 };
@@ -432,7 +574,23 @@ export const DERIVABLE_QUANTITIES = QUANTITIES.filter(
  * `postgres:<table>` — rather than a new vocabulary, so the user-facing Sources
  * block is unchanged.
  */
-export function provenanceOf(provider: HistoricalProvider): Provenance {
+export function provenanceOf(
+  provider: HistoricalProvider | LiveProvider
+): Provenance {
+  // A live provider states its own origin, because "intellicar:vehicle_summary"
+  // is not derivable from a table name the way "postgres:gps_telemetry" is. The
+  // two forms deliberately read alike — source system, then the thing inside it
+  // that answered — so the user-facing Sources block stays legible when one
+  // answer cites both.
+  if (provider.sourceClass === "live") {
+    return {
+      origin: provider.origin,
+      sourceClass: provider.sourceClass,
+      container: provider.module,
+      field: provider.field,
+    };
+  }
+
   return {
     origin: `postgres:${provider.table}`,
     sourceClass: provider.sourceClass,

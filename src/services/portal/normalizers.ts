@@ -133,6 +133,66 @@ export function parseCoordinates(
   return { lat, lon };
 }
 
+/**
+ * The instant range a rendered epoch is allowed to fall in.
+ *
+ * The guard that makes `parseEpochMillis` unambiguous rather than merely
+ * permissive: epoch SECONDS for the same moment is a ten-digit number, and
+ * reading one as milliseconds would silently place a 2026 reading in 1970. A
+ * seconds value fails both the digit-count test and this range, so the two
+ * encodings cannot be confused.
+ */
+const EPOCH_MS_FLOOR = Date.UTC(2000, 0, 1);
+const EPOCH_MS_CEILING = Date.UTC(2100, 0, 1);
+
+/**
+ * Read a timestamp the portal rendered as raw epoch MILLISECONDS.
+ *
+ * ## Why this exists (Milestone 5D-1 discovery)
+ *
+ * The Table View renders "Last Talk Time" in TWO forms, and which one you get
+ * depends on when you look. Measured against the live dashboard on 2026-08-03,
+ * across all 320 rows in one pass: 200 rows carried a bare epoch such as
+ * `1785744365673`, and 120 carried the formatted `03-Aug-2026 13:53`. The split
+ * fell exactly on the pager boundary — the page read first was raw, the page
+ * read last was formatted — because this React table formats its timestamps
+ * client-side AFTER the row renders. The same vehicle was observed unparseable
+ * on a cold read and parseable on a warm one, which is the same finding from the
+ * other direction.
+ *
+ * Before this, a raw row produced `available: false` with "in a format this
+ * system does not recognise" — a true statement about the parser and a false
+ * impression about the portal, which had in fact reported the time perfectly
+ * well. Roughly three fifths of reads were affected.
+ *
+ * ## Why this is a separate function, not a branch inside parseRenderedTimestamp
+ *
+ * They parse different things. `parseRenderedTimestamp` turns a WALL CLOCK with
+ * no zone into an instant by applying the offset that produced it. An epoch is
+ * already an instant: it needs no offset, cannot be misread by a browser in the
+ * wrong timezone, and is strictly better evidence. Folding it into the other
+ * function would give that function two contracts and force a meaningless offset
+ * on a value that has none — which is why the payload records WHICH of the two
+ * produced a value (see `basis`) rather than hiding the difference.
+ *
+ * Returns null for anything that is not a plausible epoch, which the caller then
+ * tries to read as a rendered wall clock instead.
+ */
+export function parseEpochMillis(rendered: string): string | null {
+  const text = squash(rendered);
+
+  // Twelve digits is year 2001; fourteen is far beyond the ceiling below. Ten
+  // digits — epoch seconds — is deliberately outside this range.
+  if (!/^\d{12,14}$/.test(text)) return null;
+
+  const value = Number(text);
+  if (!Number.isSafeInteger(value)) return null;
+  if (value < EPOCH_MS_FLOOR || value >= EPOCH_MS_CEILING) return null;
+
+  const instant = new Date(value);
+  return Number.isNaN(instant.getTime()) ? null : instant.toISOString();
+}
+
 const MONTHS = [
   "jan", "feb", "mar", "apr", "may", "jun",
   "jul", "aug", "sep", "oct", "nov", "dec",
@@ -514,13 +574,30 @@ const vehicleValueSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("number"), number: z.number() }),
   z.object({
     kind: z.literal("timestamp"),
-    /** The instant, derived from `rendered` and the page's offset. */
+    /** The instant, derived from `rendered` as `basis` describes. */
     iso: z.iso.datetime(),
     /** Exactly what the portal displayed. Always carried, never derived. */
     rendered: z.string().min(1),
-    /** How `iso` was arrived at, so the derivation is never implicit. */
-    basis: z.literal("browser_timezone_offset"),
-    offsetMinutes: z.number().int(),
+    /**
+     * How `iso` was arrived at, so the derivation is never implicit.
+     *
+     * TWO forms, because the portal renders two (Milestone 5D-1 discovery —
+     * see `parseEpochMillis`). They are not interchangeable and the difference
+     * is worth carrying: `epoch_milliseconds` is an absolute instant that needed
+     * no interpretation, while `browser_timezone_offset` is a wall clock read
+     * through the scraping browser's zone and is therefore only as correct as
+     * that zone. A consumer weighing how much to trust an instant can tell them
+     * apart; one that does not care reads `iso` and ignores this.
+     */
+    basis: z.enum(["epoch_milliseconds", "browser_timezone_offset"]),
+    /**
+     * The offset applied, or null when none was — an epoch carries its own zone.
+     *
+     * Nullable rather than optional so the epoch case must be stated rather than
+     * left out, and so a reader cannot mistake "no offset was needed" for "the
+     * offset was forgotten".
+     */
+    offsetMinutes: z.number().int().nullable(),
   }),
   z.object({
     kind: z.literal("coordinates"),
@@ -636,6 +713,28 @@ export function normalizeVehicleSummary(raw: VehicleSummaryRaw): unknown {
       }
 
       case "timestamp": {
+        // Epoch FIRST, because it is unambiguous and needs no offset: a value
+        // that parses here is an instant the portal stated outright, rather than
+        // one inferred through the scraping browser's timezone. The wall-clock
+        // reader is the fallback for rows the portal has already formatted.
+        const epoch = parseEpochMillis(text);
+
+        if (epoch !== null) {
+          return {
+            key,
+            label,
+            available: true,
+            value: {
+              kind: "timestamp",
+              iso: epoch,
+              rendered: text,
+              basis: "epoch_milliseconds",
+              offsetMinutes: null,
+            },
+            unit: spec.unit,
+          };
+        }
+
         const iso = parseRenderedTimestamp(text, raw.renderOffsetMinutes);
         return iso === null
           ? unavailable(

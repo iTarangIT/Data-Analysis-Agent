@@ -1,0 +1,105 @@
+{
+  "_comment": [
+    "Cross-source pairs for the conflict matrix (Milestone 5D-2).",
+    "",
+    "WHAT IS REAL AND WHAT IS CONSTRUCTED — stated per entry in `origin` below,",
+    "because the difference matters. `measured` entries are values read from the",
+    "live Intellicar dashboard and the loaded telemetry database on 2026-08-03.",
+    "`constructed` entries are built to reach states this deployment's data",
+    "CANNOT produce, and each says which real value it is derived from.",
+    "",
+    "WHY ANY ENTRY NEEDS CONSTRUCTING. The telemetry sample ends 2026-06-17 and",
+    "the portal is live now, so every real pair is about seven weeks apart. At",
+    "that separation the plausible-change bound is enormous and every difference",
+    "is explained by age — which is the CORRECT verdict, and which means the",
+    "`unexplained` path is unreachable from real data. It is the path that",
+    "matters most in production, so it is exercised here instead. Milestone 5C",
+    "recorded the same kind of admission about degradation trends: the data",
+    "cannot support them, and that is reported rather than worked around.",
+    "",
+    "The `unknownAge` entry is not hypothetical. Last Talk Time renders as a raw",
+    "epoch before the page formats it, so a live reading with no measurement",
+    "time was observed on 200 of 320 rows in one pass. It is the reason",
+    "AgeExplanation has three states rather than two."
+  ],
+
+  "agreeingSpeed": {
+    "origin": "measured",
+    "note": "The one genuine cross-source pair in this deployment. Live speed 0 km/h against the newest recorded GPS speed 0.23 km/h, 47.1 days apart. Difference 0.23 < threshold 2, so the two AGREE and no conflict is reported.",
+    "quantity": "speed",
+    "live": { "value": 0, "measuredAt": "2026-08-03T07:27:00.000Z" },
+    "historical": { "value": 0.23, "measuredAt": "2026-06-17T04:39:41.459Z" },
+    "expect": { "conflict": false }
+  },
+
+  "explainedPosition": {
+    "origin": "measured",
+    "note": "The same real pair, on position. Live (25.433566, 82.108989) against the newest recorded fix (25.433644, 82.108320). 67.7 m apart — above the 50 m threshold, so a conflict IS detected — but 1131 hours at 120 km/h could account for roughly 135,000 km, so it is explained by age and the value is not disputed.",
+    "quantity": "last_known_location",
+    "live": {
+      "value": { "lat": 25.433566, "lon": 82.108989 },
+      "measuredAt": "2026-08-03T07:27:00.000Z"
+    },
+    "historical": {
+      "value": { "lat": 25.433644, "lon": 82.10832 },
+      "measuredAt": "2026-06-17T04:39:41.459Z"
+    },
+    "expect": {
+      "conflict": true,
+      "ageExplanation": "explained",
+      "approxDeltaMetres": 67.7
+    }
+  },
+
+  "unexplainedPosition": {
+    "origin": "constructed",
+    "note": "Two REAL positions of this vehicle — the live one, and a real GPS fix from its own series — placed ONE MINUTE apart. They are 2401.4 m apart (verified independently), while one minute at 120 km/h accounts for at most 2000 m: the vehicle would have had to average 144 km/h. Note how narrow the margin is, and that it had to be engineered: at a five-minute gap the same 2401 m is comfortably explained, which is why this entry uses one.",
+    "quantity": "last_known_location",
+    "live": {
+      "value": { "lat": 25.433566, "lon": 82.108989 },
+      "measuredAt": "2026-08-03T07:27:00.000Z"
+    },
+    "historical": {
+      "value": { "lat": 25.451712, "lon": 82.121956 },
+      "measuredAt": "2026-08-03T07:26:00.000Z"
+    },
+    "expect": {
+      "conflict": true,
+      "ageExplanation": "unexplained",
+      "approxDeltaMetres": 2401.4
+    }
+  },
+
+  "unexplainedSpeed": {
+    "origin": "constructed",
+    "note": "Two real speeds from this vehicle's own GPS series (27.20 and 0.03 km/h) placed one second apart. 27.17 km/h of change in one second exceeds what 3600 km/h per hour allows, so the difference is larger than the elapsed time explains.",
+    "quantity": "speed",
+    "live": { "value": 27.2, "measuredAt": "2026-08-03T07:27:01.000Z" },
+    "historical": { "value": 0.03, "measuredAt": "2026-08-03T07:27:00.000Z" },
+    "expect": { "conflict": true, "ageExplanation": "unexplained" }
+  },
+
+  "unknownAge": {
+    "origin": "constructed",
+    "note": "The unexplainedSpeed pair with the live measurement time removed, which is what a row whose Last Talk Time had not yet been formatted actually produces. The difference still exceeds the threshold, so a conflict is reported — but plausibility cannot be assessed, so it is `unknown` and is NOT escalated to disputed.",
+    "quantity": "speed",
+    "live": { "value": 27.2, "measuredAt": null },
+    "historical": { "value": 0.03, "measuredAt": "2026-08-03T07:27:00.000Z" },
+    "expect": { "conflict": true, "ageExplanation": "unknown" }
+  },
+
+  "withinScatter": {
+    "origin": "measured",
+    "note": "Two consecutive real fixes taken while the vehicle was effectively stationary, 5.14 m apart (verified independently). Stationary scatter across the whole series peaks at 11.26 m, and the 50 m threshold was calibrated to sit above that — so a parked vehicle does not report a conflict with itself.",
+    "quantity": "last_known_location",
+    "live": {
+      "value": { "lat": 25.451666, "lon": 82.121988 },
+      "measuredAt": "2026-06-16T08:34:21.458Z"
+    },
+    "historical": {
+      "value": { "lat": 25.451662, "lon": 82.121937 },
+      "measuredAt": "2026-06-16T08:46:21.458Z"
+    },
+    "expect": { "conflict": false }
+  }
+}

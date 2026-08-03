@@ -2,6 +2,7 @@ import type { AnalysisWindow, DerivationOperation } from "./observations";
 import {
   QUANTITY_REGISTRY,
   type HistoricalProvider,
+  type LiveProvider,
   type QuantityKey,
 } from "./quantity-registry";
 
@@ -88,20 +89,38 @@ export interface AnalysisRequest {
 export type AcquisitionMode = "latest" | "window";
 
 /**
- * One thing that must be fetched, and the provider that will answer it.
+ * One source that could answer a quantity, and the key its fetch is cached
+ * under.
  *
- * `acquisitionKey` is the deduplication key: two requirements sharing it are
- * satisfied by ONE fetch. It names the source class, the container, the subject,
- * the mode and — for a windowed read — the window, which is exactly the
- * granularity a single read has. Asking can_telemetry for a vehicle's rows
- * between two instants returns the same rows whether the caller wanted state of
- * charge, pack voltage or both.
+ * `acquisitionKey` is the deduplication key: two candidates sharing it are
+ * satisfied by ONE fetch. It names the source class, the container, the subject
+ * and — for a windowed read — the window, which is exactly the granularity a
+ * single read has. Asking can_telemetry for a vehicle's rows between two
+ * instants returns the same rows whether the caller wanted state of charge, pack
+ * voltage or both; asking the portal for a vehicle's summary returns the same
+ * page whether the caller wanted its speed, its position or both.
+ */
+export type CandidateSource =
+  | {
+      sourceClass: "historical";
+      provider: HistoricalProvider;
+      acquisitionKey: string;
+    }
+  | { sourceClass: "live"; provider: LiveProvider; acquisitionKey: string };
+
+/**
+ * One quantity, and every source that may answer it, IN PRECEDENCE ORDER.
+ *
+ * The order here is P1's alone: it ranks by source CLASS according to what the
+ * question asks of time. P4 can still demote a live candidate below a historical
+ * one, but only reconcile.ts can apply it, because it depends on measurement
+ * times that do not exist until the sources have been read. The planner is pure
+ * and has no data — so it ranks on intent, and nothing else.
  */
 export interface SourceRequirement {
   quantity: QuantityKey;
-  provider: HistoricalProvider;
   mode: AcquisitionMode;
-  acquisitionKey: string;
+  candidates: CandidateSource[];
 }
 
 export interface AnalysisPlan {
@@ -218,14 +237,43 @@ export function planAnalysis(request: AnalysisRequest): AnalysisPlan {
     if (seen.has(quantity)) continue;
     seen.add(quantity);
 
-    const provider = QUANTITY_REGISTRY[quantity].historical;
+    const definition = QUANTITY_REGISTRY[quantity];
+    const historical = definition.historical;
 
-    requirements.push({
-      quantity,
-      provider,
-      mode,
-      acquisitionKey: `${provider.sourceClass}:${provider.table}:${key}:${windowKey}`,
-    });
+    const historicalCandidate: CandidateSource = {
+      sourceClass: "historical",
+      provider: historical,
+      acquisitionKey: `historical:${historical.table}:${key}:${windowKey}`,
+    };
+
+    /**
+     * P1 — INTENT DECIDES CLASS.
+     *
+     * A question about NOW prefers the live source when one exists. A question
+     * about a PERIOD takes the historical source alone: a live reading is a
+     * single point taken at whatever moment the dashboard was read, and feeding
+     * it into a series would put a sample from a different measurement path,
+     * with a different clock, into a trend. It may be shown BESIDE a series; it
+     * may never be a member of one.
+     *
+     * The practical consequence is worth naming: a derivation therefore makes no
+     * portal call at all, so windowed analysis costs no scrape latency and
+     * conflicts can only arise on latest-value requests.
+     */
+    const wantsLive = derivation === undefined && definition.live !== undefined;
+
+    const candidates: CandidateSource[] = wantsLive
+      ? [
+          {
+            sourceClass: "live",
+            provider: definition.live!,
+            acquisitionKey: `live:${definition.live!.module}:${key}`,
+          },
+          historicalCandidate,
+        ]
+      : [historicalCandidate];
+
+    requirements.push({ quantity, mode, candidates });
   }
 
   return {

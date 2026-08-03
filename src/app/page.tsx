@@ -5,6 +5,7 @@ import { useRef, useState } from "react";
 import type {
   ChatMessage,
   ChatStreamFrame,
+  ContributingSource,
   SourceAttribution,
 } from "@/types/chat";
 
@@ -12,6 +13,49 @@ type UiMessage = ChatMessage & {
   sources?: SourceAttribution[];
   failed?: boolean;
 };
+
+/**
+ * Every source that took part in one answer, when more than one did
+ * (Milestone 5D-4).
+ *
+ * Rendered beneath the source that ANSWERED rather than replacing it, because
+ * the two say different things: `origin` above is where the number came from,
+ * and this is what else was consulted. A source marked "not reported" was read
+ * and set aside — showing it is the point, since an attribution that listed only
+ * the winner would hide that a second source was ever looked at.
+ */
+function ContributingSources({ sources }: { sources: ContributingSource[] }) {
+  return (
+    <ul className="mt-1 space-y-0.5 border-l border-black/10 pl-2 dark:border-white/15">
+      {sources.map((source, index) => (
+        <li key={`${source.origin}-${index}`} className="opacity-70">
+          <span
+            className={
+              source.role === "chosen" ? "font-medium" : "italic opacity-70"
+            }
+          >
+            {source.origin}
+          </span>
+          <span className="opacity-60">
+            {" · "}
+            {source.sourceClass}
+            {source.role === "alternative" ? " · not reported" : ""}
+            {source.available ? "" : " · no data"}
+          </span>
+          {source.measuredAt ? (
+            <span className="opacity-50">
+              {" · measured "}
+              {new Date(source.measuredAt).toLocaleString()}
+            </span>
+          ) : null}
+          {source.basis ? (
+            <div className="opacity-60">{source.basis}</div>
+          ) : null}
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 function SourcesBlock({ sources }: { sources: SourceAttribution[] }) {
   return (
@@ -36,6 +80,10 @@ function SourcesBlock({ sources }: { sources: SourceAttribution[] }) {
                   .map(([key, value]) => `${key}: ${String(value)}`)
                   .join(" · ")}
               </div>
+            ) : null}
+            {source.contributingSources &&
+            source.contributingSources.length > 0 ? (
+              <ContributingSources sources={source.contributingSources} />
             ) : null}
             <div className="opacity-50">
               {new Date(source.timestamp).toLocaleString()}

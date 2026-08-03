@@ -278,6 +278,8 @@ const ANALYTICS_PURE = [
   "src/services/analytics/observations.ts",
   "src/services/analytics/projections.ts",
   "src/services/analytics/reconcile.ts",
+  "src/services/analytics/series.ts",
+  "src/services/analytics/conflict.ts",
 ];
 
 const AGENT_ZONE = {
@@ -322,8 +324,23 @@ const analyticsIsolation = [
             BROWSER_ZONE,
             AGENT_ZONE,
             {
+              /**
+               * Narrowed at Milestone 5D-2. The ban was `@/services/portal/*`
+               * wholesale; it is now the two halves of the Portal module that
+               * actually perform or reach I/O. normalizers.ts is deliberately
+               * NOT among them: it is pure parsing that imports nothing but Zod,
+               * so a pure analytics file may take its types and its parsers
+               * without gaining a way to open a page.
+               *
+               * This is exactly the split telemetry.records.ts and
+               * telemetry.reader.ts were separated into at Milestone 5B, applied
+               * to the module on the other side of the engine. What matters is
+               * not which directory a file sits in but whether importing it can
+               * start a browser.
+               */
               group: [
-                "@/services/portal/*",
+                "@/services/portal/portal.service",
+                "@/services/portal/extractors/*",
                 "@/services/database/telemetry.service",
                 "@/services/database/telemetry.reader",
                 "@/lib/prisma",

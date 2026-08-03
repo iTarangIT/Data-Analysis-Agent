@@ -23,12 +23,15 @@
  * is in the Analytics purity zone in eslint.config.mjs for the same reason
  * normalizers.ts is in the Portal one.
  *
- * `Derivation` arrived at Milestone 5C, with the first real computation. There
- * is still no `Conflict` type: Milestone 5C has exactly one candidate per
- * quantity, so a conflict remains a shape nothing can produce, and it arrives at
- * 5D with the first second candidate. The precedent is the one §19 already
- * records for TARGET_AMBIGUOUS and for src/lib/langsmith.ts: a declaration that
- * cannot be reached is not a head start, it is a claim the code does not honour.
+ * `Derivation` arrived at Milestone 5C with the first real computation, and
+ * `Conflict` arrives at 5D-2 with the first code that can produce one —
+ * conflict.ts, which is exercised against fixtures before any live acquisition
+ * exists. What is still absent is `ReconciledValue.conflict` and its
+ * disposition: nothing SELECTS between two candidates until 5D-3, so a
+ * reconciliation carrying a conflict remains a shape no code path builds. The
+ * precedent is the one §19 records for TARGET_AMBIGUOUS and for
+ * src/lib/langsmith.ts: a declaration that cannot be reached is not a head
+ * start, it is a claim the code does not honour.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -265,40 +268,156 @@ export interface UnavailableObservation extends ObservationBase {
 export type Observation = AvailableObservation | UnavailableObservation;
 
 /* -------------------------------------------------------------------------- */
+/*  Conflict                                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How two observations of one quantity are compared.
+ *
+ * A scalar difference is meaningless for a position — 0.001 degrees is a
+ * different distance at different latitudes — so a position is compared as a
+ * great-circle DISTANCE in metres, which is why `Conflict.deltaUnit` need not be
+ * the quantity's own unit.
+ */
+export type ValueComparison = "scalar" | "distance";
+
+/**
+ * Whether the time between two measurements accounts for their difference.
+ *
+ * THREE STATES, not a boolean, and the third is the one discovery forced
+ * (Milestone 5D-1). A live reading's measurement time comes from the portal's
+ * "Last Talk Time", and that cell is intermittently unreadable — it renders as a
+ * raw epoch before the page formats it, and a row read too early carries no
+ * usable instant at all. With a boolean, an unknown age would have to collapse
+ * into "unexplained", and a transient rendering artefact would then mark every
+ * value in the fleet as disputed. That is a false alarm manufactured by a
+ * missing field, which is exactly the failure this system refuses elsewhere when
+ * it declines to let a missing measurement become a zero.
+ *
+ *   - "explained"   — the difference fits the time elapsed. Ordinary.
+ *   - "unexplained" — it does not. The values genuinely disagree, and neither is
+ *                     presented as authoritative.
+ *   - "unknown"     — one side has no measurement time, so plausibility cannot
+ *                     be assessed. Reported, never guessed, and NOT escalated.
+ */
+export type AgeExplanation = "explained" | "unexplained" | "unknown";
+
+/**
+ * Two sources disagreeing about one quantity, by more than tolerance.
+ *
+ * ## What a conflict is, and what it is not
+ *
+ * A conflict requires BOTH observations to be available, the same quantity, and
+ * a difference exceeding the quantity's declared threshold. Anything within
+ * tolerance is agreement, not disagreement: the threshold for a position is set
+ * above measured GPS scatter, so a vehicle parked in one place does not report a
+ * conflict with itself every time it is read.
+ *
+ * ## Why age is the primary explanation rather than an excuse
+ *
+ * Most live-versus-historical disagreement in this system is EXPECTED. The
+ * telemetry sample and the live dashboard are seven weeks apart, so a vehicle
+ * that has plainly moved is not evidence of a data fault — it is evidence of a
+ * vehicle. `plausibleChange` is the quantity's declared maximum rate applied to
+ * the gap between the two measurements, and comparing the difference against it
+ * is what separates "the pack drained over six days" from "the pack drained in
+ * five minutes". A flat age window cannot tell those apart; a rate can.
+ *
+ * ## What is deliberately absent
+ *
+ * There is no `resolution` field, no confidence score, and no combined value. A
+ * confidence number would be a fabricated quantity with no source — the same
+ * class of object as an averaged one — and averaging is not disabled here so
+ * much as unrepresentable: a reported value is a single Observation carrying a
+ * single Provenance, and there is nowhere for a blend to live.
+ */
+export interface Conflict {
+  /** The observation that disagrees with the reported one, named not summarised. */
+  against: {
+    origin: string;
+    sourceClass: SourceClass;
+    measuredAt: string | null;
+  };
+  comparison: ValueComparison;
+  /** Magnitude of the disagreement, in `deltaUnit`. Never signed. */
+  delta: number;
+  /** The quantity's own unit, or "m" when positions are compared. */
+  deltaUnit: string;
+  /** At or below this the two sources agree; above it they do not. */
+  threshold: number;
+  /** Gap between the two measurement times. Null when either is unknown. */
+  ageDifferenceMs: number | null;
+  /** How much could plausibly have changed over that gap. Null when unknown. */
+  plausibleChange: number | null;
+  ageExplanation: AgeExplanation;
+  /** Safe to show a user, and safe to hand the model. */
+  explanation: string;
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Reconciliation                                                            */
 /* -------------------------------------------------------------------------- */
 
 /**
  * The precedence rule that selected a value (Milestone 5A, P0–P7).
  *
- * ONE MEMBER TODAY, and that is the honest count. Milestone 5B declares exactly
- * one provider per quantity — the historical feed SAD §19 makes authoritative —
- * so P2 is the only rule that can fire, and every other rule would be a string
- * no code path produces. They arrive with the candidates that make them
- * reachable:
+ * FOUR MEMBERS at Milestone 5D-3, and every one of them is reachable. The field
+ * was carried on every result since 5B precisely so that the day a second
+ * candidate existed it would already be there to distinguish outcomes:
  *
- *   - P1 (intent decides class) and P4 (stale live demoted) at 5D, when a live
- *     provider exists to rank against a historical one.
- *   - P3 (one live module per quantity per scope) at 5D.
- *   - P0 (scope gate) at 5E, when a fleet-scope provider exists to be excluded.
+ *   - P1 — the question is about NOW and a live source can answer it, so the
+ *     live reading is reported. Only reachable for a latest-value request: a
+ *     derivation is historical by definition and never admits a live candidate.
+ *   - P2 — the historical feed SAD §19 makes authoritative answered. Either it
+ *     was the only provider, or the question was about a period.
+ *   - P4 — a live reading existed but was OLDER than the recorded one, so the
+ *     portal was showing a cached state the database had already surpassed.
+ *     Reporting it would have presented older data as newer.
+ *   - P5 — the higher-precedence source could not answer, so the next one did.
+ *     The rule name IS the disclosure: a substitution cannot happen without
+ *     appearing in the result.
  *
- * P5 (availability is not precedence), P6 (one number, one provider) and P7
- * (naming discipline) are not members of this union at all, because they are
- * not selections. They are constraints the engine obeys by construction — see
- * reconcile.ts.
+ * Still not members, because they are not selections. P3 (one live module per
+ * quantity per scope) and P6 (one number, one provider) are structural — the
+ * registry holds a single `live` field and `chosen` is a single Observation, so
+ * neither can be violated rather than merely rejected. P7 (naming discipline) is
+ * enforced where the mapping is declared. P0 (scope gate) needs a fleet-scope
+ * provider to exclude, and arrives at 5E.
  */
-export type PrecedenceRule = "P2_historical_authoritative_feed";
+export type PrecedenceRule =
+  | "P1_current_prefers_live"
+  | "P2_historical_authoritative_feed"
+  | "P4_stale_live_demoted"
+  | "P5_substituted_after_unavailable";
+
+/**
+ * Whether the reported value stands on its own, or is contested.
+ *
+ * "disputed" means two sources disagreed by more than the time between them can
+ * account for. `chosen` is still populated — precedence still ran, and the wire
+ * shape needs a value — but the answer must present BOTH values rather than
+ * leading with one, and the system prompt binds the model to do exactly that.
+ *
+ * Declining to pick is the correct analyst behaviour here, and it is the same
+ * instinct as Milestone 4B's refusal to normalise a page that never rendered
+ * into confident nulls. An unknown age is NOT disputed: a missing measurement
+ * time is a gap in the evidence, not evidence of disagreement.
+ */
+export type ReconciliationDisposition = "resolved" | "disputed";
 
 /**
  * One quantity, resolved to the value that will be reported.
  *
  * `alternatives` is the design's refusal to discard evidence: a candidate that
  * lost precedence is kept, with its own provenance intact, rather than dropped
- * on the floor. It is empty at 5B because there is never more than one
- * candidate, and it is the field the conflict disclosure at 5D reads.
+ * on the floor. It was empty from 5B to 5D-2 because there was never more than
+ * one candidate; from 5D-3 it holds the live or historical reading that lost,
+ * and it is what lets the answer show its working without a second fetch.
  *
- * There is no `conflict` field yet, for the reason given at the top of this
- * file: with one candidate, a conflict is unrepresentable.
+ * There is deliberately no combined value, no confidence score and no
+ * resolution strategy. A reported value is ONE Observation carrying ONE
+ * Provenance, so averaging two sources is not disabled here — there is nowhere
+ * for a blend to live (P6).
  */
 export interface ReconciledValue {
   quantity: string;
@@ -307,4 +426,19 @@ export interface ReconciledValue {
   rule: PrecedenceRule;
   /** Candidates that did not win, each with full provenance. */
   alternatives: Observation[];
+  /**
+   * Present when two available sources disagreed by more than tolerance.
+   *
+   * Absent means either that there was only one candidate, or that the sources
+   * agreed. Both are "nothing to disclose", and collapsing them is deliberate:
+   * a reader has no action to take in either case.
+   */
+  conflict?: Conflict;
+  /**
+   * Whether the reported value stands on its own.
+   *
+   * Always set, and derived from `conflict` rather than declared separately, so
+   * the two can never disagree.
+   */
+  disposition: ReconciliationDisposition;
 }

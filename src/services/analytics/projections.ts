@@ -4,6 +4,7 @@ import type {
   CanReadingRecord,
   GpsReadingRecord,
 } from "@/services/database/telemetry.records";
+import type { VehicleSummary } from "@/services/portal/normalizers";
 
 import type { ObservationDetail, ObservationValue } from "./observations";
 
@@ -296,6 +297,133 @@ export function speed(options: {
  * compass bearing is not something a fleet operator asks for, but it is useful
  * beside a position.
  */
+/* -------------------------------------------------------------------------- */
+/*  Live projections — the portal (Milestone 5D-2)                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The field a live reading takes its MEASUREMENT time from.
+ *
+ * Not `capturedAt`. That is when Tarang looked at the dashboard, and a page
+ * showing a vehicle silent for a month would otherwise present itself as a
+ * reading taken seconds ago — the same freshness overstatement the CAN
+ * measuredAt/reportedAt split exists to prevent. "Last Talk Time" is when the
+ * VEHICLE last reported, which is the honest measurement time and is also the
+ * only input the P4 freshness gate has.
+ */
+const LAST_TALK_TIME = "last_talk_time";
+
+/** Find one field of a Vehicle Summary payload by its catalogue key. */
+function summaryField(summary: VehicleSummary, key: string) {
+  return summary.fields.find((field) => field.key === key);
+}
+
+/**
+ * When the vehicle itself last reported, or null if the portal did not say.
+ *
+ * Null is a real and not-rare outcome, and it is reported rather than
+ * substituted. The Table View renders Last Talk Time as a raw epoch before it
+ * formats it, so a row read early can carry no readable instant at all — 200 of
+ * 320 rows on one measured pass (Milestone 5D-1). A live observation with no
+ * measurement time is still a perfectly good VALUE; what it cannot do is take
+ * part in the freshness gate or in an age explanation, and both of those report
+ * "unknown" rather than guessing.
+ */
+function lastTalkTime(summary: VehicleSummary): string | null {
+  const field = summaryField(summary, LAST_TALK_TIME);
+
+  if (field === undefined || !field.available) return null;
+  return field.value.kind === "timestamp" ? field.value.iso : null;
+}
+
+/**
+ * Read one numeric field off a live Vehicle Summary.
+ *
+ * The portal's own value, in the portal's own unit, with no re-derivation: the
+ * registry pairs this with a quantity whose unit already matches, so nothing
+ * here converts anything. `decimals` narrows the value to the resolution the
+ * dashboard actually publishes; it never widens one.
+ */
+export function liveScalar(options: {
+  field: string;
+  label: string;
+  decimals: number;
+}): (summary: VehicleSummary) => Projection {
+  const { field, label, decimals } = options;
+
+  return (summary) => {
+    const found = summaryField(summary, field);
+
+    if (found === undefined) {
+      return {
+        ok: false,
+        reason: `The Intellicar dashboard did not report ${label} for this vehicle.`,
+      };
+    }
+
+    if (!found.available) return { ok: false, reason: found.reason };
+
+    if (found.value.kind !== "number") {
+      return {
+        ok: false,
+        reason: `The Intellicar dashboard reported ${label} for this vehicle in a form this system cannot read as a number.`,
+      };
+    }
+
+    return {
+      ok: true,
+      value: round(found.value.number, decimals),
+      measuredAt: lastTalkTime(summary),
+    };
+  };
+}
+
+/**
+ * Read a position off a live Vehicle Summary.
+ *
+ * The column is titled Address and this deployment renders coordinates in it —
+ * measured at 320 of 320 rows. A cell holding a genuine street address is a true
+ * answer to "where is it" but is not a POSITION, so it is reported as
+ * unavailable here rather than being geocoded, which would invent a precision
+ * the portal never published.
+ */
+export function liveCoordinates(options: {
+  field: string;
+  label: string;
+  decimals: number;
+}): (summary: VehicleSummary) => Projection {
+  const { field, label, decimals } = options;
+
+  return (summary) => {
+    const found = summaryField(summary, field);
+
+    if (found === undefined) {
+      return {
+        ok: false,
+        reason: `The Intellicar dashboard did not report ${label} for this vehicle.`,
+      };
+    }
+
+    if (!found.available) return { ok: false, reason: found.reason };
+
+    if (found.value.kind !== "coordinates") {
+      return {
+        ok: false,
+        reason: `The Intellicar dashboard reported ${label} for this vehicle as a description rather than a position.`,
+      };
+    }
+
+    return {
+      ok: true,
+      value: {
+        lat: round(found.value.lat, decimals),
+        lon: round(found.value.lon, decimals),
+      },
+      measuredAt: lastTalkTime(summary),
+    };
+  };
+}
+
 export function location(options: {
   decimals: number;
 }): (reading: GpsReadingRecord) => Projection {

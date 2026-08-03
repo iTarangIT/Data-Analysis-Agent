@@ -12,9 +12,16 @@ import type {
   CanReadingRecord,
   GpsReadingRecord,
 } from "@/services/database/telemetry.records";
+import type { VehicleSummary } from "@/services/portal/normalizers";
+import {
+  fetchPortalModule,
+  PORTAL_MODULES,
+  type PortalModule,
+} from "@/services/portal/portal.service";
+import { isAuthEnvConfigured } from "@/lib/env";
 
 import type { AnalysisWindow } from "./observations";
-import type { AnalysisPlan, AnalysisSubject } from "./planner";
+import type { AnalysisPlan, AnalysisSubject, CandidateSource } from "./planner";
 import type { HistoricalFeed } from "./quantity-registry";
 
 /**
@@ -78,7 +85,27 @@ export type SeriesSnapshot =
   | { feed: "can"; readings: CanReadingRecord[] }
   | { feed: "gps"; readings: GpsReadingRecord[] };
 
+/**
+ * One live dashboard reading, or the reason there is none.
+ *
+ * A FAILURE IS DATA HERE, not an exception, and that asymmetry with the
+ * database is deliberate. Postgres is the system of record: a failed telemetry
+ * query is a fault and still throws. The portal is a best-effort corroborator
+ * reached over a browser, a session and someone else's web application — it can
+ * be unreachable, unconfigured, mid-deploy, or simply not list the vehicle — and
+ * none of those is a reason to refuse an answer the database can already give.
+ *
+ * So a portal failure becomes an unavailable live observation carrying the
+ * reason, the historical value is reported under P5, and the substitution is
+ * DISCLOSED rather than silent. The user learns both that their answer is
+ * historical and why the live reading was not available.
+ */
+export type LiveSnapshot =
+  | { mode: "live"; ok: true; module: string; summary: VehicleSummary }
+  | { mode: "live"; ok: false; module: string; reason: string };
+
 export type FeedSnapshot =
+  | LiveSnapshot
   | ({ mode: "latest" } & LatestSnapshot)
   | ({
       mode: "window";
@@ -236,6 +263,113 @@ async function fetchWindow(
 }
 
 /**
+ * Narrow a registry module name to the Portal Service's vocabulary.
+ *
+ * The registry declares `module` as a plain string so that importing the
+ * vocabulary does not drag portal.service — and through it the Session Manager
+ * and Playwright — into every file that describes a quantity. The narrowing
+ * happens HERE, in the one file that was always going to reach the portal.
+ *
+ * A miss is a wiring bug between the registry and the Portal Service, not a
+ * fact about the fleet, so it fails loudly.
+ */
+function toPortalModule(module: string): PortalModule {
+  const found = PORTAL_MODULES.find((candidate) => candidate === module);
+
+  if (found === undefined) {
+    throw new Error(
+      `The quantity registry names portal module "${module}", which the Portal Service does not publish.`
+    );
+  }
+
+  return found;
+}
+
+/**
+ * Read one live dashboard module for the subject.
+ *
+ * ## Everything that can go wrong here is an ANSWER, not a throw
+ *
+ * `fetchPortalModule` throws only PortalError or SessionError, and both are
+ * written to be safe to surface anywhere — including into the model's context,
+ * which is exactly where they end up. Their messages already name no URL, no
+ * selector, no credential and no page content, so they are relayed verbatim
+ * rather than replaced with something vaguer.
+ *
+ * The catch is broad on purpose: the ONLY call inside it is the portal fetch, so
+ * there is no application logic whose bug could be swallowed. What is not
+ * swallowed is CANCELLATION — checked first, and rethrown — because a client
+ * that went away must not be reported to the next reader as a portal outage.
+ *
+ * A missing portal configuration is answered WITHOUT launching a browser. It is
+ * the commonest reason a live reading is unavailable in development, and paying
+ * for a Chromium launch to discover it would be a slow way to learn nothing.
+ */
+async function fetchLive(
+  module: string,
+  vehicleNo: string,
+  signal?: AbortSignal
+): Promise<FeedSnapshot> {
+  const unavailable = (reason: string): FeedSnapshot => ({
+    mode: "live",
+    ok: false,
+    module,
+    reason,
+  });
+
+  if (!isAuthEnvConfigured()) {
+    return unavailable(
+      "The Intellicar portal is not configured for this deployment, so no live reading was available."
+    );
+  }
+
+  try {
+    const data = await fetchPortalModule(
+      { module: toPortalModule(module), target: vehicleNo },
+      { signal }
+    );
+
+    // The Portal Service types its return as the union of everything a
+    // capability can produce. A vehicle summary is the arm carrying `identity`,
+    // and a mismatch would mean the registry pointed a per-vehicle quantity at
+    // an account-wide module — a wiring bug, so it fails loudly rather than
+    // being reported as an unreadable dashboard.
+    if (!("identity" in data)) {
+      throw new Error(
+        `Portal module "${module}" did not return a per-vehicle summary.`
+      );
+    }
+
+    return { mode: "live", ok: true, module, summary: data };
+  } catch (error) {
+    if (signal?.aborted) throw error;
+
+    return unavailable(
+      error instanceof Error
+        ? error.message
+        : "The Intellicar dashboard could not be read."
+    );
+  }
+}
+
+/** Start the fetch one candidate needs, whichever class it belongs to. */
+function fetchCandidate(
+  candidate: CandidateSource,
+  plan: AnalysisPlan,
+  signal?: AbortSignal
+): Promise<FeedSnapshot> {
+  const { vehicleNo } = plan.subject;
+
+  if (candidate.sourceClass === "live") {
+    return fetchLive(candidate.provider.module, vehicleNo, signal);
+  }
+
+  return plan.derivation === undefined
+    ? fetchLatest(candidate.provider.feed, vehicleNo)
+    : fetchWindow(candidate.provider.feed, vehicleNo, plan.derivation.window);
+}
+
+/**
  * Fetch everything the plan requires, once per distinct source.
  *
  * ## Deduplication is the mechanism, not an optimisation
@@ -273,21 +407,15 @@ export async function acquire(
   const pending = new Map<string, Promise<FeedSnapshot>>();
 
   for (const requirement of plan.requirements) {
-    if (signal?.aborted) throw new AcquisitionCancelledError();
-    if (pending.has(requirement.acquisitionKey)) continue;
+    for (const candidate of requirement.candidates) {
+      if (signal?.aborted) throw new AcquisitionCancelledError();
+      if (pending.has(candidate.acquisitionKey)) continue;
 
-    const { feed } = requirement.provider;
-    const { vehicleNo } = plan.subject;
-
-    pending.set(
-      requirement.acquisitionKey,
-      requirement.mode === "latest"
-        ? fetchLatest(feed, vehicleNo)
-        : // A windowed requirement exists only when the plan carries a
-          // derivation, and the planner builds both together — so this is the
-          // planner's invariant read back, not an assumption made here.
-          fetchWindow(feed, vehicleNo, requireWindow(plan)),
-    );
+      pending.set(
+        candidate.acquisitionKey,
+        fetchCandidate(candidate, plan, signal)
+      );
+    }
   }
 
   const settled = new Map<string, FeedSnapshot>();
@@ -299,20 +427,3 @@ export async function acquire(
   return settled;
 }
 
-/**
- * The plan's window, or a loud failure.
- *
- * Unreachable: `mode: "window"` and `derivation` are set together by
- * `planAnalysis`. It fails rather than defaulting, because a fabricated window
- * would silently change what a derivation covered — a wiring bug is worth a
- * crash, and is never worth a quietly wrong period.
- */
-function requireWindow(plan: AnalysisPlan): AnalysisWindow {
-  if (plan.derivation === undefined) {
-    throw new Error(
-      "A windowed requirement was planned without a derivation window."
-    );
-  }
-
-  return plan.derivation.window;
-}
