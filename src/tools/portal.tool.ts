@@ -59,8 +59,9 @@ const schema = z.object({
     .min(1)
     .optional()
     .describe(
-      "The fleet or battery to read the module for. Omit for modules that " +
-        "report the whole account."
+      "The vehicle to read the module for, as its fleet identifier " +
+        "(format TK-#####-##@@-######). REQUIRED for vehicle_summary. Omit " +
+        "for modules that report the whole account, such as fleet_overview."
     ),
 });
 
@@ -69,7 +70,13 @@ export const portalToolSpec: ToolSpec<typeof schema> = {
   description:
     "Read live data from an Intellicar dashboard module. Use this for the " +
     "current state of a fleet or battery; use the analysis tool for " +
-    "historical telemetry already stored in the database.",
+    "historical telemetry already stored in the database. " +
+    "fleet_overview reports account-wide status counts and takes no target. " +
+    "vehicle_summary reports one vehicle as the dashboard currently shows it — " +
+    "device, model, variant, last talk time, speed, fuel and location — and " +
+    "REQUIRES the vehicle's fleet identifier as `target`. It reads one vehicle " +
+    "per call and each call scrapes the live portal, so ask for the specific " +
+    "vehicle in question rather than looping over a fleet.",
   schema,
   origin: "Intellicar portal (live)",
   timeoutMs: PORTAL_TOOL_TIMEOUT_MS,

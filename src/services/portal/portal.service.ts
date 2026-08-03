@@ -9,7 +9,13 @@ import {
 } from "@/services/session/session-manager";
 
 import { fleetOverviewCapability } from "./extractors/fleet-overview";
-import type { Normalizer } from "./normalizers";
+import { vehicleSummaryCapability } from "./extractors/vehicle-summary";
+import {
+  normalizeVehicleNo,
+  type FleetOverview,
+  type Normalizer,
+  type VehicleSummary,
+} from "./normalizers";
 
 /**
  * Portal Service (SAD §4, §11 — Milestone 4A).
@@ -76,6 +82,25 @@ const PORTAL_NAV_TIMEOUT_MS = 30_000;
  */
 const PORTAL_READY_TIMEOUT_MS = 20_000;
 
+/**
+ * How long a TARGETED module's resolution phase may take in total
+ * (Milestone 4C).
+ *
+ * Bounds the whole phase, not a step inside it: a resolver opens a view and may
+ * page a table, and capping only the individual actions would let a pager with
+ * many pages multiply into an unbounded phase. A capability may still hold
+ * stricter per-step budgets of its own — the Vehicle Summary module does — which
+ * is the internal-SLA case SAD §19 keeps separate from an outer ceiling.
+ *
+ * The three phase budgets are sized to fit inside PORTAL_TOOL_TIMEOUT_MS (90s)
+ * with room to spare: 30s navigation + 35s resolution + 20s readiness = 85s. A
+ * COLD run that must also sign in can still exceed the tool budget; that is
+ * accepted rather than designed away, because the Session Manager persists the
+ * session before running this work, so the login a timed-out first request paid
+ * for is saved and the retry takes the reuse path.
+ */
+const PORTAL_RESOLVE_TIMEOUT_MS = 35_000;
+
 /* -------------------------------------------------------------------------- */
 /*  Public contract                                                           */
 /* -------------------------------------------------------------------------- */
@@ -90,6 +115,7 @@ const PORTAL_READY_TIMEOUT_MS = 20_000;
  */
 export const PORTAL_MODULES = [
   "fleet_overview",
+  "vehicle_summary",
   "battery_analytics",
   "fleet_activity",
   "health_analytics",
@@ -99,6 +125,17 @@ export const PORTAL_MODULES = [
 ] as const;
 
 export type PortalModule = (typeof PORTAL_MODULES)[number];
+
+/**
+ * Everything a registered capability can return.
+ *
+ * Declared now that there is more than one member, as the note on
+ * `fetchPortalModule` said it would be: a union costs nothing while there is one
+ * capability and starts carrying information at two. Each capability's schema
+ * types its own arm, and `defineCapability` constrains `TData` to this union, so
+ * the service's public return type is sound without a cast anywhere.
+ */
+export type PortalData = FleetOverview | VehicleSummary;
 
 /** What to fetch. Plain data — nothing here names a browser or a transport. */
 export interface PortalRequest {
@@ -133,6 +170,17 @@ export interface PortalOptions {
 export type PortalErrorCode =
   /** No capability is registered for this module yet. Not a fault. */
   | "MODULE_UNAVAILABLE"
+  /** This module reports one entity and the request named none. Not a fault. */
+  | "TARGET_REQUIRED"
+  /**
+   * The module was reached but the portal does not list the requested entity.
+   * A normal, reportable answer — the vehicle is not in this account — rather
+   * than a failure of the scrape.
+   *
+   * There is deliberately no TARGET_AMBIGUOUS beside it: resolution matches an
+   * identifier EXACTLY, so several candidates cannot occur (SAD §19, 4C).
+   */
+  | "TARGET_NOT_FOUND"
   /** The run was cancelled — the client went away, or the budget expired. */
   | "CANCELLED"
   /** The module could not be reached or did not finish rendering. Retryable. */
@@ -197,6 +245,37 @@ export type Extractor<TRaw> = (
 ) => Promise<TRaw>;
 
 /**
+ * Reach the entity named by the request, on an already-navigated page.
+ *
+ * The phase that exists because the portal has no per-vehicle route (SAD §19,
+ * Milestone 4C): selecting a vehicle leaves the URL unchanged, so a target is
+ * reached by opening a view and finding it. Run by THIS SERVICE, between
+ * navigation and the readiness wait — never by an extractor, which continues to
+ * read a page it is handed.
+ *
+ * The rule a resolver obeys is NEVER MUTATE. Opening a view, paging a table and
+ * typing into a search box are navigation. Submitting a form, saving a setting
+ * or issuing a device command are not, and no capability may do them.
+ *
+ * Raises `PortalError("TARGET_NOT_FOUND")` when the portal does not list the
+ * entity — a reportable answer, not a fault.
+ */
+export type Resolver = (page: Page, request: PortalRequest) => Promise<void>;
+
+/**
+ * Read back the identifier the portal is actually showing, so the service can
+ * prove it is about to extract the entity that was asked for.
+ *
+ * Returns the label VERBATIM as rendered, or null if none is showing. The
+ * comparison is the service's, not the capability's, so every targeted module is
+ * checked the same way.
+ */
+export type IdentityAssertion = (
+  page: Page,
+  request: PortalRequest
+) => Promise<string | null>;
+
+/**
  * One registered dashboard module, with its raw type already erased.
  *
  * `read` is the composed chain — extract → normalise → validate — built once by
@@ -232,8 +311,20 @@ export interface PortalCapability {
    * would be invalid as a whole.
    */
   readySelector: readonly string[];
+  /**
+   * Whether this module reports ONE entity named by `PortalRequest.target`.
+   *
+   * A targeted capability always carries both `resolve` and `assertIdentity` —
+   * `defineCapability` will not accept one without them — so the two optionals
+   * below are optional to the TYPE, never to a targeted module.
+   */
+  targeted: boolean;
+  /** Reach the target. Present exactly when `targeted` is true. */
+  resolve?: Resolver;
+  /** Prove the right target was reached. Present exactly when `targeted`. */
+  assertIdentity?: IdentityAssertion;
   /** extract → normalise → validate. Returns schema-validated data. */
-  read: (page: Page, request: PortalRequest) => Promise<unknown>;
+  read: (page: Page, request: PortalRequest) => Promise<PortalData>;
 }
 
 /**
@@ -248,18 +339,40 @@ export interface PortalCapability {
  * `TRaw` is bound here and appears nowhere outside, so the registry can hold
  * capabilities for modules whose raw shapes have nothing in common.
  */
-export function defineCapability<TRaw, TData>(spec: {
+interface CapabilitySpec<TRaw, TData> {
   module: PortalModule;
   path: string;
   readySelector: readonly string[];
   extract: Extractor<TRaw>;
   normalize: Normalizer<TRaw, unknown>;
   schema: z.ZodType<TData>;
-}): PortalCapability {
+}
+
+export function defineCapability<TRaw, TData extends PortalData>(
+  spec:
+    | (CapabilitySpec<TRaw, TData> & {
+        /** An account-wide module: no target, no resolution, no assertion. */
+        targeted?: false;
+      })
+    | (CapabilitySpec<TRaw, TData> & {
+        /**
+         * A targeted module. Both fields below are REQUIRED by this arm, which
+         * is the whole point of the union: a capability that reports one entity
+         * cannot be declared without the step that proves which entity it read.
+         */
+        targeted: true;
+        resolve: Resolver;
+        assertIdentity: IdentityAssertion;
+      })
+): PortalCapability {
   return {
     module: spec.module,
     path: spec.path,
     readySelector: spec.readySelector,
+    targeted: spec.targeted === true,
+    ...(spec.targeted === true
+      ? { resolve: spec.resolve, assertIdentity: spec.assertIdentity }
+      : {}),
     read: async (page, request) => {
       const raw = await spec.extract(page, request);
       const normalized = spec.normalize(raw);
@@ -298,6 +411,7 @@ export function defineCapability<TRaw, TData>(spec: {
  */
 const CAPABILITIES: Partial<Record<PortalModule, PortalCapability>> = {
   fleet_overview: fleetOverviewCapability,
+  vehicle_summary: vehicleSummaryCapability,
 };
 
 /* -------------------------------------------------------------------------- */
@@ -321,7 +435,7 @@ const CAPABILITIES: Partial<Record<PortalModule, PortalCapability>> = {
 export async function fetchPortalModule(
   request: PortalRequest,
   options: PortalOptions = {}
-): Promise<unknown> {
+): Promise<PortalData> {
   const { signal } = options;
 
   // Already gone: the run was cancelled before this call was reached. Refusing
@@ -347,11 +461,29 @@ export async function fetchPortalModule(
     );
   }
 
+  // A targeted module with no target is refused BEFORE any browser work: it is
+  // a question that cannot be asked, not a scrape that failed. The message is
+  // written for the model, which can fix it by asking again with an identifier.
+  if (capability.targeted && normalizeVehicleNo(request.target ?? "").length === 0) {
+    throw new PortalError(
+      "TARGET_REQUIRED",
+      `Reading ${request.module} needs a specific vehicle. Ask again with the ` +
+        `vehicle's fleet identifier, for example TK-51105-02AZ-179386.`
+    );
+  }
+
+  // Canonicalised ONCE, here, so every capability compares identifiers the same
+  // way and no extractor has to remember to. What is reported back to the caller
+  // is always the portal's own rendering, never this form.
+  const resolved: PortalRequest = capability.targeted
+    ? { ...request, target: normalizeVehicleNo(request.target ?? "") }
+    : request;
+
   const startedAt = Date.now();
 
   try {
     const data = await withAuthenticatedContext(
-      (context) => readModule(capability, request, context),
+      (context) => readModule(capability, resolved, context, signal),
       { signal }
     );
 
@@ -407,9 +539,30 @@ export async function fetchPortalModule(
 async function readModule(
   capability: PortalCapability,
   request: PortalRequest,
-  context: BrowserContext
-): Promise<unknown> {
+  context: BrowserContext,
+  signal?: AbortSignal
+): Promise<PortalData> {
   const page = await context.newPage();
+
+  /**
+   * Stop at a phase boundary rather than starting the next one.
+   *
+   * This is an EARLY EXIT, not the classification rule. Cancelling closes the
+   * context, so whatever was in flight fails — and during resolution that would
+   * otherwise surface as TARGET_NOT_FOUND, telling a user their vehicle does not
+   * exist because they closed a tab. What guarantees that cannot happen is
+   * `fetchPortalModule`'s catch, which tests `signal.aborted` BEFORE it inspects
+   * the error at all. This check only avoids paying for work already known to be
+   * unwanted; the ordering there is the fix.
+   */
+  const stopIfCancelled = () => {
+    if (signal?.aborted) {
+      throw new PortalError(
+        "CANCELLED",
+        "The portal request was cancelled before it finished."
+      );
+    }
+  };
 
   try {
     const url = `${authEnv().INTELLICAR_BASE_URL}${capability.path}`;
@@ -423,13 +576,86 @@ async function readModule(
       timeout: PORTAL_NAV_TIMEOUT_MS,
     });
 
+    // Reach the requested entity. Only a targeted module has this phase, and it
+    // runs BEFORE readiness because for such a module the data-bearing element
+    // does not exist until the entity has been reached.
+    if (capability.resolve) {
+      stopIfCancelled();
+      await withPhaseBudget(
+        capability.resolve(page, request),
+        PORTAL_RESOLVE_TIMEOUT_MS,
+        () =>
+          new PortalError(
+            "MODULE_CHANGED",
+            `The ${capability.module} view did not respond as expected while ` +
+              `looking up ${request.target}.`
+          )
+      );
+    }
+
+    stopIfCancelled();
     await waitForReady(page, capability);
 
+    // Prove the page is showing the entity that was asked for. Redundant with an
+    // exact-match resolver by construction, and kept anyway: it turns a future
+    // resolution bug into a clean TARGET_NOT_FOUND instead of a confident wrong
+    // vehicle, which is the failure this whole module is shaped to prevent.
+    if (capability.assertIdentity) {
+      stopIfCancelled();
+
+      const shown = await capability.assertIdentity(page, request);
+      const expected = normalizeVehicleNo(request.target ?? "");
+
+      if (shown === null || normalizeVehicleNo(shown) !== expected) {
+        throw new PortalError(
+          "TARGET_NOT_FOUND",
+          `The Intellicar portal did not show ${request.target} in the ` +
+            `${capability.module} view.`
+        );
+      }
+    }
+
+    stopIfCancelled();
     return await capability.read(page, request);
   } finally {
     // The context is closed by the Session Manager; the page is this
     // function's to release, and a close failure must not mask a real error.
     await page.close().catch(() => {});
+  }
+}
+
+/**
+ * Bound one lifecycle phase, without pretending to cancel it.
+ *
+ * `Promise.race` reports the first outcome; it does not stop the loser — the
+ * same property the Tool Registry documents about `runBounded`. What actually
+ * stops a phase here is the browser context closing, which happens for the two
+ * reasons that matter: the run was cancelled, or `withAuthenticatedContext`
+ * returned. So this guarantees the SERVICE moves on, and the context guarantees
+ * the work does.
+ *
+ * The loser cannot become an unhandled rejection: `Promise.race` subscribes to
+ * both, so a late rejection already has a handler attached and settles the race
+ * a second time as a no-op.
+ */
+async function withPhaseBudget<T>(
+  work: Promise<T>,
+  timeoutMs: number,
+  onTimeout: () => PortalError
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  const expiry = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(onTimeout()), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([work, expiry]);
+  } finally {
+    // Released whichever way the race settled: a stray timer would hold the
+    // event loop open for the rest of the budget, which is what hangs a
+    // short-lived process such as `npm run portal:fetch`.
+    clearTimeout(timer);
   }
 }
 

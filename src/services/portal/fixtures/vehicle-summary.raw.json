@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "A REAL raw extraction, captured from the live Intellicar dashboard's Table",
+    "View on 2026-08-03 by the production resolve + extract path. Not",
+    "hand-written sample data.",
+    "",
+    "This is the input side of normalizeVehicleSummary(): exactly what the",
+    "extractor hands over — rendered text, unparsed — so the normalizer, which is",
+    "pure, can be exercised and reviewed without a browser, a session or a",
+    "network.",
+    "",
+    "Note the empty string at index 2: the Ignition column renders an icon and no",
+    "text at all, which is why Ignition is not in the catalogue (SAD §19,",
+    "Milestone 4C). The fixture keeps the column so the header-to-cell alignment",
+    "it proves stays honest.",
+    "",
+    "renderOffsetMinutes is getTimezoneOffset() as read INSIDE the page: minutes",
+    "to add to local time to reach UTC, so -330 is IST. It is captured rather",
+    "than assumed because this portal formats timestamps client-side.",
+    "",
+    "Values are live from that moment and are expected to differ from any later",
+    "reading. Nothing here is a secret: one vehicle's public dashboard row."
+  ],
+  "capturedAt": "2026-08-03T04:17:26.362Z",
+  "requested": "TK-51105-06GY-112765",
+  "portalLabel": "TK-51105-06GY-112765",
+  "fleet": null,
+  "renderOffsetMinutes": -330,
+  "headers": [
+    "Vehicle No",
+    "Device No",
+    "Ignition",
+    "Model",
+    "Variant",
+    "Last Talk Time",
+    "Speed",
+    "Fuel",
+    "Address"
+  ],
+  "cells": [
+    "TK-51105-06GY-112765",
+    "9A8EC0A1241C53C5",
+    "",
+    "51V105Ah",
+    "Trontek_REV 1.3",
+    "03-Aug-2026 09:46",
+    "24",
+    "83",
+    "(25.396795,81.892144)"
+  ]
+}

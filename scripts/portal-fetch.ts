@@ -7,6 +7,11 @@ import { config as loadDotenv } from "dotenv";
  *
  *   npm run portal:fetch                    # fleet_overview
  *   npm run portal:fetch -- fleet_overview
+ *   npm run portal:fetch -- vehicle_summary TK-51105-06GY-112765
+ *
+ * The third argument is the module's TARGET. A targeted module (vehicle_summary)
+ * requires one and refuses with TARGET_REQUIRED before any browser work if it is
+ * missing; an account-wide module ignores it.
  *
  * Performs one real read of a live Intellicar dashboard module and prints the
  * validated JSON. Run it twice: the second run should reuse the stored session
@@ -77,7 +82,17 @@ try {
 
   // The two failures with completely different causes get pointed at the right
   // place, rather than leaving a reader to guess which layer moved.
-  if (code === "MODULE_CHANGED") {
+  if (code === "TARGET_REQUIRED") {
+    console.error(
+      "\n  This module reports one vehicle. Pass its fleet identifier:\n" +
+        "  npm run portal:fetch -- vehicle_summary TK-#####-##@@-######"
+    );
+  } else if (code === "TARGET_NOT_FOUND") {
+    console.error(
+      "\n  The portal does not list that vehicle. Check the identifier against\n" +
+        "  the dashboard's Table View."
+    );
+  } else if (code === "MODULE_CHANGED") {
     console.error(
       "\n  The dashboard rendered, but not the data this module expects.\n" +
         "  Re-check the selectors in src/services/portal/extractors/, and re-run\n" +
