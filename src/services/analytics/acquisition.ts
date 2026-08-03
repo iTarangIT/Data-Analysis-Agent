@@ -1,4 +1,7 @@
 import {
+  fetchBatteryReadings,
+  fetchCanReadings,
+  fetchGpsReadings,
   fetchLatestBatteryReading,
   fetchLatestCanReading,
   fetchLatestGpsReading,
@@ -10,11 +13,12 @@ import type {
   GpsReadingRecord,
 } from "@/services/database/telemetry.records";
 
+import type { AnalysisWindow } from "./observations";
 import type { AnalysisPlan, AnalysisSubject } from "./planner";
 import type { HistoricalFeed } from "./quantity-registry";
 
 /**
- * Stage 3 — Acquire (Milestone 5A design, 5B implementation).
+ * Stage 3 — Acquire (Milestone 5A design, 5B implementation, 5C extension).
  *
  * THE ONLY IMPURE FILE IN THE ANALYSIS ENGINE. Everything else in
  * src/services/analytics/ is a function of data already in memory; this is where
@@ -22,11 +26,12 @@ import type { HistoricalFeed } from "./quantity-registry";
  * rest of the engine be exercised from a fixture, and it is the same split the
  * Portal Service draws between its extractors and its normalizers.
  *
- * At Milestone 5B every acquisition is HISTORICAL — a latest-reading fetch
- * through the telemetry reader. Milestone 5D adds the live half, and it lands
- * here and nowhere else: `fetchPortalModule()` gets called from this file, the
- * cache below keys portal reads exactly as it keys database reads, and no other
- * module in the engine learns that a second source class exists.
+ * At Milestone 5C every acquisition is still HISTORICAL — a latest-reading fetch
+ * or a windowed range read through the telemetry reader. Milestone 5D adds the
+ * live half, and it lands here and nowhere else: `fetchPortalModule()` gets
+ * called from this file, the cache below keys portal reads exactly as it keys
+ * database reads, and no other module in the engine learns that a second source
+ * class exists.
  *
  * ## What this module may not do
  *
@@ -36,6 +41,12 @@ import type { HistoricalFeed } from "./quantity-registry";
  * `fetchPortalModule()`, which returns validated JSON and holds its own browser
  * context, so no page, context or cookie can reach the engine any more than it
  * can reach a tool (CLAUDE.md rule 1).
+ *
+ * It also holds NO BUSINESS LOGIC. It fetches rows and reports how many came
+ * back; it does not read a signal out of one, decide whether a series is long
+ * enough, or compute anything. The readers below it are equally plain — they
+ * convert Postgres values to JSON-safe ones and nothing else. Every judgement
+ * about what the rows MEAN happens in the pure stages downstream.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -50,10 +61,36 @@ import type { HistoricalFeed } from "./quantity-registry";
  * it into an honest "not available" with a reason (SAD §19, "missing telemetry
  * is reported, not thrown").
  */
-export type FeedSnapshot =
+export type LatestSnapshot =
   | { feed: "battery"; reading: BatteryReadingRecord | null }
   | { feed: "can"; reading: CanReadingRecord | null }
   | { feed: "gps"; reading: GpsReadingRecord | null };
+
+/**
+ * Every reading from one feed inside a window, oldest first.
+ *
+ * An EMPTY array is a normal outcome for the same reason a null latest reading
+ * is: a quiet window is an answer about the fleet. It becomes an unavailable
+ * observation carrying the window it covered, never an exception.
+ */
+export type SeriesSnapshot =
+  | { feed: "battery"; readings: BatteryReadingRecord[] }
+  | { feed: "can"; readings: CanReadingRecord[] }
+  | { feed: "gps"; readings: GpsReadingRecord[] };
+
+export type FeedSnapshot =
+  | ({ mode: "latest" } & LatestSnapshot)
+  | ({
+      mode: "window";
+      /**
+       * True when the read hit its row ceiling, so the series covers less than
+       * the window asked for. Carried outward rather than absorbed: truncation
+       * keeps the NEWEST rows, so a truncated series is recent rather than
+       * representative, and a derivation over it must say so.
+       */
+      truncated: boolean;
+      window: AnalysisWindow;
+    } & SeriesSnapshot);
 
 /** Everything one analysis run fetched, keyed by `SourceRequirement.acquisitionKey`. */
 export type Acquisitions = ReadonlyMap<string, FeedSnapshot>;
@@ -90,6 +127,29 @@ export class AcquisitionCancelledError extends Error {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Row ceilings                                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * How many rows one windowed read may return, per feed.
+ *
+ * These MIRROR the per-table maxima in telemetry.service.ts, which clamps
+ * anything larger. Asking for exactly the maximum is deliberate: it means the
+ * clamp never silently reduces a request below what was asked for, so a short
+ * series is always a property of the data rather than of a limit nobody
+ * declared. A deliberate coupling to a module we own — keep the two in step,
+ * the same way the range-error prefix in telemetry.records.ts is kept in step.
+ *
+ * CAN is an order of magnitude lower because a CAN row carries a jsonb payload
+ * of 44-112 signals, which is the same reason its service-side ceiling is lower.
+ */
+const WINDOW_ROW_LIMITS: Record<HistoricalFeed, number> = {
+  battery: 5000,
+  gps: 5000,
+  can: 500,
+};
+
+/* -------------------------------------------------------------------------- */
 /*  Subject resolution                                                        */
 /* -------------------------------------------------------------------------- */
 
@@ -113,26 +173,65 @@ export async function resolveSubject(subject: AnalysisSubject): Promise<void> {
 /*  Acquisition                                                               */
 /* -------------------------------------------------------------------------- */
 
-function fetchFeed(
+function fetchLatest(
   feed: HistoricalFeed,
   vehicleNo: string
 ): Promise<FeedSnapshot> {
   switch (feed) {
     case "battery":
       return fetchLatestBatteryReading({ vehicleNo }).then((reading) => ({
+        mode: "latest" as const,
         feed,
         reading,
       }));
     case "can":
       return fetchLatestCanReading({ vehicleNo }).then((reading) => ({
+        mode: "latest" as const,
         feed,
         reading,
       }));
     case "gps":
       return fetchLatestGpsReading({ vehicleNo }).then((reading) => ({
+        mode: "latest" as const,
         feed,
         reading,
       }));
+  }
+}
+
+async function fetchWindow(
+  feed: HistoricalFeed,
+  vehicleNo: string,
+  window: AnalysisWindow
+): Promise<FeedSnapshot> {
+  const limit = WINDOW_ROW_LIMITS[feed];
+  const request = {
+    vehicleNo,
+    from: new Date(window.from),
+    to: new Date(window.to),
+    limit,
+  };
+
+  // `>=` rather than `===` so a ceiling that ever moves below what the service
+  // clamps to still reports truncation rather than silently under-reporting it.
+  const truncated = (count: number) => count >= limit;
+
+  // A switch rather than a ternary chain so each branch narrows to its own
+  // reading type, and no cast is needed to build the snapshot. The same
+  // discriminated-union discipline the providers use.
+  switch (feed) {
+    case "battery": {
+      const readings = await fetchBatteryReadings(request);
+      return { mode: "window", feed, readings, truncated: truncated(readings.length), window };
+    }
+    case "can": {
+      const readings = await fetchCanReadings(request);
+      return { mode: "window", feed, readings, truncated: truncated(readings.length), window };
+    }
+    case "gps": {
+      const readings = await fetchGpsReadings(request);
+      return { mode: "window", feed, readings, truncated: truncated(readings.length), window };
+    }
   }
 }
 
@@ -147,11 +246,13 @@ function fetchFeed(
  * slow: three reads can return three different rows if telemetry arrives
  * between them, and the answer would then report three quantities from three
  * moments while presenting them as one snapshot of the pack. The cache is what
- * makes "as at one instant" true rather than approximately true.
+ * makes "as at one instant" true rather than approximately true. The same holds
+ * for a window, where three reads could also disagree on where the series ends.
  *
  * Keyed by `acquisitionKey`, so the cache is the planner's decision made
  * concrete rather than a second, independent judgement about what counts as the
- * same read.
+ * same read. The key carries the MODE and the window, so a latest read can never
+ * be handed to a requirement that asked for a series.
  *
  * ## Cached promises, not cached values
  *
@@ -175,9 +276,17 @@ export async function acquire(
     if (signal?.aborted) throw new AcquisitionCancelledError();
     if (pending.has(requirement.acquisitionKey)) continue;
 
+    const { feed } = requirement.provider;
+    const { vehicleNo } = plan.subject;
+
     pending.set(
       requirement.acquisitionKey,
-      fetchFeed(requirement.provider.feed, plan.subject.vehicleNo)
+      requirement.mode === "latest"
+        ? fetchLatest(feed, vehicleNo)
+        : // A windowed requirement exists only when the plan carries a
+          // derivation, and the planner builds both together — so this is the
+          // planner's invariant read back, not an assumption made here.
+          fetchWindow(feed, vehicleNo, requireWindow(plan)),
     );
   }
 
@@ -188,4 +297,22 @@ export async function acquire(
   }
 
   return settled;
+}
+
+/**
+ * The plan's window, or a loud failure.
+ *
+ * Unreachable: `mode: "window"` and `derivation` are set together by
+ * `planAnalysis`. It fails rather than defaulting, because a fabricated window
+ * would silently change what a derivation covered — a wiring bug is worth a
+ * crash, and is never worth a quietly wrong period.
+ */
+function requireWindow(plan: AnalysisPlan): AnalysisWindow {
+  if (plan.derivation === undefined) {
+    throw new Error(
+      "A windowed requirement was planned without a derivation window."
+    );
+  }
+
+  return plan.derivation.window;
 }

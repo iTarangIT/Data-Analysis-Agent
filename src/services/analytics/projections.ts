@@ -239,17 +239,22 @@ export function canSpread(options: {
  * a §19 amendment — `soh` is hardcoded 100 in every sampled row and `soh_1`
  * disagrees with it in 63 of 70 — so neither is used.
  */
-export function projectBatteryHealth(reading: BatteryReadingRecord): Projection {
-  return reading.sohPct === null
-    ? {
-        ok: false,
-        reason: `The latest battery reading for this vehicle (${reading.recordedAt}) carries no state-of-health value.`,
-      }
-    : {
-        ok: true,
-        value: round(reading.sohPct, 2),
-        measuredAt: reading.recordedAt,
-      };
+export function batteryHealth(options: {
+  decimals: number;
+}): (reading: BatteryReadingRecord) => Projection {
+  const { decimals } = options;
+
+  return (reading) =>
+    reading.sohPct === null
+      ? {
+          ok: false,
+          reason: `The latest battery reading for this vehicle (${reading.recordedAt}) carries no state-of-health value.`,
+        }
+      : {
+          ok: true,
+          value: round(reading.sohPct, decimals),
+          measuredAt: reading.recordedAt,
+        };
 }
 
 /**
@@ -259,24 +264,30 @@ export function projectBatteryHealth(reading: BatteryReadingRecord): Projection 
  * every sampled row, so it has no value as a metric, but it is exactly the
  * right validity filter.
  */
-export function projectSpeed(reading: GpsReadingRecord): Projection {
-  if (reading.gpsFix === false) {
-    return {
-      ok: false,
-      reason: `The latest GPS reading for this vehicle (${reading.recordedAt}) has no valid satellite fix.`,
-    };
-  }
+export function speed(options: {
+  decimals: number;
+}): (reading: GpsReadingRecord) => Projection {
+  const { decimals } = options;
 
-  return reading.speedKph === null
-    ? {
+  return (reading) => {
+    if (reading.gpsFix === false) {
+      return {
         ok: false,
-        reason: `The latest GPS reading for this vehicle (${reading.recordedAt}) carries no speed value.`,
-      }
-    : {
-        ok: true,
-        value: round(reading.speedKph, 2),
-        measuredAt: reading.recordedAt,
+        reason: `The latest GPS reading for this vehicle (${reading.recordedAt}) has no valid satellite fix.`,
       };
+    }
+
+    return reading.speedKph === null
+      ? {
+          ok: false,
+          reason: `The latest GPS reading for this vehicle (${reading.recordedAt}) carries no speed value.`,
+        }
+      : {
+          ok: true,
+          value: round(reading.speedKph, decimals),
+          measuredAt: reading.recordedAt,
+        };
+  };
 }
 
 /**
@@ -285,27 +296,39 @@ export function projectSpeed(reading: GpsReadingRecord): Projection {
  * compass bearing is not something a fleet operator asks for, but it is useful
  * beside a position.
  */
-export function projectLocation(reading: GpsReadingRecord): Projection {
-  if (reading.gpsFix === false) {
-    return {
-      ok: false,
-      reason: `The latest GPS reading for this vehicle (${reading.recordedAt}) has no valid satellite fix.`,
-    };
-  }
+export function location(options: {
+  decimals: number;
+}): (reading: GpsReadingRecord) => Projection {
+  const { decimals } = options;
 
-  if (reading.lat === null || reading.lon === null) {
-    return {
-      ok: false,
-      reason: `The latest GPS reading for this vehicle (${reading.recordedAt}) carries no coordinates.`,
-    };
-  }
+  return (reading) => {
+    if (reading.gpsFix === false) {
+      return {
+        ok: false,
+        reason: `The latest GPS reading for this vehicle (${reading.recordedAt}) has no valid satellite fix.`,
+      };
+    }
 
-  return {
-    ok: true,
-    value: { lat: round(reading.lat, 6), lon: round(reading.lon, 6) },
-    measuredAt: reading.recordedAt,
-    ...(reading.heading === null
-      ? {}
-      : { detail: { headingDegrees: round(reading.heading, 2) } }),
+    if (reading.lat === null || reading.lon === null) {
+      return {
+        ok: false,
+        reason: `The latest GPS reading for this vehicle (${reading.recordedAt}) carries no coordinates.`,
+      };
+    }
+
+    return {
+      ok: true,
+      value: {
+        lat: round(reading.lat, decimals),
+        lon: round(reading.lon, decimals),
+      },
+      measuredAt: reading.recordedAt,
+      // Heading keeps its own precision: it is a constituent riding along beside
+      // a position, not a component of it, and a bearing is not measured to the
+      // six decimals a coordinate is.
+      ...(reading.heading === null
+        ? {}
+        : { detail: { headingDegrees: round(reading.heading, 2) } }),
+    };
   };
 }

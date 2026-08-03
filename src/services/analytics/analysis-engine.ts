@@ -4,8 +4,19 @@ import {
   type Acquisitions,
   type FeedSnapshot,
 } from "./acquisition";
-import type { Observation, ReconciledValue } from "./observations";
-import { planAnalysis, type AnalysisRequest, type AnalysisPlan } from "./planner";
+import type {
+  Derivation,
+  Observation,
+  ObservationDetail,
+  ReconciledValue,
+} from "./observations";
+import {
+  planAnalysis,
+  type AnalysisPlan,
+  type AnalysisRequest,
+  type DerivationRequest,
+  type SourceRequirement,
+} from "./planner";
 import type { Projection } from "./projections";
 import {
   FEED_LABELS,
@@ -15,9 +26,15 @@ import {
   type QuantityKey,
 } from "./quantity-registry";
 import { reconcile } from "./reconcile";
+import {
+  computeSeries,
+  MINIMUM_SAMPLES,
+  OPERATION_LABELS,
+  type Sample,
+} from "./series";
 
 /**
- * The Analysis Engine (SAD §4, §6 — Milestone 5A design, 5B implementation).
+ * The Analysis Engine (SAD §4, §6 — Milestone 5A design, 5B/5C implementation).
  *
  * The deterministic brain that sits ABOVE the Portal Service and the Database
  * Service and combines what they provide. It is a SERVICE, reached in-process
@@ -41,21 +58,19 @@ import { reconcile } from "./reconcile";
  *   2 VOCABULARY  quantity-registry — which source answers which quantity.
  *   3 ACQUIRE     acquisition.ts    — the only impure stage. Deduplicated.
  *   4 RECONCILE   reconcile.ts      — precedence P0-P7. Pure.
- *   5 COMPUTE     (Milestone 5C)    — trends, rates, windows. Pure.
+ *   5 COMPUTE     series.ts         — aggregates, change, trend. Pure (5C).
  *   6 ASSEMBLE    here              — findings with full provenance.
  *
- * Stage 5 is genuinely absent rather than stubbed. Milestone 5B reports latest
- * values only — the same ten readouts Milestone 2C exposed — so there is nothing
- * to compute, and src/services/analytics/battery-metrics.ts is not created until
- * 5C gives it something to hold. That is the rule this codebase has applied since
- * Milestone 2C declined to create this very folder.
+ * ## What Milestone 5C added, and what it deliberately did not
  *
- * ## What Milestone 5B deliberately does not change
+ * Stage 5 became real: a request carrying a DERIVATION reads a window of rows
+ * instead of one, projects each into a sample, and computes over the series. A
+ * request WITHOUT one behaves exactly as it did at 5B and 2C — same shape, same
+ * strings, same envelope — which is the differential test this slice is held to.
  *
- * NOTHING THE USER OR THE MODEL CAN SEE. The Analysis Tool's input schema, its
- * description, its result shape and its envelope are byte-identical to Milestone
- * 2C's. This slice moves the catalogue into an engine and proves the move by the
- * absence of a difference; 5C and 5D are what make the engine visible.
+ * Not added: multi-source reconciliation. Every quantity still resolves to one
+ * historical provider, so `reconcile` still reports P2 on every finding, and
+ * `Conflict` remains a shape nothing can produce. That is Milestone 5D.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -73,15 +88,16 @@ export interface Finding {
 
 export interface AnalysisResult {
   subject: AnalysisPlan["subject"];
-  intent: AnalysisPlan["intent"];
   /**
-   * True when the caller stated no intent and "current" was assumed.
+   * Whether this run reported latest values or computed over a window.
    *
-   * Carried rather than hidden because P1 turns intent into a source-class
-   * decision at 5D, and an assumption that changes which source answers must be
-   * visible in the result that reports it.
+   * Derived from the request's SHAPE rather than declared by the caller: a
+   * request carrying a derivation is historical and one without it is current,
+   * so the two can never disagree. Milestone 5B carried an `intentAssumed` flag
+   * for a caller-supplied intent that could be defaulted; making intent
+   * structural removed the possibility, and with it the flag.
    */
-  intentAssumed: boolean;
+  intent: AnalysisPlan["intent"];
   findings: Finding[];
 }
 
@@ -95,60 +111,55 @@ export interface AnalysisOptions {
 /* -------------------------------------------------------------------------- */
 
 /**
- * Run one provider's projection against the snapshot it was fetched into.
+ * Run one provider's projection against a reading of its own feed.
  *
- * Each branch pairs a provider with the snapshot proven to match its feed, which
+ * Each branch pairs a provider with the reading proven to match its feed, which
  * is what lets the projections stay typed to a single reading shape — the same
  * discriminated-union discipline the Milestone 2C catalogue used, preserved
  * rather than traded for a cast.
  */
-function project(
+function projectOne(
   provider: HistoricalProvider,
-  snapshot: FeedSnapshot
-): Projection | null {
+  snapshot: FeedSnapshot,
+  reading: unknown
+): Projection {
   switch (provider.feed) {
     case "battery":
-      if (snapshot.feed !== "battery" || snapshot.reading === null) return null;
-      return provider.project(snapshot.reading);
+      if (snapshot.feed !== "battery") break;
+      return provider.project(reading as Parameters<typeof provider.project>[0]);
     case "can":
-      if (snapshot.feed !== "can" || snapshot.reading === null) return null;
-      return provider.project(snapshot.reading);
+      if (snapshot.feed !== "can") break;
+      return provider.project(reading as Parameters<typeof provider.project>[0]);
     case "gps":
-      if (snapshot.feed !== "gps" || snapshot.reading === null) return null;
-      return provider.project(snapshot.reading);
+      if (snapshot.feed !== "gps") break;
+      return provider.project(reading as Parameters<typeof provider.project>[0]);
   }
+
+  // Unreachable: the snapshot is fetched from the requirement's own provider, so
+  // a mismatch is a wiring bug in this engine rather than a data problem, and it
+  // fails loudly instead of being reported as missing telemetry.
+  throw new Error(
+    `Provider for the ${provider.feed} feed was given a ${snapshot.feed} snapshot.`
+  );
 }
 
-/**
- * Turn one acquisition into one Observation.
- *
- * Absence is reported here, never thrown — "this vehicle has no CAN data" is a
- * correct answer to a question about its state of charge, and reporting it keeps
- * the quantity's identity and provenance intact instead of collapsing them into
- * an error string (SAD §19, Milestone 2C).
- */
-function observe(
-  quantity: QuantityKey,
+/* -------------------------------------------------------------------------- */
+/*  Latest-value path (Milestone 5B, unchanged)                               */
+/* -------------------------------------------------------------------------- */
+
+interface ObservationBaseFields {
+  quantity: QuantityKey;
+  label: string;
+  unit: string | null;
+  provenance: ReturnType<typeof provenanceOf>;
+}
+
+function observeLatest(
+  base: ObservationBaseFields,
   provider: HistoricalProvider,
-  acquisitions: Acquisitions,
-  acquisitionKey: string
+  snapshot: Extract<FeedSnapshot, { mode: "latest" }>
 ): Observation {
-  const { label, unit } = QUANTITY_REGISTRY[quantity];
-  const provenance = provenanceOf(provider);
-  const snapshot = acquisitions.get(acquisitionKey);
-
-  // Missing from the map is the same wiring-bug class as an empty candidate
-  // list: the planner produced the key and the acquirer fetched every key it
-  // produced. It fails loudly rather than reporting a data gap that is really a
-  // code gap.
-  if (snapshot === undefined) {
-    throw new Error(
-      `Quantity "${quantity}" was planned against "${acquisitionKey}", which was never acquired.`
-    );
-  }
-
-  const base = { quantity, label, unit, provenance } as const;
-  const reportedAt = snapshot.reading?.recordedAt ?? null;
+  const { label } = base;
 
   if (snapshot.reading === null) {
     return {
@@ -160,22 +171,16 @@ function observe(
     };
   }
 
-  const projection = project(provider, snapshot);
+  const reportedAt = snapshot.reading.recordedAt;
+  const projection = projectOne(provider, snapshot, snapshot.reading);
 
-  if (projection === null || !projection.ok) {
+  if (!projection.ok) {
     return {
       ...base,
       available: false,
       measuredAt: null,
       reportedAt,
-      // `projection === null` is unreachable here — the null-reading case is
-      // handled above and the feed is proven by the acquisition key — so the
-      // fallback text exists only to keep this total, and names the feed rather
-      // than inventing a cause.
-      reason:
-        projection === null
-          ? `The latest ${FEED_LABELS[provider.feed]} reading for this vehicle could not be read.`
-          : projection.reason,
+      reason: projection.reason,
     };
   }
 
@@ -190,6 +195,233 @@ function observe(
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Derived path (Milestone 5C)                                               */
+/* -------------------------------------------------------------------------- */
+
+/** ISO 8601 for prose. Kept verbatim rather than reformatted for a locale. */
+function describeWindow(derivation: DerivationRequest): string {
+  return `${derivation.window.from} and ${derivation.window.to}`;
+}
+
+/**
+ * Pull every usable measurement of one quantity out of a window of readings.
+ *
+ * A reading contributes a sample only if the projection succeeds AND the value
+ * is numeric AND it carries a measurement time. The last two conditions are not
+ * defensive padding:
+ *
+ *   - NUMERIC excludes a coordinate pair. It cannot be reached today, because
+ *     the planner refuses a derivation over a non-derivable quantity before any
+ *     read — but the check is what makes that refusal a guarantee rather than a
+ *     convention, and it keeps this function total.
+ *   - A MEASUREMENT TIME is required because a sample with none cannot be
+ *     ordered, cannot contribute to a span, and would silently distort a trend
+ *     by being placed arbitrarily. A CAN signal with a malformed timestamp is
+ *     exactly this case.
+ *
+ * Samples excluded here are simply absent from `sampleCount`, and the gap
+ * between that and `readingCount` is reported in the Derivation, so a series
+ * thinned by unusable rows never looks like a series that was never there.
+ */
+function collectSamples(
+  provider: HistoricalProvider,
+  snapshot: Extract<FeedSnapshot, { mode: "window" }>
+): Sample[] {
+  const samples: Sample[] = [];
+
+  for (const reading of snapshot.readings) {
+    const projection = projectOne(provider, snapshot, reading);
+
+    if (!projection.ok) continue;
+    if (typeof projection.value !== "number") continue;
+    if (projection.measuredAt === null) continue;
+
+    samples.push({ value: projection.value, measuredAt: projection.measuredAt });
+  }
+
+  return samples;
+}
+
+/**
+ * Compute one quantity over a window, reporting insufficiency as an answer.
+ *
+ * ## The insufficiency contract
+ *
+ * Four different shortfalls can stop a computation, and ALL FOUR come back as an
+ * unavailable Observation carrying its Derivation — never as an exception:
+ *
+ *   1. the window held no rows at all;
+ *   2. it held rows, but none carried a usable measurement of this quantity;
+ *   3. it held fewer measurements than the operation needs;
+ *   4. every measurement shares one instant, so a rate has no interval.
+ *
+ * Each is a true statement about the fleet that a user can act on — usually by
+ * widening the window — and each keeps the quantity's identity and provenance
+ * intact. An exception would collapse all four into "the tool failed", which is
+ * both less true and less useful. Only genuine faults still throw: an
+ * unregistered vehicle, a malformed request, a failed query.
+ *
+ * The Derivation is built BEFORE the computation is attempted and attached
+ * either way, which is what makes the failure informative rather than merely
+ * honest: "the window holds one measurement and a trend needs two" tells the
+ * reader what to do next, and "not available" does not.
+ */
+function observeDerived(
+  base: ObservationBaseFields,
+  provider: HistoricalProvider,
+  snapshot: Extract<FeedSnapshot, { mode: "window" }>,
+  request: DerivationRequest
+): Observation {
+  const { label, quantity } = base;
+  const { operation, window } = request;
+  const { precision } = QUANTITY_REGISTRY[quantity];
+
+  const readingCount = snapshot.readings.length;
+
+  // One call does the preparing and the computing, so the counts below always
+  // describe the series that was actually used — including when nothing could be
+  // computed from it, which is the case the Derivation exists to explain.
+  const { prepared, result } = computeSeries(
+    operation,
+    collectSamples(provider, snapshot),
+    precision
+  );
+
+  const sampleCount = prepared.length;
+  const operationLabel = OPERATION_LABELS[operation];
+  const minimumSamples = MINIMUM_SAMPLES[operation];
+
+  const derivation: Derivation = {
+    operation,
+    window,
+    readingCount,
+    sampleCount,
+    minimumSamples,
+    firstMeasuredAt: sampleCount === 0 ? null : prepared[0].measuredAt,
+    lastMeasuredAt: sampleCount === 0 ? null : prepared[sampleCount - 1].measuredAt,
+    truncated: snapshot.truncated,
+    basis:
+      `${operationLabel} of ${sampleCount} ${label.toLowerCase()} ` +
+      `measurement${sampleCount === 1 ? "" : "s"} between ${describeWindow(request)}`,
+  };
+
+  // The newest row in the window, which is what a derived value is reported
+  // against. `readings` arrive oldest first.
+  const reportedAt =
+    readingCount === 0 ? null : snapshot.readings[readingCount - 1].recordedAt;
+
+  const unavailable = (reason: string): Observation => ({
+    ...base,
+    available: false,
+    measuredAt: null,
+    reportedAt,
+    derivation,
+    reason,
+  });
+
+  if (readingCount === 0) {
+    return unavailable(
+      `No ${FEED_LABELS[provider.feed]} telemetry is recorded for this vehicle ` +
+        `between ${describeWindow(request)}, so the ${operationLabel} ` +
+        `${label.toLowerCase()} cannot be computed. Try a wider window.`
+    );
+  }
+
+  if (!result.ok) {
+    switch (result.failure) {
+      case "no_samples":
+        return unavailable(
+          `The ${readingCount} ${FEED_LABELS[provider.feed]} reading` +
+            `${readingCount === 1 ? "" : "s"} for this vehicle between ` +
+            `${describeWindow(request)} ${readingCount === 1 ? "carries" : "carry"} ` +
+            `no usable ${label.toLowerCase()} measurement, so the ` +
+            `${operationLabel} cannot be computed.`
+        );
+      case "too_few_samples": {
+        // When rows outnumber measurements, SAY SO. The commonest cause is a CAN
+        // signal re-reported unchanged across rows, and a user looking at three
+        // rows in the database deserves to know why the answer counted one
+        // measurement rather than being left to suspect the tool.
+        const collapsed =
+          readingCount > sampleCount
+            ? ` The window holds ${readingCount} ${FEED_LABELS[provider.feed]} reading` +
+              `${readingCount === 1 ? "" : "s"}, but they carry only ${sampleCount} ` +
+              `distinct ${label.toLowerCase()} measurement${sampleCount === 1 ? "" : "s"}.`
+            : "";
+
+        return unavailable(
+          `A ${operationLabel} needs at least ${minimumSamples} ` +
+            `${label.toLowerCase()} measurements; the window between ` +
+            `${describeWindow(request)} holds ${sampleCount} for this vehicle.` +
+            `${collapsed} Try a wider window.`
+        );
+      }
+    }
+  }
+
+  return {
+    ...base,
+    available: true,
+    value: result.value,
+    // The freshest evidence the number rests on. The full span is in the
+    // Derivation, so a value computed over a period is never mistaken for a
+    // reading taken at an instant.
+    measuredAt: derivation.lastMeasuredAt,
+    reportedAt,
+    derivation,
+    ...(result.detail ? { detail: result.detail as ObservationDetail } : {}),
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Observation assembly                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Turn one acquisition into one Observation.
+ *
+ * Absence is reported here, never thrown — "this vehicle has no CAN data" is a
+ * correct answer to a question about its state of charge, and reporting it keeps
+ * the quantity's identity and provenance intact instead of collapsing them into
+ * an error string (SAD §19, Milestone 2C).
+ */
+function observe(
+  requirement: SourceRequirement,
+  acquisitions: Acquisitions,
+  derivation: DerivationRequest | undefined
+): Observation {
+  const { quantity, provider } = requirement;
+  const { label, unit } = QUANTITY_REGISTRY[quantity];
+  const base: ObservationBaseFields = {
+    quantity,
+    label,
+    unit,
+    provenance: provenanceOf(provider),
+  };
+
+  const snapshot = acquisitions.get(requirement.acquisitionKey);
+
+  // Missing from the map is a wiring-bug class: the planner produced the key and
+  // the acquirer fetched every key it produced. It fails loudly rather than
+  // reporting a data gap that is really a code gap.
+  if (snapshot === undefined) {
+    throw new Error(
+      `Quantity "${quantity}" was planned against "${requirement.acquisitionKey}", which was never acquired.`
+    );
+  }
+
+  if (snapshot.mode === "latest") return observeLatest(base, provider, snapshot);
+
+  if (derivation === undefined) {
+    throw new Error(
+      `Quantity "${quantity}" acquired a window without a derivation to compute.`
+    );
+  }
+
+  return observeDerived(base, provider, snapshot, derivation);
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Public entry point                                                        */
 /* -------------------------------------------------------------------------- */
 
@@ -198,13 +430,14 @@ function observe(
  *
  * The Analysis Tool's only call. The caller learns nothing about which tables
  * were read, how many queries ran or which reads were shared — it asks for
- * quantities and receives findings, each carrying the source that answered it.
+ * quantities and receives findings, each carrying the source that answered it
+ * and, when one was computed, how.
  */
 export async function runAnalysis(
   request: AnalysisRequest,
   options: AnalysisOptions = {}
 ): Promise<AnalysisResult> {
-  // 1 — Plan.
+  // 1 — Plan. Rejects a question that cannot be asked before any read happens.
   const plan = planAnalysis(request);
 
   // 2/3 — Resolve the subject, then acquire every distinct source once.
@@ -218,32 +451,22 @@ export async function runAnalysis(
 
   // 4/6 — Reconcile each quantity, then assemble.
   //
-  // Every requirement produces exactly ONE candidate at 5B, so `reconcile`
+  // Every requirement produces exactly ONE candidate at 5C, so `reconcile`
   // reports P2 on every finding. The single-element array is not ceremony: it is
   // the shape 5D fills with a second candidate, and building the finding any
   // other way would mean rewriting this loop rather than extending it.
   const findings = plan.requirements.map<Finding>((requirement) => {
     const { label, unit } = QUANTITY_REGISTRY[requirement.quantity];
 
-    const observation = observe(
-      requirement.quantity,
-      requirement.provider,
-      acquisitions,
-      requirement.acquisitionKey
-    );
-
     return {
       quantity: requirement.quantity,
       label,
       unit,
-      reconciled: reconcile(requirement.quantity, [observation]),
+      reconciled: reconcile(requirement.quantity, [
+        observe(requirement, acquisitions, plan.derivation),
+      ]),
     };
   });
 
-  return {
-    subject: plan.subject,
-    intent: plan.intent,
-    intentAssumed: plan.intentAssumed,
-    findings,
-  };
+  return { subject: plan.subject, intent: plan.intent, findings };
 }

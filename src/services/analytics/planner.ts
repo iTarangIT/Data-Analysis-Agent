@@ -1,3 +1,4 @@
+import type { AnalysisWindow, DerivationOperation } from "./observations";
 import {
   QUANTITY_REGISTRY,
   type HistoricalProvider,
@@ -5,7 +6,7 @@ import {
 } from "./quantity-registry";
 
 /**
- * Stage 1 — Plan (Milestone 5A design, 5B implementation).
+ * Stage 1 — Plan (Milestone 5A design, 5B implementation, 5C extension).
  *
  * Turns a validated request into an ordered list of what must be acquired, and
  * from where. It is a LOOKUP over the Quantity Registry, not a decision the
@@ -15,7 +16,10 @@ import {
  * being reproducible from its inputs.
  *
  * Pure. No I/O, no clock, no service. Given a request it returns a plan, for
- * ever.
+ * ever. THE WINDOW ARRIVES ALREADY ABSOLUTE for exactly this reason: resolving
+ * "the last 90 days" needs a clock, and that single read belongs at the tool
+ * boundary, the same way a portal extractor stamps `capturedAt` so its
+ * normalizer never has to.
  */
 
 /**
@@ -31,12 +35,27 @@ export type AnalysisSubject = { kind: "vehicle"; vehicleNo: string };
 /**
  * What the question is asking of TIME.
  *
- * "current" is the only member at 5B, because the engine reads latest values
- * only. "historical" arrives at 5C with windowed reads, and it is what P1 ranks
- * source classes against at 5D. Declaring it before it can be planned for would
- * be a promise the planner does not keep.
+ * "current" reports the latest measured value; "historical" computes over a
+ * window. Which one applies is decided by whether the request carries a
+ * derivation, not by the model asserting an intent — an intent that could
+ * disagree with the request would be a second source of truth. It is recorded
+ * on the result because P1 turns intent into a SOURCE-CLASS decision at 5D, and
+ * an assumption that changes which source answers must be visible.
  */
-export type AnalysisIntent = "current";
+export type AnalysisIntent = "current" | "historical";
+
+/**
+ * A computation to perform, over an absolute window.
+ *
+ * Both fields are required together: an operation without a window has nothing
+ * to range over, and a window without an operation asks for nothing that the
+ * latest-value path does not already answer. Pairing them in one optional
+ * object makes both halves unrepresentable apart.
+ */
+export interface DerivationRequest {
+  operation: DerivationOperation;
+  window: AnalysisWindow;
+}
 
 export interface AnalysisRequest {
   subject: AnalysisSubject;
@@ -47,35 +66,69 @@ export interface AnalysisRequest {
    * exactly one today. This is not anticipation: it is what makes the
    * acquisition cache a real mechanism rather than a decoration — two
    * quantities on one feed become one fetch, and the loop that does it is the
-   * same loop whether it runs once or eight times. The tool's own input stays
-   * single-valued at 5B, so nothing new is advertised to the model.
+   * same loop whether it runs once or eight times.
    */
   quantities: QuantityKey[];
-  /** Omitted means "current", and the result records that it was assumed. */
-  intent?: AnalysisIntent;
+  /**
+   * Omitted means "report the latest measured value", which is the whole of
+   * Milestone 5B's behaviour and remains the default.
+   */
+  derivation?: DerivationRequest;
 }
+
+/**
+ * How a requirement is read: one latest row, or every row in a window.
+ *
+ * The distinction is the acquisition's, not the computation's, which is why it
+ * lives on the requirement rather than being re-derived downstream: a windowed
+ * read and a latest read are different queries with different ceilings, and the
+ * cache key must tell them apart or a latest read would satisfy a windowed
+ * requirement.
+ */
+export type AcquisitionMode = "latest" | "window";
 
 /**
  * One thing that must be fetched, and the provider that will answer it.
  *
  * `acquisitionKey` is the deduplication key: two requirements sharing it are
- * satisfied by ONE fetch. It names the source class, the container and the
- * subject, which is exactly the granularity a single read has — asking
- * can_telemetry for a vehicle's latest row returns the same row whether the
- * caller wanted state of charge, pack voltage or both.
+ * satisfied by ONE fetch. It names the source class, the container, the subject,
+ * the mode and — for a windowed read — the window, which is exactly the
+ * granularity a single read has. Asking can_telemetry for a vehicle's rows
+ * between two instants returns the same rows whether the caller wanted state of
+ * charge, pack voltage or both.
  */
 export interface SourceRequirement {
   quantity: QuantityKey;
   provider: HistoricalProvider;
+  mode: AcquisitionMode;
   acquisitionKey: string;
 }
 
 export interface AnalysisPlan {
   subject: AnalysisSubject;
   intent: AnalysisIntent;
-  /** True when the caller stated no intent and "current" was assumed (P1). */
-  intentAssumed: boolean;
+  derivation?: DerivationRequest;
   requirements: SourceRequirement[];
+}
+
+/**
+ * A request that could not describe a valid analysis.
+ *
+ * Distinct from insufficiency, and the distinction is the point of the whole
+ * milestone. "There is not enough evidence" is an ANSWER and comes back as an
+ * unavailable observation carrying its Derivation. "A trend of a position" and
+ * "a window that ends before it starts" are QUESTIONS THAT CANNOT BE ASKED, and
+ * no amount of data would change that — so they are refused before any read, the
+ * same treatment the Portal Service gives TARGET_REQUIRED.
+ *
+ * The message reaches the model through the tool envelope, so it is written to
+ * say what is wrong and how to ask again.
+ */
+export class AnalysisRequestError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "AnalysisRequestError";
+  }
 }
 
 /** The stable identity of a subject, for keying acquisitions. */
@@ -84,10 +137,39 @@ function subjectKey(subject: AnalysisSubject): string {
 }
 
 /**
+ * Reject a window that cannot describe a period.
+ *
+ * An inverted or unparseable range would otherwise reach the Database Service,
+ * which fails it correctly but with a message written for a developer. Catching
+ * it here lets the model read one written for it — and an EMPTY window (from
+ * equal to to) is refused too, because a zero-width period cannot hold the two
+ * measurements a change or a trend needs and would report as insufficiency
+ * rather than as the malformed question it is.
+ */
+function assertUsableWindow(window: AnalysisWindow): void {
+  const from = Date.parse(window.from);
+  const to = Date.parse(window.to);
+
+  if (Number.isNaN(from) || Number.isNaN(to)) {
+    throw new AnalysisRequestError(
+      "The analysis window must be two ISO 8601 timestamps, for example " +
+        "2026-06-16T00:00:00Z."
+    );
+  }
+
+  if (from >= to) {
+    throw new AnalysisRequestError(
+      `The analysis window starts at ${window.from} and ends at ${window.to}, ` +
+        `so it covers no time at all. Ask again with a start earlier than the end.`
+    );
+  }
+}
+
+/**
  * Resolve a request into a plan.
  *
  * Every quantity resolves to its HISTORICAL provider, per SAD §19, because that
- * is the only class Milestone 5B can acquire. There is no selection to make
+ * is the only class Milestone 5C can acquire. There is no selection to make
  * here yet and the code says so rather than pretending: when 5D adds live
  * providers, this is where a requirement gains a second candidate, and
  * reconcile.ts is where the choice between them is made — never here, and never
@@ -98,7 +180,37 @@ function subjectKey(subject: AnalysisSubject): string {
  * by repeating itself.
  */
 export function planAnalysis(request: AnalysisRequest): AnalysisPlan {
+  const { derivation } = request;
+
+  if (derivation !== undefined) {
+    assertUsableWindow(derivation.window);
+
+    // A derivation over a quantity that is not a series of scalars. Refused
+    // before any read: no window would make the mean of two positions a place.
+    const notDerivable = request.quantities.filter(
+      (quantity) => !QUANTITY_REGISTRY[quantity].derivable
+    );
+
+    if (notDerivable.length > 0) {
+      const names = notDerivable
+        .map((quantity) => `\`${quantity}\``)
+        .join(", ");
+
+      throw new AnalysisRequestError(
+        `A ${derivation.operation} cannot be computed over ${names}: it is not ` +
+          `a numeric measurement. Ask for it without a derivation to get the ` +
+          `latest reading.`
+      );
+    }
+  }
+
   const key = subjectKey(request.subject);
+  const mode: AcquisitionMode = derivation === undefined ? "latest" : "window";
+  const windowKey =
+    derivation === undefined
+      ? "latest"
+      : `window:${derivation.window.from}..${derivation.window.to}`;
+
   const seen = new Set<QuantityKey>();
   const requirements: SourceRequirement[] = [];
 
@@ -111,14 +223,15 @@ export function planAnalysis(request: AnalysisRequest): AnalysisPlan {
     requirements.push({
       quantity,
       provider,
-      acquisitionKey: `${provider.sourceClass}:${provider.table}:${key}`,
+      mode,
+      acquisitionKey: `${provider.sourceClass}:${provider.table}:${key}:${windowKey}`,
     });
   }
 
   return {
     subject: request.subject,
-    intent: request.intent ?? "current",
-    intentAssumed: request.intent === undefined,
+    intent: derivation === undefined ? "current" : "historical",
+    ...(derivation === undefined ? {} : { derivation }),
     requirements,
   };
 }

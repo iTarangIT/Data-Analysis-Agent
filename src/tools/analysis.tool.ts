@@ -2,8 +2,14 @@ import { z } from "zod";
 
 import type { ToolSpec } from "@/agent/tool-registry";
 import { runAnalysis, type Finding } from "@/services/analytics/analysis-engine";
-import type { ObservationValue } from "@/services/analytics/observations";
 import {
+  DERIVATION_OPERATIONS,
+  type AnalysisWindow,
+  type Derivation,
+  type ObservationValue,
+} from "@/services/analytics/observations";
+import {
+  DERIVABLE_QUANTITIES,
   QUANTITIES,
   QUANTITY_CATALOGUE_TEXT,
 } from "@/services/analytics/quantity-registry";
@@ -11,55 +17,69 @@ import {
 /**
  * Analysis Tool (SAD §6) — the Tool layer's adapter over the Analysis Engine.
  *
- * ## What Milestone 5B did to this file
+ * ## What this file is
  *
- * Emptied it. Everything that made a number — the ten-metric catalogue, the CAN
- * signal reader, the placeholder floors, the rounding, the feed dispatch — moved
- * into src/services/analytics/, where it can reason over more than one source.
- * What is left is what a tool is supposed to be: a Zod-validated declaration of
- * what the LLM may ask for, one call into a service, and a mapping of the answer
- * back to the wire (CLAUDE.md — "tools are thin adapters over services").
+ * A Zod-validated declaration of what the LLM may ask for, one call into a
+ * service, and a mapping of the answer back to the wire. Everything that makes a
+ * number lives in src/services/analytics/ — the catalogue, the CAN signal
+ * reader, the placeholder floors, the statistics — and nothing computes here
+ * (CLAUDE.md: "tools are thin adapters over services").
  *
- * ## And what it deliberately did NOT do
+ * ## The one impurity that lives here on purpose (Milestone 5C)
  *
- * Change anything the model or the user can see. The input schema, the
- * description, the default metric, the result shape, the `origin`, the `method`
- * fields and every reason string are byte-identical to Milestone 2C's. That is
- * the whole test of this slice: an engine that answers the same questions the
- * same way is an engine whose foundations can be trusted before 5C and 5D start
- * asking it new ones.
+ * `windowDays` is relative, and resolving it needs a clock. THE ENGINE MAY NOT
+ * READ ONE: determinism is what makes an analysis reproducible from its inputs,
+ * and a clock read inside it would mean the same request produced a different
+ * plan every second. So the single `Date.now()` happens here, at the boundary,
+ * and the engine receives two absolute instants. This is the same rule that
+ * makes a portal extractor stamp `capturedAt` so its normalizer never has to.
  *
- * The one-metric-per-call input is part of that. The engine accepts a LIST of
- * quantities and deduplicates the reads behind them, but exposing that here
- * would change the tool list the model reasons over, which is a 5C decision made
- * with a windowed input beside it rather than a side effect of a refactor.
+ * ## What a request WITHOUT a derivation does
+ *
+ * Exactly what it did at Milestone 2C and 5B: one latest value, in the same
+ * shape, with the same strings, the same `origin` and the same `method`. That
+ * equivalence is verified differentially against the live database rather than
+ * asserted, and it is why the derivation inputs are optional additions rather
+ * than a redesign of the input.
  *
  * ## Layering
  *
- * No Prisma, no SQL, no portal, no scraping — and no longer any database access
- * either, direct or adapted. This file knows one service. The `{ data, source }`
- * envelope is still applied by the Tool Registry, so this declares only where its
- * numbers came from and how they were obtained.
+ * No Prisma, no SQL, no portal, no scraping, no database access. This file knows
+ * one service. The `{ data, source }` envelope is still applied by the Tool
+ * Registry, so this declares only where its numbers came from and how they were
+ * obtained.
  */
+
+/** Ceiling on a relative window, so a runaway request cannot ask for decades. */
+const MAX_WINDOW_DAYS = 3650;
+
+const MS_PER_DAY = 86_400_000;
 
 /**
  * The user-facing result of one metric request.
  *
- * The Milestone 2C shape, preserved field for field and in field ORDER, because
- * this is what the model reads and what /api/chat serialises. It is a
- * COMPATIBILITY PROJECTION of one engine Finding: the engine's own result is
- * richer — it carries the precedence rule that selected the value and every
- * source that did not win — and none of that is exposed yet because there is
- * never more than one source to report at 5B. Milestone 5D is what widens this
- * shape, alongside the `contributingSources` extension to SourceAttribution.
+ * The Milestone 2C shape, preserved field for field and in field ORDER, with one
+ * OPTIONAL addition: `derivation`, present only when a derivation was asked for.
+ * A request without one therefore produces a byte-identical object, which is the
+ * differential test this slice is held to.
+ *
+ * It remains a COMPATIBILITY PROJECTION of one engine Finding: the engine's own
+ * result also carries the precedence rule that selected the value and every
+ * source that did not win, and neither is exposed yet because there is never
+ * more than one source to report before Milestone 5D.
  */
 interface MetricResult {
   metric: string;
   vehicleNo: string;
   label: string;
   /**
-   * False when the vehicle, the feed or the signal carried nothing to report.
-   * `reason` then says which, and `value` is null.
+   * False when the vehicle, the feed, the signal or the EVIDENCE carried
+   * nothing to report. `reason` then says which, and `value` is null.
+   *
+   * Insufficient evidence for a derivation is one of these, never a tool
+   * failure: "the window holds one measurement and a trend needs two" is an
+   * answer a user can act on, and `derivation` below says how much evidence
+   * there was.
    */
   available: boolean;
   value: ObservationValue | null;
@@ -74,12 +94,20 @@ interface MetricResult {
    * the row, and the slowest-refreshing signals in the sample lag it by up to
    * 235 days. Reporting one of those against the row time would overstate its
    * freshness by months, so every CAN metric carries its own measurement time.
+   *
+   * For a computed value it is the latest contributing measurement; the full
+   * span is in `derivation`.
    */
   measuredAt: string | null;
   /** When the row carrying the signal was recorded. */
   reportedAt: string | null;
   /** Set only when `available` is false. Safe to show the user. */
   reason?: string;
+  /**
+   * Present exactly when a derivation was requested — including when it could
+   * not be computed, which is what makes an insufficiency answer actionable.
+   */
+  derivation?: Derivation;
 }
 
 /**
@@ -88,7 +116,8 @@ interface MetricResult {
  * Field order is preserved deliberately: `JSON.stringify` emits keys in
  * insertion order, so an answer built in a different order would be a different
  * string in the model's context and in every LangSmith trace, for identical
- * data. Byte-identical means byte-identical.
+ * data. `derivation` is appended LAST for the same reason — it must not displace
+ * a key that a derivation-free request already emits.
  */
 function toMetricResult(finding: Finding, vehicleNo: string): MetricResult {
   const { chosen } = finding.reconciled;
@@ -108,6 +137,7 @@ function toMetricResult(finding: Finding, vehicleNo: string): MetricResult {
       measuredAt: null,
       reportedAt: chosen.reportedAt,
       reason: chosen.reason,
+      ...(chosen.derivation ? { derivation: chosen.derivation } : {}),
     };
   }
 
@@ -118,44 +148,177 @@ function toMetricResult(finding: Finding, vehicleNo: string): MetricResult {
     measuredAt: chosen.measuredAt,
     reportedAt: chosen.reportedAt,
     ...(chosen.detail ? { detail: chosen.detail } : {}),
+    ...(chosen.derivation ? { derivation: chosen.derivation } : {}),
   };
 }
 
-const analysisInputSchema = z.object({
-  vehicleNo: z
-    .string()
-    .min(1)
-    .describe(
-      "Fleet identifier of the vehicle to analyse, e.g. 'TK-51105-02AZ-179386'."
-    ),
-  metric: z
-    .enum(QUANTITIES)
-    .default("battery_health")
-    .describe(`The metric to report. One of: ${QUANTITY_CATALOGUE_TEXT}.`),
-});
+const analysisInputSchema = z
+  .object({
+    vehicleNo: z
+      .string()
+      .min(1)
+      .describe(
+        "Fleet identifier of the vehicle to analyse, e.g. 'TK-51105-02AZ-179386'."
+      ),
+    metric: z
+      .enum(QUANTITIES)
+      .default("battery_health")
+      .describe(`The metric to report. One of: ${QUANTITY_CATALOGUE_TEXT}.`),
+    derivation: z
+      .enum(DERIVATION_OPERATIONS)
+      .optional()
+      .describe(
+        "Compute a value over a period instead of reporting the latest " +
+          "reading. minimum/maximum/mean summarise the period; change is the " +
+          "net difference between the first and last measurement; trend is the " +
+          "rate of change per day. REQUIRES a window — either windowDays, or " +
+          "both from and to. Omit this entirely to get the latest reading. " +
+          `Not available for last_known_location.`
+      ),
+    windowDays: z
+      .number()
+      .int()
+      .positive()
+      .max(MAX_WINDOW_DAYS)
+      .optional()
+      .describe(
+        "Length of the period to compute over, counting back from now. Use " +
+          "this or from/to, never both. Only valid with a derivation."
+      ),
+    from: z
+      .iso
+      .datetime()
+      .optional()
+      .describe(
+        "Start of the period, ISO 8601 (e.g. 2026-06-16T00:00:00Z). Must be " +
+          "given together with `to`. Only valid with a derivation."
+      ),
+    to: z
+      .iso
+      .datetime()
+      .optional()
+      .describe(
+        "End of the period, ISO 8601. Must be given together with `from`. " +
+          "Only valid with a derivation."
+      ),
+  })
+  /**
+   * Shape validation only — whether these fields can describe a request at all.
+   * Whether the request is ANSWERABLE (a derivation over a position, a window
+   * that ends before it starts) is the engine's judgement, made once in the
+   * planner so the vocabulary has one home.
+   */
+  .superRefine((input, ctx) => {
+    const relative = input.windowDays !== undefined;
+    const absolute = input.from !== undefined || input.to !== undefined;
+
+    if (input.derivation === undefined) {
+      if (relative || absolute) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["derivation"],
+          message:
+            "A window was given with no derivation to compute over it. Add a " +
+            "derivation, or drop the window to get the latest reading.",
+        });
+      }
+      return;
+    }
+
+    if (!relative && !absolute) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["windowDays"],
+        message:
+          "A derivation needs a period. Give windowDays, or both from and to.",
+      });
+      return;
+    }
+
+    if (relative && absolute) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["windowDays"],
+        message:
+          "Give either windowDays or from/to, not both — they describe the " +
+          "same period two different ways.",
+      });
+      return;
+    }
+
+    if (absolute && (input.from === undefined || input.to === undefined)) {
+      ctx.addIssue({
+        code: "custom",
+        path: [input.from === undefined ? "from" : "to"],
+        message: "An absolute period needs both from and to.",
+      });
+    }
+  });
+
+/**
+ * Resolve the requested period into two absolute instants.
+ *
+ * THE ONLY CLOCK READ ON THIS PATH, and it is here rather than in the engine so
+ * the engine stays deterministic. `to` is now and `from` is now minus the
+ * requested days; an absolute period is passed through untouched.
+ *
+ * The schema has already guaranteed exactly one form is present, so the throw
+ * below is a wiring guard rather than a reachable branch.
+ */
+function resolveWindow(input: {
+  windowDays?: number;
+  from?: string;
+  to?: string;
+}): AnalysisWindow {
+  if (input.from !== undefined && input.to !== undefined) {
+    return { from: input.from, to: input.to };
+  }
+
+  if (input.windowDays !== undefined) {
+    const now = Date.now();
+    return {
+      from: new Date(now - input.windowDays * MS_PER_DAY).toISOString(),
+      to: new Date(now).toISOString(),
+    };
+  }
+
+  throw new Error("A derivation was requested without a resolvable period.");
+}
+
+const DERIVABLE_TEXT = DERIVABLE_QUANTITIES.join(", ");
 
 export const analysisToolSpec: ToolSpec<typeof analysisInputSchema> = {
   name: "analysis",
   description:
-    "Report the latest measured telemetry metric for a single vehicle. Use " +
-    "this whenever the user asks about a specific vehicle's battery condition, " +
-    "charge, voltage, current, temperature, charge cycles, cell balance, " +
-    "speed or location. Requires the vehicle's fleet identifier (format " +
-    `TK-#####-##@@-######). Available metrics: ${QUANTITY_CATALOGUE_TEXT}. ` +
-    "Each result reports one latest value with the time it was measured; the " +
-    "tool does not compute trends or history. When a metric comes back with " +
-    "available=false, the vehicle has no such reading — report that gap rather " +
-    "than substituting another metric.",
+    "Report telemetry for a single vehicle: either the latest measured value, " +
+    "or a value computed over a period. Use this whenever the user asks about " +
+    "a specific vehicle's battery condition, charge, voltage, current, " +
+    "temperature, charge cycles, cell balance, speed or location. Requires the " +
+    "vehicle's fleet identifier (format TK-#####-##@@-######). Available " +
+    `metrics: ${QUANTITY_CATALOGUE_TEXT}. ` +
+    "By default it reports one latest value with the time it was measured. " +
+    "To answer a question about a PERIOD — an average, a high or low, how much " +
+    "something changed, or whether it is rising or falling — add a derivation " +
+    "and a window; the tool then computes over the readings in that period and " +
+    `reports how many it used. Derivations work for: ${DERIVABLE_TEXT}. ` +
+    "When a metric comes back with available=false, the vehicle has no such " +
+    "reading, or the period holds too little data to compute it — the reason " +
+    "says which. Report that gap rather than substituting another metric, and " +
+    "do not retry the same window expecting a different answer.",
   schema: analysisInputSchema,
   // Per-result origin names the table actually read; this is the fallback the
   // registry uses when the handler throws before a source answers.
   origin: "postgres:tarang_dev",
-  handler: async ({ vehicleNo, metric }, context) => {
+  handler: async (input, context) => {
+    const { vehicleNo, metric, derivation } = input;
+
     const result = await runAnalysis(
       {
         subject: { kind: "vehicle", vehicleNo },
         quantities: [metric],
-        intent: "current",
+        ...(derivation === undefined
+          ? {}
+          : { derivation: { operation: derivation, window: resolveWindow(input) } }),
       },
       // Honoured between acquisitions rather than passed into Prisma, which
       // exposes no AbortSignal. The Tool Registry's race is what guarantees the
@@ -184,13 +347,52 @@ export const analysisToolSpec: ToolSpec<typeof analysisInputSchema> = {
       // Read off the chosen observation's provenance rather than re-derived
       // here, so the cited source is by construction the one that answered.
       origin: provenance.origin,
-      method: {
-        basis: "latest telemetry reading",
-        table: provenance.container,
-        column: provenance.field,
-        measuredAt: projected.measuredAt,
-        reportedAt: projected.reportedAt,
-      },
+      method: describeMethod(projected, provenance.container, provenance.field),
     };
   },
 };
+
+/**
+ * How the value was obtained, for the user-facing Sources block (SAD §6 —
+ * "Method metadata").
+ *
+ * Without a derivation this is the Milestone 2C record, unchanged. With one it
+ * carries the computation and the evidence behind it, which is exactly what §6
+ * promised the field would say and what it could not carry before Stage 5
+ * existed: "mean of 41 state-of-charge measurements between … and …", with the
+ * sample and row counts beside it.
+ */
+function describeMethod(
+  result: MetricResult,
+  table: string,
+  column: string
+): Record<string, unknown> {
+  if (result.derivation === undefined) {
+    return {
+      basis: "latest telemetry reading",
+      table,
+      column,
+      measuredAt: result.measuredAt,
+      reportedAt: result.reportedAt,
+    };
+  }
+
+  const { derivation } = result;
+
+  return {
+    basis: derivation.basis,
+    table,
+    column,
+    operation: derivation.operation,
+    windowFrom: derivation.window.from,
+    windowTo: derivation.window.to,
+    samples: derivation.sampleCount,
+    readings: derivation.readingCount,
+    // Stated only when true. A truncated series covers less than the window
+    // asked for, and silence about it would let a derivation over the newest
+    // rows read as one over the whole period.
+    ...(derivation.truncated ? { truncated: true } : {}),
+    firstMeasuredAt: derivation.firstMeasuredAt,
+    lastMeasuredAt: derivation.lastMeasuredAt,
+  };
+}

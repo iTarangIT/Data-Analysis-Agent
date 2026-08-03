@@ -6,18 +6,18 @@ import type {
 
 import type { Provenance, SourceClass } from "./observations";
 import {
+  batteryHealth,
   canScalar,
   canSpread,
-  projectBatteryHealth,
-  projectLocation,
-  projectSpeed,
+  location,
+  speed,
   TEMPERATURE_FLOOR_C,
   VOLTAGE_FLOOR_V,
   type Projection,
 } from "./projections";
 
 /**
- * The Quantity Registry (Milestone 5A design, 5B implementation).
+ * The Quantity Registry (Milestone 5A design, 5B implementation, 5C extension).
  *
  * ## What this is
  *
@@ -62,7 +62,7 @@ import {
  *
  * ## No live providers yet, and that is a statement rather than a gap
  *
- * `live` is absent from every entry below, because Milestone 5B acquires
+ * `live` is absent from every entry below, because Milestone 5C acquires
  * nothing from the portal. A declared provider the engine cannot fetch would be
  * a promise the code does not keep — the same reason `CAPABILITIES` is a
  * `Partial<Record<...>>` with three of eight modules filled in. Milestone 5D
@@ -116,7 +116,7 @@ export const FEED_LABELS: Record<HistoricalFeed, string> = {
 /**
  * The scope a quantity is reported at.
  *
- * Declared as DATA, not yet read as a BRANCH. Milestone 5B has only
+ * Declared as DATA, not yet read as a BRANCH. Milestone 5C has only
  * vehicle-scope quantities and only vehicle subjects, so the P0 scope gate
  * would be an always-true check; it becomes a real filter at 5E, when
  * fleet-scope providers exist to be excluded. Recording the axis now costs one
@@ -152,6 +152,36 @@ export interface QuantityDefinition {
   unit: string | null;
   scope: QuantityScope;
   /**
+   * Decimal places this quantity is reported to (Milestone 5C).
+   *
+   * ONE HOME for the precision. It is passed into the projection that reads a
+   * single measurement AND used to round a value computed over many, so a mean
+   * pack voltage cannot come back with a different resolution from a measured
+   * one. Before 5C the same numbers were written inside each projection; making
+   * every projection a factory is what let them be stated once.
+   *
+   * It narrows a value to the resolution the source actually carries; it never
+   * widens one. CAN arrives with float artifacts — one battery temperature reads
+   * 41.05000000000001 — and passing those through would present noise as
+   * precision.
+   */
+  precision: number;
+  /**
+   * Whether a derivation may be computed over this quantity (Milestone 5C).
+   *
+   * False for `last_known_location` and true for the other nine. This is not a
+   * limitation to be lifted later: every operation the engine offers is defined
+   * over a series of SCALARS, and the mean of two positions is a point in a
+   * field rather than a place the vehicle was. A trend of a position is a
+   * different concept — a track — needing its own model, its own units and its
+   * own answer shape.
+   *
+   * A derivation requested on a non-derivable quantity is refused BEFORE any
+   * read, as a question that cannot be asked rather than a computation that
+   * failed — the same treatment the Portal Service gives TARGET_REQUIRED.
+   */
+  derivable: boolean;
+  /**
    * The historical provider, per SAD §19. Required: every quantity in this
    * catalogue is answerable from recorded telemetry, which is what made the
    * Milestone 2C catalogue possible in the first place.
@@ -168,18 +198,25 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
    * State of health stays on battery_telemetry.soh_pct by decision. CAN carries
    * two competing signals and neither replaces it: `soh` is hardcoded 100 in
    * every sampled row, and `soh_1` disagrees with it in 63 of 70 rows.
+   *
+   * Known limitation for any derivation over it: `soh_pct` reads exactly 100.00
+   * across all 100 sampled rows, so a trend over this data is a true zero rather
+   * than a healthy pack. That is a property of the data, reported rather than
+   * worked around.
    */
   battery_health: {
     key: "battery_health",
     label: "State of health",
     unit: "%",
     scope: "vehicle",
+    precision: 2,
+    derivable: true,
     historical: {
       sourceClass: "historical",
       feed: "battery",
       table: "battery_telemetry",
       column: "soh_pct",
-      project: projectBatteryHealth,
+      project: batteryHealth({ decimals: 2 }),
     },
   },
 
@@ -189,6 +226,8 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
     label: "State of charge",
     unit: "%",
     scope: "vehicle",
+    precision: 2,
+    derivable: true,
     historical: {
       sourceClass: "historical",
       feed: "can",
@@ -204,6 +243,8 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
     label: "Pack voltage",
     unit: "V",
     scope: "vehicle",
+    precision: 3,
+    derivable: true,
     historical: {
       sourceClass: "historical",
       feed: "can",
@@ -220,13 +261,16 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
   /**
    * CAN `current` is authoritative, not battery_telemetry.pack_current. Note
    * that this feed reports magnitude without sign, so the value alone does not
-   * distinguish charging from discharging.
+   * distinguish charging from discharging — and neither does a mean or a trend
+   * over it, which is why neither is described as a net flow.
    */
   pack_current: {
     key: "pack_current",
     label: "Pack current",
     unit: "A",
     scope: "vehicle",
+    precision: 3,
+    derivable: true,
     historical: {
       sourceClass: "historical",
       feed: "can",
@@ -242,6 +286,8 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
     label: "Pack temperature",
     unit: "°C",
     scope: "vehicle",
+    precision: 2,
+    derivable: true,
     historical: {
       sourceClass: "historical",
       feed: "can",
@@ -266,6 +312,8 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
     label: "Charge cycles",
     unit: "cycles",
     scope: "vehicle",
+    precision: 0,
+    derivable: true,
     historical: {
       sourceClass: "historical",
       feed: "can",
@@ -286,6 +334,8 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
     label: "Cell voltage spread",
     unit: "V",
     scope: "vehicle",
+    precision: 3,
+    derivable: true,
     historical: {
       sourceClass: "historical",
       feed: "can",
@@ -309,6 +359,8 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
     label: "Cell temperature spread",
     unit: "°C",
     scope: "vehicle",
+    precision: 2,
+    derivable: true,
     historical: {
       sourceClass: "historical",
       feed: "can",
@@ -324,37 +376,40 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
     },
   },
 
-  /**
-   * Latest measured speed. A max or mean over a window needs a time-range
-   * contract on the engine's input, which arrives at Milestone 5C with the rest
-   * of the windowed work.
-   */
+  /** Latest measured speed, and — from Milestone 5C — aggregates over a window. */
   speed: {
     key: "speed",
     label: "Speed",
     unit: "km/h",
     scope: "vehicle",
+    precision: 2,
+    derivable: true,
     historical: {
       sourceClass: "historical",
       feed: "gps",
       table: "gps_telemetry",
       column: "speed_kph",
-      project: projectSpeed,
+      project: speed({ decimals: 2 }),
     },
   },
 
-  /** Position as a single value. Latitude and longitude are never separated. */
+  /**
+   * Position as a single value. Latitude and longitude are never separated, and
+   * this is the one quantity no derivation applies to — see `derivable`.
+   */
   last_known_location: {
     key: "last_known_location",
     label: "Last known location",
     unit: "degrees (WGS84)",
     scope: "vehicle",
+    precision: 6,
+    derivable: false,
     historical: {
       sourceClass: "historical",
       feed: "gps",
       table: "gps_telemetry",
       column: "lat, lon",
-      project: projectLocation,
+      project: location({ decimals: 6 }),
     },
   },
 };
@@ -362,6 +417,11 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
 /* -------------------------------------------------------------------------- */
 /*  Derived views                                                             */
 /* -------------------------------------------------------------------------- */
+
+/** Quantities a derivation may be computed over. */
+export const DERIVABLE_QUANTITIES = QUANTITIES.filter(
+  (key) => QUANTITY_REGISTRY[key].derivable
+);
 
 /**
  * The provenance one provider stamps on every observation it produces.

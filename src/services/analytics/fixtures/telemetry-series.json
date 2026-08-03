@@ -1,0 +1,120 @@
+{
+  "_comment": [
+    "Captured telemetry SERIES (Milestone 5C) — real consecutive rows from the",
+    "loaded database, in the JSON-safe shape telemetry.records.ts produces. This",
+    "is what makes series.ts and the derived path exercisable with no database,",
+    "the same way telemetry-records.json exercises the single-reading path and",
+    "src/services/portal/fixtures/ exercises the normalizers.",
+    "",
+    "PROVENANCE. gps is the first six rows of gps_telemetry for vehicle",
+    "TK-51105-02AZ-179386 (2026-06-16), ordered oldest first exactly as a windowed",
+    "read returns them. No value was altered and none was invented.",
+    "",
+    "WHAT THIS SERIES SHOWS.",
+    "- Six distinct measurement times, so ordering and span are real: the window",
+    "  runs 08:21:41.458Z to 08:54:41.458Z, a span of 33 minutes.",
+    "- speedKph moves 0.13 -> 0.15 -> 0.34 -> 0.85 -> 0.12 -> 0.27, so minimum,",
+    "  maximum, mean, change and trend are all distinguishable from one another.",
+    "  A fixture where every value matched would let a wrong operation pass.",
+    "- The samples are IRREGULARLY spaced — 60s, 640s, 60s, 720s, 500s — which is",
+    "  precisely why `mean` is documented as a sample mean and not a time-weighted",
+    "  one. The two differ on this series.",
+    "- ignition is false in every row while the vehicle is moving, the",
+    "  contradiction docs/DATA-IMPORT.md §7 records and the reason ignition is",
+    "  exposed as no quantity at all.",
+    "",
+    "canFlat is the last-known-value hazard, captured from can_telemetry for",
+    "TK-51105-23IY-141757: three rows whose `soc` signal never refreshed. Their",
+    "signal timestamps DO differ, so they are three measurements rather than one —",
+    "but the value is identical in all three, which is what makes a trend over",
+    "them a true zero rather than an artefact. A vehicle whose signal timestamps",
+    "were also identical would collapse to one sample and report no_time_span."
+  ],
+
+  "gps": [
+    {
+      "vehicleNo": "TK-51105-02AZ-179386",
+      "recordedAt": "2026-06-16T08:21:41.458Z",
+      "lat": 25.451672,
+      "lon": 82.121992,
+      "speedKph": 0.13,
+      "heading": 0,
+      "ignition": false,
+      "gpsFix": true,
+      "extVoltage": 54.05
+    },
+    {
+      "vehicleNo": "TK-51105-02AZ-179386",
+      "recordedAt": "2026-06-16T08:22:41.458Z",
+      "lat": 25.451684,
+      "lon": 82.121981,
+      "speedKph": 0.15,
+      "heading": 8.42,
+      "ignition": false,
+      "gpsFix": true,
+      "extVoltage": 54.05
+    },
+    {
+      "vehicleNo": "TK-51105-02AZ-179386",
+      "recordedAt": "2026-06-16T08:33:21.458Z",
+      "lat": 25.451666,
+      "lon": 82.121988,
+      "speedKph": 0.34,
+      "heading": 0,
+      "ignition": false,
+      "gpsFix": true,
+      "extVoltage": 54.07
+    },
+    {
+      "vehicleNo": "TK-51105-02AZ-179386",
+      "recordedAt": "2026-06-16T08:34:21.458Z",
+      "lat": 25.451666,
+      "lon": 82.121988,
+      "speedKph": 0.85,
+      "heading": 0,
+      "ignition": false,
+      "gpsFix": true,
+      "extVoltage": 54.09
+    },
+    {
+      "vehicleNo": "TK-51105-02AZ-179386",
+      "recordedAt": "2026-06-16T08:46:21.458Z",
+      "lat": 25.451662,
+      "lon": 82.121937,
+      "speedKph": 0.12,
+      "heading": 0,
+      "ignition": false,
+      "gpsFix": true,
+      "extVoltage": 54.12
+    },
+    {
+      "vehicleNo": "TK-51105-02AZ-179386",
+      "recordedAt": "2026-06-16T08:54:41.458Z",
+      "lat": 25.451712,
+      "lon": 82.121956,
+      "speedKph": 0.27,
+      "heading": 323.24,
+      "ignition": false,
+      "gpsFix": true,
+      "extVoltage": 54.12
+    }
+  ],
+
+  "canFlat": [
+    {
+      "vehicleNo": "TK-51105-23IY-141757",
+      "recordedAt": "2026-06-25T02:51:28.385Z",
+      "payload": { "soc": { "value": 64, "timestamp": 1782355888385 } }
+    },
+    {
+      "vehicleNo": "TK-51105-23IY-141757",
+      "recordedAt": "2026-06-25T02:52:28.384Z",
+      "payload": { "soc": { "value": 64, "timestamp": 1782355948384 } }
+    },
+    {
+      "vehicleNo": "TK-51105-23IY-141757",
+      "recordedAt": "2026-06-25T04:57:58.497Z",
+      "payload": { "soc": { "value": 64, "timestamp": 1782363478497 } }
+    }
+  ]
+}

@@ -23,13 +23,12 @@
  * is in the Analytics purity zone in eslint.config.mjs for the same reason
  * normalizers.ts is in the Portal one.
  *
- * There is no `Conflict` type here yet, and no `Derivation`. Milestone 5B has
- * exactly one candidate per quantity and computes nothing, so both would be
- * shapes nothing can produce. They arrive with the code that fills them —
- * `Derivation` at 5C with the first real computation, `Conflict` at 5D with the
- * first second candidate. The precedent is the one §19 already records for
- * TARGET_AMBIGUOUS and for src/lib/langsmith.ts: a declaration that cannot be
- * reached is not a head start, it is a claim the code does not honour.
+ * `Derivation` arrived at Milestone 5C, with the first real computation. There
+ * is still no `Conflict` type: Milestone 5C has exactly one candidate per
+ * quantity, so a conflict remains a shape nothing can produce, and it arrives at
+ * 5D with the first second candidate. The precedent is the one §19 already
+ * records for TARGET_AMBIGUOUS and for src/lib/langsmith.ts: a declaration that
+ * cannot be reached is not a head start, it is a claim the code does not honour.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -85,6 +84,97 @@ export interface Provenance {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Derivation                                                                */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A bounded window of time, as absolute instants.
+ *
+ * ABSOLUTE, never relative, and that is a determinism requirement rather than a
+ * formatting preference. "The last 90 days" cannot be resolved without reading a
+ * clock, and an engine that reads a clock stops being reproducible from its
+ * inputs. The single clock read that turns a relative request into this shape
+ * happens at the tool boundary — the same rule that makes a portal extractor
+ * stamp `capturedAt` so its normalizer never has to.
+ */
+export interface AnalysisWindow {
+  /** ISO 8601. Inclusive. */
+  from: string;
+  /** ISO 8601. Inclusive. */
+  to: string;
+}
+
+/**
+ * What was computed over a series.
+ *
+ * Deliberately a small, closed set. Each is a statement a fleet analyst
+ * actually makes about a quantity over a period, and each is defined over a
+ * SERIES OF SCALARS — which is why `last_known_location` is not derivable: the
+ * mean of two positions is a point in a field, not a place the vehicle was.
+ */
+export const DERIVATION_OPERATIONS = [
+  "minimum",
+  "maximum",
+  "mean",
+  "change",
+  "trend",
+] as const;
+
+export type DerivationOperation = (typeof DERIVATION_OPERATIONS)[number];
+
+/**
+ * How a computed value was arrived at (SAD §6 — "Method metadata": the Analysis
+ * Tool includes how each metric was computed in its envelope, for example the
+ * analysis window).
+ *
+ * ## Why this is carried even when the computation FAILED
+ *
+ * A Derivation is attached to an unavailable observation as readily as to an
+ * available one, and that is the insufficiency contract in one sentence: an
+ * answer of "there is not enough evidence" is worthless unless it says how much
+ * evidence there was. `sampleCount`, `readingCount` and `window` are what turn
+ * "no trend available" into "the window holds one measurement and a trend needs
+ * two" — a statement the user can act on by widening the window.
+ *
+ * ## readingCount and sampleCount are different numbers on purpose
+ *
+ * `readingCount` counts ROWS the window returned. `sampleCount` counts distinct
+ * MEASUREMENTS of this quantity inside them, and it is routinely smaller. A CAN
+ * payload is a last-known-value snapshot (docs/DATA-IMPORT.md §7), so several
+ * rows can carry one unchanged signal bearing one timestamp — those are one
+ * measurement observed repeatedly, not several measurements, and counting them
+ * severally would let an unchanged signal dominate a mean purely by being
+ * re-reported. Reporting both numbers makes that shrinkage visible instead of
+ * silent.
+ */
+export interface Derivation {
+  operation: DerivationOperation;
+  window: AnalysisWindow;
+  /** Rows the window returned for the feed. */
+  readingCount: number;
+  /** Distinct usable measurements of THIS quantity within those rows. */
+  sampleCount: number;
+  /** How many samples this operation needs at minimum. */
+  minimumSamples: number;
+  /** Measurement time of the earliest contributing sample. */
+  firstMeasuredAt: string | null;
+  /** Measurement time of the latest contributing sample. */
+  lastMeasuredAt: string | null;
+  /**
+   * True when the window held more rows than the read ceiling allowed, so the
+   * series covers less than the window asked for.
+   *
+   * Disclosed rather than absorbed: a silently truncated window would report a
+   * derivation over the newest slice as though it covered the whole period. The
+   * reader keeps the NEWEST rows on truncation, so the series is recent, not
+   * representative.
+   */
+  truncated: boolean;
+  /** One line naming the computation, for the user-facing Sources block. */
+  basis: string;
+}
+
+/* -------------------------------------------------------------------------- */
 /*  Observations                                                              */
 /* -------------------------------------------------------------------------- */
 
@@ -108,6 +198,17 @@ interface ObservationBase {
    * overstate its freshness by months.
    */
   reportedAt: string | null;
+  /**
+   * Present exactly when this observation is a COMPUTED value rather than a
+   * measured one (Milestone 5C).
+   *
+   * Absent means the observation is a direct reading, which is every observation
+   * Milestone 5B could produce and every one a request without a derivation
+   * still produces. Its presence is therefore the honest discriminator between
+   * "the pack measured 52.9 V" and "the pack averaged 52.9 V over 40 readings",
+   * and it is what stops the second being reported as the first.
+   */
+  derivation?: Derivation;
 }
 
 /**
@@ -115,8 +216,13 @@ interface ObservationBase {
  *
  * `measuredAt` is null only when the source carries no measurement time of its
  * own. It is NOT a substitute for `reportedAt` and the two are never collapsed:
- * the freshness gate P4 needs both, and Milestone 5C's trend work needs to know
- * which of the two ordered a series.
+ * the freshness gate P4 needs both, and the trend work orders a series by the
+ * first rather than the second.
+ *
+ * For a DERIVED value it is the measurement time of the latest contributing
+ * sample — the freshest evidence the number rests on. The full span is in
+ * `derivation.firstMeasuredAt` / `lastMeasuredAt`, so a mean is never mistaken
+ * for a reading taken at one instant.
  */
 export interface AvailableObservation extends ObservationBase {
   available: true;
@@ -134,6 +240,20 @@ export interface AvailableObservation extends ObservationBase {
  * holding a placeholder are all true statements about the fleet; a zero
  * standing in for any of them is not. `reason` is written to be safe to show a
  * user and safe to hand the model.
+ *
+ * ## The insufficiency contract (Milestone 5C)
+ *
+ * NOT ENOUGH EVIDENCE IS ONE OF THESE, NEVER AN EXCEPTION. A window holding no
+ * rows, holding rows that carry no usable measurement, holding fewer samples
+ * than the operation needs, or holding several samples that share one
+ * measurement time, all arrive here — with `derivation` attached, so the answer
+ * says what was attempted and how much evidence existed. Only genuine faults
+ * still throw: an unregistered vehicle, a malformed request, a failed query.
+ *
+ * The distinction is the one this system keeps making. "This vehicle has one
+ * charge-cycle reading and a trend needs two" is an ANSWER, and a user can act
+ * on it by widening the window. An exception is not an answer, and the model
+ * would be left reporting a tool failure for a fleet that is merely quiet.
  */
 export interface UnavailableObservation extends ObservationBase {
   available: false;
