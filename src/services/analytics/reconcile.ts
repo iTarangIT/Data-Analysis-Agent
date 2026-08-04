@@ -1,5 +1,6 @@
 import { detectConflict, type ComparisonSpec } from "./conflict";
 import type {
+  AgeExplanation,
   AvailableObservation,
   Conflict,
   Observation,
@@ -40,8 +41,12 @@ import type {
  *     there is nowhere for a blended value to live.
  *   - P7 — naming discipline. Enforced where the mapping is declared.
  *
- *   NOT YET REACHABLE
- *   - P0 (scope gate) needs a fleet-scope provider to exclude. Milestone 5E.
+ *   IMPLEMENTED UPSTREAM, and never reported here
+ *   - P0 — the scope gate. A fleet quantity is not answerable about one vehicle
+ *     and a per-vehicle quantity is not answerable about a fleet. Both of its
+ *     inputs are static, so it is enforced in the PLANNER (Milestone 5E), where
+ *     a mismatch is refused as a question that cannot be asked. It selects
+ *     nothing, so — like P3, P6 and P7 — it is not a `PrecedenceRule`.
  */
 
 /**
@@ -62,6 +67,27 @@ export class ReconciliationError extends Error {
 
 const isLive = (observation: Observation) =>
   observation.provenance.sourceClass === "live";
+
+/**
+ * The age verdicts that make a reported value CONTESTED.
+ *
+ * A set rather than a chain of comparisons, so the rule is stated once and reads
+ * as the policy it is. The two members arrive from different discoveries and
+ * mean different things, and both leave the answer unable to lead with one
+ * figure:
+ *
+ *   - "unexplained"    — the sources differ by more than the time between them
+ *                        can account for.
+ *   - "not_applicable" — there was never a time-based explanation available,
+ *                        because the quantity is an exact count (5E).
+ *
+ * "unknown" is deliberately absent. A missing measurement time is a gap in the
+ * evidence, not evidence of a gap.
+ */
+const DISPUTED_AGE_EXPLANATIONS = new Set<AgeExplanation>([
+  "unexplained",
+  "not_applicable",
+]);
 
 /**
  * P4 — THE FRESHNESS GATE.
@@ -203,9 +229,11 @@ export function reconcile(
     alternatives,
     ...(conflict === undefined ? {} : { conflict }),
     // Derived from the conflict rather than declared beside it, so the two
-    // cannot disagree. An UNKNOWN age is deliberately not disputed: a missing
-    // measurement time is a gap in the evidence, not evidence of a gap.
+    // cannot disagree.
     disposition:
-      conflict?.ageExplanation === "unexplained" ? "disputed" : "resolved",
+      conflict !== undefined &&
+      DISPUTED_AGE_EXPLANATIONS.has(conflict.ageExplanation)
+        ? "disputed"
+        : "resolved",
   };
 }

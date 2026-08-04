@@ -1,10 +1,15 @@
 import {
   fetchBatteryReadings,
   fetchCanReadings,
+  fetchFleetPopulation,
+  fetchFleetSize,
   fetchGpsReadings,
   fetchLatestBatteryReading,
+  fetchLatestBatteryReadingsForFleet,
   fetchLatestCanReading,
+  fetchLatestCanReadingsForFleet,
   fetchLatestGpsReading,
+  fetchLatestGpsReadingsForFleet,
   requireVehicle,
 } from "@/services/database/telemetry.reader";
 import type {
@@ -12,7 +17,10 @@ import type {
   CanReadingRecord,
   GpsReadingRecord,
 } from "@/services/database/telemetry.records";
-import type { VehicleSummary } from "@/services/portal/normalizers";
+import type {
+  FleetOverview,
+  VehicleSummary,
+} from "@/services/portal/normalizers";
 import {
   fetchPortalModule,
   PORTAL_MODULES,
@@ -22,7 +30,7 @@ import { isAuthEnvConfigured } from "@/lib/env";
 
 import type { AnalysisWindow } from "./observations";
 import type { AnalysisPlan, AnalysisSubject, CandidateSource } from "./planner";
-import type { HistoricalFeed } from "./quantity-registry";
+import { QUANTITY_REGISTRY, type HistoricalFeed } from "./quantity-registry";
 
 /**
  * Stage 3 — Acquire (Milestone 5A design, 5B implementation, 5C extension).
@@ -33,12 +41,17 @@ import type { HistoricalFeed } from "./quantity-registry";
  * rest of the engine be exercised from a fixture, and it is the same split the
  * Portal Service draws between its extractors and its normalizers.
  *
- * At Milestone 5C every acquisition is still HISTORICAL — a latest-reading fetch
- * or a windowed range read through the telemetry reader. Milestone 5D adds the
- * live half, and it lands here and nowhere else: `fetchPortalModule()` gets
- * called from this file, the cache below keys portal reads exactly as it keys
- * database reads, and no other module in the engine learns that a second source
- * class exists.
+ * Five kinds of read land here and nowhere else: a vehicle's latest reading, a
+ * vehicle's window of readings, a vehicle's live dashboard summary (5D), the
+ * whole population's latest readings, and an account-wide dashboard module (5E).
+ * `fetchPortalModule()` is called from this file alone, the cache below keys
+ * portal reads exactly as it keys database reads, and no other module in the
+ * engine learns that a second source class or a second scope exists.
+ *
+ * The one-read rule (5E) is enforced by shape rather than by discipline: a fleet
+ * live read passes NO target, so a per-vehicle scrape cannot be fanned across a
+ * population, and a fleet historical read is one query for every vehicle rather
+ * than one query per vehicle.
  *
  * ## What this module may not do
  *
@@ -101,8 +114,29 @@ export type SeriesSnapshot =
  * historical and why the live reading was not available.
  */
 export type LiveSnapshot =
-  | { mode: "live"; ok: true; module: string; summary: VehicleSummary }
-  | { mode: "live"; ok: false; module: string; reason: string };
+  | { mode: "live"; scope: "vehicle"; ok: true; module: string; summary: VehicleSummary }
+  | { mode: "live"; scope: "vehicle"; ok: false; module: string; reason: string }
+  /**
+   * An ACCOUNT-WIDE dashboard read (Milestone 5E). Distinguished from the
+   * per-vehicle arm by `scope` rather than by inspecting the payload, so a
+   * consumer narrows on the discriminant instead of testing for a field.
+   */
+  | { mode: "live"; scope: "fleet"; ok: true; module: string; overview: FleetOverview }
+  | { mode: "live"; scope: "fleet"; ok: false; module: string; reason: string };
+
+/**
+ * The latest reading of each vehicle in the population, keyed by identifier
+ * (Milestone 5E).
+ *
+ * A vehicle ABSENT from the map is a non-contributor — it has no row in this
+ * feed — and that is a normal outcome for the same reason a null latest reading
+ * is. The engine walks the resolved population rather than the map's keys, so an
+ * absence is counted against the denominator instead of vanishing from it.
+ */
+export type FleetLatestSnapshot =
+  | { feed: "battery"; byVehicle: ReadonlyMap<string, BatteryReadingRecord> }
+  | { feed: "can"; byVehicle: ReadonlyMap<string, CanReadingRecord> }
+  | { feed: "gps"; byVehicle: ReadonlyMap<string, GpsReadingRecord> };
 
 export type FeedSnapshot =
   | LiveSnapshot
@@ -117,7 +151,18 @@ export type FeedSnapshot =
        */
       truncated: boolean;
       window: AnalysisWindow;
-    } & SeriesSnapshot);
+    } & SeriesSnapshot)
+  | ({ mode: "fleet_latest" } & FleetLatestSnapshot)
+  /**
+   * The size of the registered fleet.
+   *
+   * Its own mode rather than a one-entry reading, because it is not a
+   * measurement of anything: no vehicle reported it, it carries no measurement
+   * time, and there is no projection to run over it. Collapsing it into a
+   * telemetry snapshot would put a registry count behind the same shape as a
+   * pack voltage.
+   */
+  | { mode: "fleet_population"; count: number; table: string };
 
 /** Everything one analysis run fetched, keyed by `SourceRequirement.acquisitionKey`. */
 export type Acquisitions = ReadonlyMap<string, FeedSnapshot>;
@@ -181,6 +226,32 @@ const WINDOW_ROW_LIMITS: Record<HistoricalFeed, number> = {
 /* -------------------------------------------------------------------------- */
 
 /**
+ * What the subject resolved to, and what every later stage reads it as
+ * (Milestone 5E).
+ *
+ * Resolution stopped returning `void` at this milestone, and the reason is the
+ * whole design: a fleet's POPULATION is not a fact any later stage can recover
+ * on its own. Without it carried forward, an aggregate's denominator would be
+ * "whatever rows the query returned", so a mean over three vehicles and a mean
+ * over seventy would produce the same shape and be indistinguishable in the
+ * answer. Making the population a resolved value is what lets coverage be
+ * reported rather than assumed.
+ */
+export type SubjectResolution =
+  | { kind: "vehicle"; vehicleNo: string }
+  | {
+      kind: "fleet";
+      /** The resolved members, ascending. The denominator of every aggregate. */
+      vehicleNos: string[];
+      /** `vehicleNos.length`, named so the answer never counts an array. */
+      populationSize: number;
+      /** Where the population came from, for the Aggregation. */
+      populationOrigin: string;
+      /** True when more vehicles are registered than were enumerated. */
+      truncated: boolean;
+    };
+
+/**
  * Prove the subject exists before reading anything about it.
  *
  * Without this, a mistyped fleet identifier and a vehicle that genuinely has no
@@ -190,10 +261,35 @@ const WINDOW_ROW_LIMITS: Record<HistoricalFeed, number> = {
  *
  * Resolved ONCE per run rather than once per quantity, which is the first thing
  * the deduplication rule buys: an eight-quantity request costs one vehicle
- * lookup, not eight.
+ * lookup, not eight. The fleet arm is the same bargain at a larger scale — one
+ * population read serves every fleet quantity in the request.
+ *
+ * ## An EMPTY fleet is resolved, not refused
+ *
+ * A deployment with no vehicles registered resolves to a population of zero
+ * rather than throwing. That is the deliberate asymmetry with the vehicle arm: an
+ * unknown vehicle identifier is a MISTAKE a caller made, while an empty fleet is
+ * a true statement about the deployment. It becomes an unavailable observation
+ * carrying "no vehicles are registered", which is an answer someone can act on.
  */
-export async function resolveSubject(subject: AnalysisSubject): Promise<void> {
+export async function resolveSubject(
+  subject: AnalysisSubject
+): Promise<SubjectResolution> {
+  if (subject.kind === "fleet") {
+    const { vehicleNos, truncated } = await fetchFleetPopulation();
+
+    return {
+      kind: "fleet",
+      vehicleNos,
+      populationSize: vehicleNos.length,
+      populationOrigin: "postgres:vehicles",
+      truncated,
+    };
+  }
+
   await requireVehicle({ vehicleNo: subject.vehicleNo });
+
+  return { kind: "vehicle", vehicleNo: subject.vehicleNo };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -312,6 +408,7 @@ async function fetchLive(
 ): Promise<FeedSnapshot> {
   const unavailable = (reason: string): FeedSnapshot => ({
     mode: "live",
+    scope: "vehicle",
     ok: false,
     module,
     reason,
@@ -340,7 +437,7 @@ async function fetchLive(
       );
     }
 
-    return { mode: "live", ok: true, module, summary: data };
+    return { mode: "live", scope: "vehicle", ok: true, module, summary: data };
   } catch (error) {
     if (signal?.aborted) throw error;
 
@@ -352,13 +449,151 @@ async function fetchLive(
   }
 }
 
+/**
+ * Read one ACCOUNT-WIDE dashboard module (Milestone 5E).
+ *
+ * The fleet counterpart of `fetchLive`, and it differs in exactly two ways —
+ * both of which are the point of the one-read rule:
+ *
+ *   - NO TARGET is passed. An account-wide capability declares neither `resolve`
+ *     nor `assertIdentity` (Milestone 4C), so there is no vehicle to reach and
+ *     no identity to prove. This is what keeps a fleet answer to ONE page load
+ *     instead of fanning a per-vehicle scrape across three hundred vehicles.
+ *   - The payload must NOT carry `identity`. A module returning a per-vehicle
+ *     summary here would mean the registry pointed a fleet quantity at a
+ *     targeted module, which is a wiring bug rather than a fact about the fleet,
+ *     so it fails loudly — the exact mirror of the check `fetchLive` makes.
+ *
+ * Everything else is identical, including the part that matters most: a portal
+ * failure is an ANSWER. The dashboard is a corroborator reached over a browser
+ * and someone else's web application; Postgres remains the system of record, so
+ * an unreachable portal degrades to the recorded population under P5 rather than
+ * refusing an answer the database can already give.
+ */
+async function fetchFleetLive(
+  module: string,
+  signal?: AbortSignal
+): Promise<FeedSnapshot> {
+  const unavailable = (reason: string): FeedSnapshot => ({
+    mode: "live",
+    scope: "fleet",
+    ok: false,
+    module,
+    reason,
+  });
+
+  if (!isAuthEnvConfigured()) {
+    return unavailable(
+      "The Intellicar portal is not configured for this deployment, so no live reading was available."
+    );
+  }
+
+  try {
+    const data = await fetchPortalModule(
+      { module: toPortalModule(module) },
+      { signal }
+    );
+
+    if (!("metrics" in data)) {
+      throw new Error(
+        `Portal module "${module}" did not return account-wide fleet metrics.`
+      );
+    }
+
+    return { mode: "live", scope: "fleet", ok: true, module, overview: data };
+  } catch (error) {
+    if (signal?.aborted) throw error;
+
+    return unavailable(
+      error instanceof Error
+        ? error.message
+        : "The Intellicar dashboard could not be read."
+    );
+  }
+}
+
+/**
+ * Read the latest reading of every vehicle in the population, from one feed.
+ *
+ * ONE QUERY for the whole fleet, not one per vehicle. That is a correctness
+ * property before it is a performance one, and it is the same argument the
+ * acquisition cache makes: seventy separate reads could return rows from seventy
+ * different moments, and the answer would then present a fleet mean assembled
+ * across an interval while calling it a snapshot.
+ */
+function fetchFleetLatest(
+  feed: HistoricalFeed,
+  vehicleNos: string[]
+): Promise<FeedSnapshot> {
+  switch (feed) {
+    case "battery":
+      return fetchLatestBatteryReadingsForFleet(vehicleNos).then((byVehicle) => ({
+        mode: "fleet_latest" as const,
+        feed,
+        byVehicle,
+      }));
+    case "can":
+      return fetchLatestCanReadingsForFleet(vehicleNos).then((byVehicle) => ({
+        mode: "fleet_latest" as const,
+        feed,
+        byVehicle,
+      }));
+    case "gps":
+      return fetchLatestGpsReadingsForFleet(vehicleNos).then((byVehicle) => ({
+        mode: "fleet_latest" as const,
+        feed,
+        byVehicle,
+      }));
+  }
+}
+
 /** Start the fetch one candidate needs, whichever class it belongs to. */
 function fetchCandidate(
   candidate: CandidateSource,
   plan: AnalysisPlan,
+  resolution: SubjectResolution,
   signal?: AbortSignal
 ): Promise<FeedSnapshot> {
-  const { vehicleNo } = plan.subject;
+  // Dispatched on SCOPE first, then on source class. That order is the one the
+  // planner's candidate type imposes, and it is the right one: what a fleet read
+  // and a vehicle read have in common is neither the query nor the provider, only
+  // the fact that both end in a snapshot.
+  if (candidate.scope === "fleet") {
+    // Unreachable: P0 refuses a fleet quantity under a vehicle subject before a
+    // plan exists. A wiring bug rather than a fact about the fleet.
+    if (resolution.kind !== "fleet") {
+      throw new Error("A fleet-scope candidate was planned for a vehicle subject.");
+    }
+
+    if (candidate.sourceClass === "live") {
+      return fetchFleetLive(candidate.provider.module, signal);
+    }
+
+    const provider = candidate.provider;
+
+    if (provider.kind === "population") {
+      return fetchFleetSize().then((count) => ({
+        mode: "fleet_population" as const,
+        count,
+        table: provider.table,
+      }));
+    }
+
+    // The feed comes from the MEMBER quantity's provider, so §19's
+    // authoritative-feed table decides which table a fleet aggregate reads
+    // exactly as it decides for the per-vehicle quantity. Nothing about scope
+    // reassigns a feed.
+    const { feed } = QUANTITY_REGISTRY[provider.memberQuantity].historical;
+
+    return fetchFleetLatest(feed, resolution.vehicleNos);
+  }
+
+  // Unreachable for the mirror-image reason above.
+  if (resolution.kind !== "vehicle") {
+    throw new Error("A vehicle-scope candidate was planned for a fleet subject.");
+  }
+
+  const { vehicleNo } = resolution;
 
   if (candidate.sourceClass === "live") {
     return fetchLive(candidate.provider.module, vehicleNo, signal);
@@ -401,6 +636,7 @@ function fetchCandidate(
  */
 export async function acquire(
   plan: AnalysisPlan,
+  resolution: SubjectResolution,
   options: AcquisitionOptions = {}
 ): Promise<Acquisitions> {
   const { signal } = options;
@@ -413,7 +649,7 @@ export async function acquire(
 
       pending.set(
         candidate.acquisitionKey,
-        fetchCandidate(candidate, plan, signal)
+        fetchCandidate(candidate, plan, resolution, signal)
       );
     }
   }

@@ -1,11 +1,16 @@
 import {
+  countVehicles,
   getBatteryReadingsByTimeRange,
   getCanReadingsByTimeRange,
   getGpsReadingsByTimeRange,
   getLatestBatteryReading,
+  getLatestBatteryReadingsForVehicles,
   getLatestCanReading,
+  getLatestCanReadingsForVehicles,
   getLatestGpsReading,
+  getLatestGpsReadingsForVehicles,
   getVehicleByVehicleNo,
+  listVehicleNos,
 } from "./telemetry.service";
 import {
   readTelemetry,
@@ -149,5 +154,102 @@ export function fetchCanReadings(
   return readTelemetry("fetchCanReadings", async () => {
     const rows = await getCanReadingsByTimeRange(request);
     return rows.map((row) => toCanRecord(row, request.vehicleNo));
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Fleet-scope reads (Milestone 5E)                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The population an analysis of "the fleet" covers.
+ *
+ * The fleet counterpart of `requireVehicle`, and load-bearing for the same
+ * reason: without an explicit population, an aggregate's denominator would be
+ * "whatever rows came back", and a fleet mean over three vehicles would be
+ * indistinguishable from one over seventy. Resolving the set FIRST is what lets
+ * every fleet answer state what it covered.
+ *
+ * An empty fleet is an ANSWER, not a fault — a deployment with no vehicles
+ * registered is a true state, and it becomes an unavailable observation with a
+ * reason rather than a throw.
+ */
+export interface FleetPopulation {
+  /** Fleet identifiers, ascending. The denominator of every fleet aggregate. */
+  vehicleNos: string[];
+  /** True when more vehicles exist than the read enumerated. */
+  truncated: boolean;
+}
+
+/** Every registered vehicle, ascending, bounded by POPULATION_LIMIT. */
+export function fetchFleetPopulation(): Promise<FleetPopulation> {
+  return readTelemetry("fetchFleetPopulation", () => listVehicleNos());
+}
+
+/**
+ * How many vehicles are registered.
+ *
+ * The authoritative answer for `fleet_size`, and deliberately not the length of
+ * the resolved population: the two differ exactly when the population read
+ * truncated, and the count is the one that is true about the fleet.
+ */
+export function fetchFleetSize(): Promise<number> {
+  return readTelemetry("fetchFleetSize", () => countVehicles());
+}
+
+/**
+ * The latest battery reading of each named vehicle, keyed by fleet identifier.
+ *
+ * A MAP rather than an array, because every consumer looks readings up by
+ * vehicle: the engine walks the resolved population in order and asks what each
+ * member reported, so a vehicle that is ABSENT from this map is a non-contributor
+ * with a reason, not a row that failed to appear. Returning an array would make
+ * the caller rebuild this index, and would leave "no reading" and "reading not
+ * looked for" indistinguishable.
+ */
+export function fetchLatestBatteryReadingsForFleet(
+  vehicleNos: string[]
+): Promise<Map<string, BatteryReadingRecord>> {
+  return readTelemetry("fetchLatestBatteryReadingsForFleet", async () => {
+    const rows = await getLatestBatteryReadingsForVehicles(vehicleNos);
+
+    return new Map(
+      rows.map((row) => [
+        row.vehicle.vehicleNo,
+        toBatteryRecord(row, row.vehicle.vehicleNo),
+      ])
+    );
+  });
+}
+
+/** The latest GPS reading of each named vehicle, keyed by fleet identifier. */
+export function fetchLatestGpsReadingsForFleet(
+  vehicleNos: string[]
+): Promise<Map<string, GpsReadingRecord>> {
+  return readTelemetry("fetchLatestGpsReadingsForFleet", async () => {
+    const rows = await getLatestGpsReadingsForVehicles(vehicleNos);
+
+    return new Map(
+      rows.map((row) => [
+        row.vehicle.vehicleNo,
+        toGpsRecord(row, row.vehicle.vehicleNo),
+      ])
+    );
+  });
+}
+
+/** The latest CAN reading of each named vehicle, keyed by fleet identifier. */
+export function fetchLatestCanReadingsForFleet(
+  vehicleNos: string[]
+): Promise<Map<string, CanReadingRecord>> {
+  return readTelemetry("fetchLatestCanReadingsForFleet", async () => {
+    const rows = await getLatestCanReadingsForVehicles(vehicleNos);
+
+    return new Map(
+      rows.map((row) => [
+        row.vehicle.vehicleNo,
+        toCanRecord(row, row.vehicle.vehicleNo),
+      ])
+    );
   });
 }

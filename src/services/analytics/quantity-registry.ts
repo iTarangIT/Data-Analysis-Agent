@@ -4,7 +4,7 @@ import type {
   GpsReadingRecord,
 } from "@/services/database/telemetry.records";
 
-import type { VehicleSummary } from "@/services/portal/normalizers";
+import type { FleetOverview, VehicleSummary } from "@/services/portal/normalizers";
 
 import type { ComparisonSpec } from "./conflict";
 import type { Provenance, SourceClass } from "./observations";
@@ -12,6 +12,7 @@ import {
   batteryHealth,
   canScalar,
   canSpread,
+  fleetCount,
   liveCoordinates,
   liveScalar,
   location,
@@ -65,17 +66,33 @@ import {
  * "the portal shows 62%" and "CAN recorded 41% six days ago" from being treated
  * as rival answers to the same question when they are answers to two.
  *
- * ## No live providers yet, and that is a statement rather than a gap
+ * ## Scope is the THIRD axis (Milestone 5E)
  *
- * `live` is absent from every entry below, because Milestone 5C acquires
- * nothing from the portal. A declared provider the engine cannot fetch would be
- * a promise the code does not keep — the same reason `CAPABILITIES` is a
- * `Partial<Record<...>>` with three of eight modules filled in. Milestone 5D
- * adds the live half, and the ONLY change here will be additive: a `live` field
- * on the quantities the portal can genuinely answer (state of charge, speed,
- * location), and nothing on the ones it cannot (state of health — the portal
- * publishes no per-vehicle battery view at all, which Milestone 4D's discovery
- * pass established).
+ * §19 decides which feed answers a quantity; `sourceClass` decides live or
+ * recorded; `scope` decides what the answer is ABOUT — one vehicle, or the
+ * population. The three are independent, and a fleet quantity does not amend
+ * either of the other two: `fleet_state_of_charge` reads
+ * `can_telemetry.payload.soc` because `state_of_charge` does, and it says so by
+ * naming that quantity as its member rather than by restating the table.
+ *
+ * Fleet quantities are SEPARATE ENTRIES with their own names rather than a flag
+ * on the ten above. That is P7 applied to scope: one word must not mean one pack
+ * in one answer and seventy in the next.
+ *
+ * ## What is deliberately absent, and why absence is the statement
+ *
+ * A quantity appears here only when a source can genuinely answer it. There is
+ * no `fleet_last_known_location`, because the mean of positions is a point in a
+ * field rather than a place; no `fleet_speed`, because GPS reaches 1 of 70
+ * vehicles; and no live counterpart for the fleet aggregates, because the
+ * dashboard's Battery Analytics module publishes a seven-band DISTRIBUTION
+ * rather than a comparable figure, and reducing it to a mean would invent a
+ * number the portal never published.
+ *
+ * This is the same discipline that kept `live` off every entry until Milestone
+ * 5D could actually fetch one, and that keeps `CAPABILITIES` a
+ * `Partial<Record<...>>` with three of eight modules filled in: a declared
+ * provider the engine cannot reach is a promise the code does not keep.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -90,7 +107,7 @@ import {
  * a prompt change is a deliberate act rather than a side effect of adding an
  * entry in the middle.
  */
-export const QUANTITIES = [
+export const VEHICLE_QUANTITIES = [
   "battery_health",
   "state_of_charge",
   "pack_voltage",
@@ -103,7 +120,54 @@ export const QUANTITIES = [
   "last_known_location",
 ] as const;
 
-export type QuantityKey = (typeof QUANTITIES)[number];
+export type VehicleQuantityKey = (typeof VEHICLE_QUANTITIES)[number];
+
+/**
+ * Every quantity reported about the FLEET rather than one vehicle
+ * (Milestone 5E).
+ *
+ * A SEPARATE LIST, and separate names, rather than a scope flag on the ten
+ * above. That is P7 (naming discipline) applied to scope: `state_of_charge` and
+ * `fleet_state_of_charge` are different quantities that happen to read the same
+ * signal, and giving them one name would mean the same word meant one pack in
+ * one answer and seventy in the next. It is also what makes the P0 gate a TOTAL
+ * check — subject kind against quantity scope, with no third case — instead of a
+ * heuristic over how the caller phrased things.
+ *
+ * The absences are as deliberate as the entries. There is no
+ * `fleet_last_known_location`, because the mean of positions is a point in a
+ * field rather than a place the fleet was — the identical argument that makes
+ * `last_known_location` non-derivable, and it is expressed by the entry simply
+ * not existing rather than by a flag that would have to be checked. There is no
+ * `fleet_speed` either: GPS reaches 1 of 70 vehicles (5E-1 discovery), so a
+ * fleet speed would be one vehicle's reading wearing a fleet label.
+ */
+export const FLEET_QUANTITIES = [
+  "fleet_size",
+  "fleet_running",
+  "fleet_stopped",
+  "fleet_non_communicating",
+  "fleet_state_of_charge",
+  "fleet_pack_temperature",
+  "fleet_battery_health",
+] as const;
+
+export type FleetQuantityKey = (typeof FLEET_QUANTITIES)[number];
+
+/**
+ * The whole vocabulary, vehicle quantities first.
+ *
+ * ORDER IS PRESERVED, not merely stable: the ten vehicle quantities keep their
+ * catalogue positions and the fleet entries are APPENDED, so the string the
+ * Analysis Tool renders for the per-vehicle catalogue is byte-identical to the
+ * one it rendered before this milestone.
+ */
+export const QUANTITIES = [
+  ...VEHICLE_QUANTITIES,
+  ...FLEET_QUANTITIES,
+] as const;
+
+export type QuantityKey = VehicleQuantityKey | FleetQuantityKey;
 
 /** Which historical telemetry feed a provider reads. */
 export type HistoricalFeed = "battery" | "can" | "gps";
@@ -119,14 +183,18 @@ export const FEED_LABELS: Record<HistoricalFeed, string> = {
 };
 
 /**
- * The scope a quantity is reported at.
+ * The scope a quantity is reported at — the THIRD axis of this vocabulary.
  *
- * Declared as DATA, not yet read as a BRANCH. Milestone 5C has only
- * vehicle-scope quantities and only vehicle subjects, so the P0 scope gate
- * would be an always-true check; it becomes a real filter at 5E, when
- * fleet-scope providers exist to be excluded. Recording the axis now costs one
- * field and is the same judgement that lets `PORTAL_MODULES` name modules
- * before they are built.
+ * Declared as data at 5A and read as a branch from 5E. It is orthogonal to the
+ * other two and must not be confused with either: SAD §19's authoritative-feed
+ * table decides WHICH FEED answers a quantity, `sourceClass` decides whether the
+ * answer is live or recorded, and this decides WHAT THE ANSWER IS ABOUT. A fleet
+ * mean state of charge reads the same CAN signal as the per-vehicle quantity,
+ * from the same authoritative feed, and is a different fact.
+ *
+ * It is now the discriminant of `QuantityDefinition`, which is what turns the P0
+ * gate from a comparison someone has to remember into a check the compiler
+ * cannot let a caller skip.
  */
 export type QuantityScope = "vehicle" | "fleet";
 
@@ -172,6 +240,78 @@ export interface LiveProvider {
   project: (summary: VehicleSummary) => Projection;
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Fleet providers (Milestone 5E)                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A fleet quantity answered by aggregating one telemetry feed over the whole
+ * population.
+ *
+ * ## It names a MEMBER QUANTITY, never a table and a column
+ *
+ * `memberQuantity` points at the per-vehicle entry whose provider reads each
+ * vehicle, so the feed, the column, the projection, the placeholder floors and
+ * the precision are all inherited rather than restated. That is the difference
+ * between referencing SAD §19's authoritative-feed table and copying it: a fleet
+ * mean state of charge reads `can_telemetry.payload.soc` BECAUSE
+ * `state_of_charge` does, and the day §19 ever reassigns that feed the fleet
+ * quantity follows automatically instead of silently disagreeing with its own
+ * per-vehicle counterpart.
+ *
+ * The type is `VehicleQuantityKey`, so the compiler will not let this point at
+ * another fleet quantity — an aggregate of an aggregate has no meaning here.
+ *
+ * The OPERATION is not declared: it belongs to the request, exactly as a
+ * `DerivationRequest`'s operation does. Baking "mean" into the registry would
+ * make "which vehicle has the lowest charge" unaskable.
+ */
+export interface FleetAggregateProvider {
+  sourceClass: Extract<SourceClass, "historical">;
+  kind: "aggregate";
+  memberQuantity: VehicleQuantityKey;
+}
+
+/**
+ * A fleet quantity whose value IS the size of the resolved population.
+ *
+ * Not an aggregate over measurements, and kept structurally apart from one for
+ * that reason: a vehicle's presence in the registry is not a measurement of the
+ * vehicle, so there is no member to project, no measurement time to span and no
+ * coverage to report. Its provenance is the `vehicles` dimension itself.
+ */
+export interface FleetPopulationProvider {
+  sourceClass: Extract<SourceClass, "historical">;
+  kind: "population";
+  table: string;
+  column: string;
+}
+
+export type FleetHistoricalProvider =
+  | FleetAggregateProvider
+  | FleetPopulationProvider;
+
+/**
+ * A fleet quantity answered by an ACCOUNT-WIDE dashboard module.
+ *
+ * The live counterpart of the two above, and the reason a fleet answer costs one
+ * page load rather than three hundred and twenty. A fleet live provider must
+ * name a module that reports the whole account — never a targeted one — because
+ * the alternative is fanning a per-vehicle scrape across the population inside a
+ * tool budget. That constraint is expressed by this type carrying no target and
+ * by its projection taking a `FleetOverview` rather than a `VehicleSummary`.
+ */
+export interface FleetLiveProvider {
+  sourceClass: Extract<SourceClass, "live">;
+  /** Portal module id, resolved against PORTAL_MODULES where it is used. */
+  module: string;
+  /** Envelope-facing origin, e.g. "intellicar:fleet_overview". */
+  origin: string;
+  /** The module's own metric key, as its catalogue names it. */
+  field: string;
+  project: (overview: FleetOverview) => Projection;
+}
+
 interface QuantityBase {
   key: QuantityKey;
   /** Human-readable name, for prose. */
@@ -193,27 +333,6 @@ interface QuantityBase {
    * precision.
    */
   precision: number;
-  /**
-   * Whether a derivation may be computed over this quantity (Milestone 5C).
-   *
-   * False for `last_known_location` and true for the other nine. This is not a
-   * limitation to be lifted later: every operation the engine offers is defined
-   * over a series of SCALARS, and the mean of two positions is a point in a
-   * field rather than a place the vehicle was. A trend of a position is a
-   * different concept — a track — needing its own model, its own units and its
-   * own answer shape.
-   *
-   * A derivation requested on a non-derivable quantity is refused BEFORE any
-   * read, as a question that cannot be asked rather than a computation that
-   * failed — the same treatment the Portal Service gives TARGET_REQUIRED.
-   */
-  derivable: boolean;
-  /**
-   * The historical provider, per SAD §19. Required: every quantity in this
-   * catalogue is answerable from recorded telemetry, which is what made the
-   * Milestone 2C catalogue possible in the first place.
-   */
-  historical: HistoricalProvider;
 }
 
 /**
@@ -233,8 +352,32 @@ interface QuantityBase {
  * that reports one entity cannot be declared without the step that proves which
  * entity it read.
  */
-export type QuantityDefinition = QuantityBase &
-  (
+export type VehicleQuantityDefinition = QuantityBase & {
+  key: VehicleQuantityKey;
+  scope: Extract<QuantityScope, "vehicle">;
+  /**
+   * Whether a derivation may be computed over this quantity (Milestone 5C).
+   *
+   * False for `last_known_location` and true for the other nine. This is not a
+   * limitation to be lifted later: every operation the engine offers is defined
+   * over a series of SCALARS, and the mean of two positions is a point in a
+   * field rather than a place the vehicle was. A trend of a position is a
+   * different concept — a track — needing its own model, its own units and its
+   * own answer shape.
+   *
+   * A derivation requested on a non-derivable quantity is refused BEFORE any
+   * read, as a question that cannot be asked rather than a computation that
+   * failed — the same treatment the Portal Service gives TARGET_REQUIRED.
+   */
+  derivable: boolean;
+  /**
+   * The historical provider, per SAD §19. Required on this arm: every
+   * per-vehicle quantity in this catalogue is answerable from recorded
+   * telemetry, which is what made the Milestone 2C catalogue possible in the
+   * first place.
+   */
+  historical: HistoricalProvider;
+} & (
     | {
         /** No live provider: this quantity is answerable only from history. */
         live?: undefined;
@@ -247,11 +390,74 @@ export type QuantityDefinition = QuantityBase &
       }
   );
 
+/**
+ * One fleet quantity, and — when both sources can answer it — how they are
+ * compared (Milestone 5E).
+ *
+ * THREE ARMS, expressing "at least one provider, and a comparison exactly when
+ * there are two". The middle arm is the one the vehicle definition has no
+ * counterpart for and the reason this could not be a flag on the existing type:
+ * `fleet_running` is answerable ONLY from the live dashboard. The database
+ * records no vehicle state — §19 excludes `ignition` outright, because it reads
+ * false in every sampled row while the vehicle is demonstrably moving — so a
+ * historical provider for it would have to be invented. Forcing one would put a
+ * fabricated source behind a real number, which is the failure this whole
+ * subsystem exists to prevent.
+ *
+ * `derivable` is absent from every arm, and its absence is the statement: a
+ * fleet question over a WINDOW is refused wholesale in the planner, so there is
+ * no per-quantity judgement to record. When it is enabled the flag arrives with
+ * it.
+ */
+export type FleetQuantityDefinition = QuantityBase & {
+  key: FleetQuantityKey;
+  scope: Extract<QuantityScope, "fleet">;
+} & (
+    | {
+        fleetHistorical: FleetHistoricalProvider;
+        /** No live counterpart, so nothing to reconcile against. */
+        fleetLive?: undefined;
+        reconciliation?: undefined;
+      }
+    | {
+        fleetHistorical?: undefined;
+        /** Live only: the database records no counterpart to this. */
+        fleetLive: FleetLiveProvider;
+        reconciliation?: undefined;
+      }
+    | {
+        fleetHistorical: FleetHistoricalProvider;
+        fleetLive: FleetLiveProvider;
+        /** REQUIRED by this arm. Calibrated in the 5E-1 discovery pass. */
+        reconciliation: ComparisonSpec;
+      }
+  );
+
+export type QuantityDefinition =
+  | VehicleQuantityDefinition
+  | FleetQuantityDefinition;
+
+/**
+ * The definition a given key resolves to.
+ *
+ * A mapped type rather than `Record<QuantityKey, QuantityDefinition>`, so that
+ * `QUANTITY_REGISTRY.state_of_charge.historical` still type-checks without a
+ * narrowing dance at every call site, while `QUANTITY_REGISTRY[someKey]` for an
+ * unknown key correctly yields the union — which is exactly what the P0 gate
+ * needs in order to be a total check.
+ */
+export type QuantityDefinitionFor<K extends QuantityKey> =
+  K extends VehicleQuantityKey
+    ? VehicleQuantityDefinition
+    : FleetQuantityDefinition;
+
 /* -------------------------------------------------------------------------- */
 /*  The catalogue                                                             */
 /* -------------------------------------------------------------------------- */
 
-export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
+export const QUANTITY_REGISTRY: {
+  [K in QuantityKey]: QuantityDefinitionFor<K>;
+} = {
   /**
    * State of health stays on battery_telemetry.soh_pct by decision. CAN carries
    * two competing signals and neither replaces it: `soh` is hardcoded 100 in
@@ -554,14 +760,208 @@ export const QUANTITY_REGISTRY: Record<QuantityKey, QuantityDefinition> = {
       plausibleChangePerHour: 120_000,
     },
   },
+
+  /* ------------------------------------------------------------------------ */
+  /*  Fleet quantities (Milestone 5E)                                         */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * How many vehicles there are — the only quantity both sources answer with a
+   * COUNT, and the one that makes the population question explicit.
+   *
+   * On this deployment the two sources disagree and will keep disagreeing:
+   * `vehicles` holds the 70 registered by the manual telemetry import, while the
+   * dashboard's own All Vehicles card reads 320 (VERIFIED against the live
+   * portal on 2026-08-03). That is not a fault in either source — they are
+   * counting different sets — and it is reported as a DISPUTED result with both
+   * figures rather than resolved in favour of whichever ranked higher.
+   *
+   * It is also why every other fleet answer names its population: an aggregate
+   * over the database covers 70 vehicles, not the account's 320, and without
+   * this quantity that would be a fact the user had no way to discover.
+   */
+  fleet_size: {
+    key: "fleet_size",
+    label: "Fleet size",
+    unit: "vehicles",
+    scope: "fleet",
+    precision: 0,
+    fleetHistorical: {
+      sourceClass: "historical",
+      kind: "population",
+      table: "vehicles",
+      column: "vehicle_no",
+    },
+    fleetLive: {
+      sourceClass: "live",
+      module: "fleet_overview",
+      origin: "intellicar:fleet_overview",
+      field: "total_vehicles",
+      project: fleetCount({ metric: "total_vehicles", label: "an All Vehicles count" }),
+    },
+    reconciliation: {
+      /**
+       * CALIBRATED, 2026-08-03. A count is EXACT: there is no measurement
+       * scatter to sit above, so there is no noise floor to calibrate a
+       * tolerance from, and any disagreement between two registries is worth
+       * naming. Zero is therefore the honest threshold rather than a strict one.
+       *
+       * The observations behind it: the live count read 320 twice, two minutes
+       * apart, so the dashboard's own figure is stable; the database holds 70.
+       * Raise this only if the import ever becomes continuous, when a
+       * one-or-two-vehicle lag would become ordinary rather than notable.
+       */
+      comparison: "count",
+      deltaUnit: "vehicles",
+      threshold: 0,
+    },
+  },
+
+  /**
+   * The three fleet-state counts, all LIVE ONLY.
+   *
+   * The database records no counterpart and none can be invented: §19 excludes
+   * `ignition` outright because it reads false in every sampled row while the
+   * vehicle reaches 27.2 km/h, and "non communicating" is a property of the
+   * portal's own contact tracking rather than of any telemetry column. So these
+   * take the live-only arm — and the practical consequence is worth naming, since
+   * the 5E-1 discovery measured Running moving from 116 to 128 across two reads
+   * two minutes apart: these are genuinely current figures with no recorded
+   * history to check them against, and an answer must not imply otherwise.
+   */
+  fleet_running: {
+    key: "fleet_running",
+    label: "Vehicles running",
+    unit: "vehicles",
+    scope: "fleet",
+    precision: 0,
+    fleetLive: {
+      sourceClass: "live",
+      module: "fleet_overview",
+      origin: "intellicar:fleet_overview",
+      field: "running",
+      project: fleetCount({ metric: "running", label: "a Running count" }),
+    },
+  },
+
+  fleet_stopped: {
+    key: "fleet_stopped",
+    label: "Vehicles stopped",
+    unit: "vehicles",
+    scope: "fleet",
+    precision: 0,
+    fleetLive: {
+      sourceClass: "live",
+      module: "fleet_overview",
+      origin: "intellicar:fleet_overview",
+      field: "stopped",
+      project: fleetCount({ metric: "stopped", label: "a Stopped count" }),
+    },
+  },
+
+  fleet_non_communicating: {
+    key: "fleet_non_communicating",
+    label: "Vehicles not communicating",
+    unit: "vehicles",
+    scope: "fleet",
+    precision: 0,
+    fleetLive: {
+      sourceClass: "live",
+      module: "fleet_overview",
+      origin: "intellicar:fleet_overview",
+      field: "non_communicating",
+      project: fleetCount({
+        metric: "non_communicating",
+        label: "a Non Communicating count",
+      }),
+    },
+  },
+
+  /**
+   * State of charge across the population, aggregated from CAN.
+   *
+   * The best-covered fleet quantity in this deployment: 70 of 70 vehicles supply
+   * a usable measurement, spanning 0.3 days (5E-1 discovery). No live provider —
+   * the dashboard's Battery Analytics module publishes a DISTRIBUTION across
+   * seven bands rather than a fleet figure, and a histogram is a different answer
+   * shape from a scalar, not a rival reading of one. Reducing it to a mean would
+   * be inventing a number the portal never published.
+   */
+  fleet_state_of_charge: {
+    key: "fleet_state_of_charge",
+    label: "Fleet state of charge",
+    unit: "%",
+    scope: "fleet",
+    precision: 2,
+    fleetHistorical: {
+      sourceClass: "historical",
+      kind: "aggregate",
+      memberQuantity: "state_of_charge",
+    },
+  },
+
+  /**
+   * Pack temperature across the population, aggregated from CAN.
+   *
+   * 69 of 70 vehicles contribute — `TK-51105-28JY-157748`'s latest CAN row
+   * carries no usable `battery_temp` — and the contributing measurements span
+   * 59.4 DAYS (5E-1 discovery). Both facts travel in the Aggregation, and the
+   * second is why they must: the CAN payload is a last-known-value snapshot, so
+   * one vehicle's latest temperature was measured in April and another's in June.
+   * A fleet mean over that is a true statement about each vehicle's latest
+   * reading and a misleading one about the fleet right now.
+   */
+  fleet_pack_temperature: {
+    key: "fleet_pack_temperature",
+    label: "Fleet pack temperature",
+    unit: "°C",
+    scope: "fleet",
+    precision: 2,
+    fleetHistorical: {
+      sourceClass: "historical",
+      kind: "aggregate",
+      memberQuantity: "pack_temperature",
+    },
+  },
+
+  /**
+   * State of health across the population, aggregated from battery_telemetry.
+   *
+   * Shipped BECAUSE its coverage is poor: 1 of 70 vehicles contributes, since the
+   * battery dataset covers a single vehicle. It is the quantity that proves the
+   * coverage disclosure works, and it returns an honest "1 of 70 vehicles
+   * contributed" instead of a confident claim about the fleet's health. The
+   * portal publishes no per-vehicle battery view at all (Milestone 4D
+   * discovery), so there is no live counterpart to check it against either.
+   */
+  fleet_battery_health: {
+    key: "fleet_battery_health",
+    label: "Fleet state of health",
+    unit: "%",
+    scope: "fleet",
+    precision: 2,
+    fleetHistorical: {
+      sourceClass: "historical",
+      kind: "aggregate",
+      memberQuantity: "battery_health",
+    },
+  },
 };
 
 /* -------------------------------------------------------------------------- */
 /*  Derived views                                                             */
 /* -------------------------------------------------------------------------- */
 
-/** Quantities a derivation may be computed over. */
-export const DERIVABLE_QUANTITIES = QUANTITIES.filter(
+/**
+ * Quantities a derivation may be computed over.
+ *
+ * Filtered from `VEHICLE_QUANTITIES` at Milestone 5E, which is not a narrowing
+ * of what was derivable before: a derivation is a computation over TIME for one
+ * subject, and no fleet quantity has ever been one. Fleet questions over a
+ * window are refused wholesale in the planner, so a fleet key appearing in this
+ * list would advertise something the engine declines to do.
+ */
+export const DERIVABLE_QUANTITIES = VEHICLE_QUANTITIES.filter(
   (key) => QUANTITY_REGISTRY[key].derivable
 );
 
@@ -575,13 +975,19 @@ export const DERIVABLE_QUANTITIES = QUANTITIES.filter(
  * block is unchanged.
  */
 export function provenanceOf(
-  provider: HistoricalProvider | LiveProvider
+  provider:
+    | HistoricalProvider
+    | LiveProvider
+    | FleetHistoricalProvider
+    | FleetLiveProvider
 ): Provenance {
   // A live provider states its own origin, because "intellicar:vehicle_summary"
   // is not derivable from a table name the way "postgres:gps_telemetry" is. The
   // two forms deliberately read alike — source system, then the thing inside it
   // that answered — so the user-facing Sources block stays legible when one
-  // answer cites both.
+  // answer cites both. A fleet live provider takes the same branch: it names an
+  // account-wide module instead of a per-vehicle one, and the shape of the
+  // attribution does not change because the scope did.
   if (provider.sourceClass === "live") {
     return {
       origin: provider.origin,
@@ -589,6 +995,16 @@ export function provenanceOf(
       container: provider.module,
       field: provider.field,
     };
+  }
+
+  // A fleet AGGREGATE cites the table and column its members were read from,
+  // resolved through the member quantity rather than restated here. So a fleet
+  // mean state of charge reports `postgres:can_telemetry` / `payload.soc` —
+  // exactly what a per-vehicle state of charge reports, because it is exactly
+  // what was read. The population is not a source and never appears as one; it
+  // is disclosed in the Aggregation, where it belongs.
+  if ("kind" in provider && provider.kind === "aggregate") {
+    return provenanceOf(QUANTITY_REGISTRY[provider.memberQuantity].historical);
   }
 
   return {
@@ -600,12 +1016,25 @@ export function provenanceOf(
 }
 
 /**
- * One line per quantity, so the model can pick without guessing.
+ * One line per PER-VEHICLE quantity, so the model can pick without guessing.
  *
  * Rendered from the catalogue rather than written by hand, which is what keeps
  * the tool's description and the engine's capabilities from disagreeing.
+ *
+ * Scoped to `VEHICLE_QUANTITIES` at Milestone 5E rather than to the whole
+ * vocabulary, so this string is byte-identical to what it was before fleet
+ * quantities existed. The fleet catalogue is rendered separately below, and the
+ * two are kept apart in the tool's description for the same reason they are kept
+ * apart in the registry: a model choosing between them is choosing what the
+ * answer is ABOUT, which is a different decision from choosing a metric.
  */
-export const QUANTITY_CATALOGUE_TEXT = QUANTITIES.map((key) => {
+export const QUANTITY_CATALOGUE_TEXT = VEHICLE_QUANTITIES.map((key) => {
+  const { label, unit } = QUANTITY_REGISTRY[key];
+  return unit === null ? `${key} (${label})` : `${key} (${label}, ${unit})`;
+}).join("; ");
+
+/** One line per FLEET quantity (Milestone 5E). */
+export const FLEET_QUANTITY_CATALOGUE_TEXT = FLEET_QUANTITIES.map((key) => {
   const { label, unit } = QUANTITY_REGISTRY[key];
   return unit === null ? `${key} (${label})` : `${key} (${label}, ${unit})`;
 }).join("; ");

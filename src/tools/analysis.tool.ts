@@ -4,6 +4,8 @@ import type { ToolSpec } from "@/agent/tool-registry";
 import { runAnalysis, type Finding } from "@/services/analytics/analysis-engine";
 import {
   DERIVATION_OPERATIONS,
+  FLEET_OPERATIONS,
+  type Aggregation,
   type AnalysisWindow,
   type Conflict,
   type Derivation,
@@ -15,8 +17,10 @@ import {
 } from "@/services/analytics/observations";
 import {
   DERIVABLE_QUANTITIES,
+  FLEET_QUANTITY_CATALOGUE_TEXT,
   QUANTITIES,
   QUANTITY_CATALOGUE_TEXT,
+  QUANTITY_REGISTRY,
 } from "@/services/analytics/quantity-registry";
 import type { ContributingSource } from "@/types/chat";
 
@@ -93,7 +97,16 @@ const MS_PER_DAY = 86_400_000;
  */
 interface MetricResult {
   metric: string;
-  vehicleNo: string;
+  /**
+   * Absent for a FLEET metric (Milestone 5E), which describes a population and
+   * has no vehicle to name.
+   *
+   * Optional rather than nullable, and still emitted in second position, so a
+   * per-vehicle result is byte-identical to what it was before fleet metrics
+   * existed. A `vehicleNo: null` would have been a field claiming there was a
+   * vehicle and it was unknown, which is a different and false statement.
+   */
+  vehicleNo?: string;
   label: string;
   /**
    * False when the vehicle, the feed, the signal or the EVIDENCE carried
@@ -131,6 +144,21 @@ interface MetricResult {
    * not be computed, which is what makes an insufficiency answer actionable.
    */
   derivation?: Derivation;
+  /**
+   * Present exactly when this metric describes a POPULATION (Milestone 5E).
+   *
+   * Carries how the figure was arrived at — read from the dashboard, aggregated
+   * across members, or counted from the registry — and, for an aggregate, how
+   * many vehicles contributed out of how many and over what span of measurement
+   * times. It is the fleet counterpart of `derivation`, and it is present on an
+   * unavailable result for the same reason: an answer of "no vehicle could
+   * report this" is worth little unless it says how many were asked.
+   *
+   * There is deliberately no separate `population` field beside it. The
+   * Aggregation already carries the denominator, and a second home for the same
+   * number is a second thing to keep in step.
+   */
+  aggregation?: Aggregation;
   /**
    * Present exactly when MORE THAN ONE source was consulted (Milestone 5D-3).
    *
@@ -249,13 +277,21 @@ function toReconciliation(finding: Finding): MetricResult["reconciliation"] {
   };
 }
 
-function toMetricResult(finding: Finding, vehicleNo: string): MetricResult {
+function toMetricResult(
+  finding: Finding,
+  vehicleNo: string | undefined
+): MetricResult {
   const { chosen } = finding.reconciled;
   const reconciliation = toReconciliation(finding);
 
+  // Spread conditionally so a FLEET result omits the key entirely while a
+  // per-vehicle one keeps it in the position it has always occupied. Key order
+  // is part of the contract: `JSON.stringify` emits in insertion order, so a
+  // reordered result is a different string in the model's context and in every
+  // trace, for identical data.
   const base = {
     metric: finding.quantity,
-    vehicleNo,
+    ...(vehicleNo === undefined ? {} : { vehicleNo }),
     label: finding.label,
     unit: finding.unit,
   };
@@ -269,6 +305,7 @@ function toMetricResult(finding: Finding, vehicleNo: string): MetricResult {
       reportedAt: chosen.reportedAt,
       reason: chosen.reason,
       ...(chosen.derivation ? { derivation: chosen.derivation } : {}),
+      ...(chosen.aggregation ? { aggregation: chosen.aggregation } : {}),
       ...(reconciliation ? { reconciliation } : {}),
     };
   }
@@ -281,6 +318,7 @@ function toMetricResult(finding: Finding, vehicleNo: string): MetricResult {
     reportedAt: chosen.reportedAt,
     ...(chosen.detail ? { detail: chosen.detail } : {}),
     ...(chosen.derivation ? { derivation: chosen.derivation } : {}),
+    ...(chosen.aggregation ? { aggregation: chosen.aggregation } : {}),
     ...(reconciliation ? { reconciliation } : {}),
   };
 }
@@ -290,13 +328,30 @@ const analysisInputSchema = z
     vehicleNo: z
       .string()
       .min(1)
+      .optional()
       .describe(
-        "Fleet identifier of the vehicle to analyse, e.g. 'TK-51105-02AZ-179386'."
+        "Fleet identifier of the vehicle to analyse, e.g. " +
+          "'TK-51105-02AZ-179386'. REQUIRED for a per-vehicle metric, and must " +
+          "be omitted for a fleet_* metric, which reports the whole fleet."
       ),
     metric: z
       .enum(QUANTITIES)
       .default("battery_health")
-      .describe(`The metric to report. One of: ${QUANTITY_CATALOGUE_TEXT}.`),
+      .describe(
+        `The metric to report. Per-vehicle metrics: ${QUANTITY_CATALOGUE_TEXT}. ` +
+          `Fleet metrics, which report the whole fleet and take no vehicleNo: ` +
+          `${FLEET_QUANTITY_CATALOGUE_TEXT}.`
+      ),
+    aggregation: z
+      .enum(FLEET_OPERATIONS)
+      .optional()
+      .describe(
+        "How to summarise a fleet metric across its vehicles: mean is the " +
+          "average over the fleet, minimum and maximum report the lowest and " +
+          "highest single vehicle. Defaults to mean. Only valid with a fleet_* " +
+          "metric, and not with fleet_size or the fleet status counts, which " +
+          "are counts rather than summaries."
+      ),
     derivation: z
       .enum(DERIVATION_OPERATIONS)
       .optional()
@@ -342,6 +397,41 @@ const analysisInputSchema = z
    * planner so the vocabulary has one home.
    */
   .superRefine((input, ctx) => {
+    /**
+     * SCOPE IS INFERRED FROM THE METRIC, never taken as an input.
+     *
+     * A separate `scope` field could disagree with the quantity it described,
+     * and the engine would then hold two answers to "what is this about" — the
+     * same reasoning that made intent structural at Milestone 5B rather than a
+     * flag the caller could set. The registry already knows, so the only thing
+     * left to validate here is that `vehicleNo` matches what the metric needs.
+     *
+     * Presence is SHAPE, which is this schema's business. Answerability — a
+     * fleet metric over a window, an aggregation over a count — stays the
+     * planner's, so the vocabulary has one home.
+     */
+    const scope = QUANTITY_REGISTRY[input.metric].scope;
+
+    if (scope === "fleet" && input.vehicleNo !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["vehicleNo"],
+        message:
+          `\`${input.metric}\` reports the whole fleet, so it takes no ` +
+          `vehicleNo. Drop it, or ask for a per-vehicle metric instead.`,
+      });
+    }
+
+    if (scope === "vehicle" && input.vehicleNo === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["vehicleNo"],
+        message:
+          `\`${input.metric}\` reports one vehicle, so it needs that vehicle's ` +
+          `fleet identifier (format TK-#####-##@@-######).`,
+      });
+    }
+
     const relative = input.windowDays !== undefined;
     const absolute = input.from !== undefined || input.to !== undefined;
 
@@ -423,42 +513,68 @@ const DERIVABLE_TEXT = DERIVABLE_QUANTITIES.join(", ");
 export const analysisToolSpec: ToolSpec<typeof analysisInputSchema> = {
   name: "analysis",
   description:
-    "Report telemetry for a single vehicle: either the latest measured value, " +
-    "or a value computed over a period. Use this whenever the user asks about " +
-    "a specific vehicle's battery condition, charge, voltage, current, " +
-    "temperature, charge cycles, cell balance, speed or location. Requires the " +
-    "vehicle's fleet identifier (format TK-#####-##@@-######). Available " +
-    `metrics: ${QUANTITY_CATALOGUE_TEXT}. ` +
+    "Report telemetry for ONE VEHICLE or for the WHOLE FLEET. The metric decides " +
+    "which: a fleet_* metric reports the fleet and takes no vehicleNo, and every " +
+    "other metric reports one vehicle and requires its fleet identifier (format " +
+    "TK-#####-##@@-######). " +
+    "Use the per-vehicle metrics whenever the user asks about a specific " +
+    "vehicle's battery condition, charge, voltage, current, temperature, charge " +
+    `cycles, cell balance, speed or location: ${QUANTITY_CATALOGUE_TEXT}. ` +
     "By default it reports one latest value with the time it was measured. " +
     "To answer a question about a PERIOD — an average, a high or low, how much " +
     "something changed, or whether it is rising or falling — add a derivation " +
     "and a window; the tool then computes over the readings in that period and " +
     `reports how many it used. Derivations work for: ${DERIVABLE_TEXT}. ` +
+    "Use the FLEET metrics whenever the user asks about the fleet as a whole — " +
+    "how many vehicles there are, how many are running, or what the fleet's " +
+    `charge, temperature or health looks like: ${FLEET_QUANTITY_CATALOGUE_TEXT}. ` +
+    "ASK FOR A FLEET METRIC RATHER THAN CALLING THIS TOOL ONCE PER VEHICLE; one " +
+    "fleet call reads every vehicle at once. Fleet metrics report the current " +
+    "picture only and accept no window. fleet_state_of_charge, " +
+    "fleet_pack_temperature and fleet_battery_health accept an aggregation " +
+    "(mean, minimum or maximum, default mean); the counts do not. " +
+    "A fleet result carries an `aggregation` block. When its method is " +
+    "`aggregated`, ALWAYS report contributingVehicles out of populationSize — a " +
+    "figure resting on 1 of 70 vehicles must not be presented as a fact about " +
+    "the fleet — and mention the span between firstMeasuredAt and lastMeasuredAt " +
+    "when it is wide. When the method is `reported`, the Intellicar dashboard " +
+    "counted it and Tarang did not; say so, and do not describe it as computed. " +
     "When a metric comes back with available=false, the vehicle has no such " +
-    "reading, or the period holds too little data to compute it — the reason " +
-    "says which. Report that gap rather than substituting another metric, and " +
-    "do not retry the same window expecting a different answer. " +
-    "For speed and last_known_location this tool also reads the live Intellicar " +
-    "dashboard and reconciles it against recorded telemetry; that costs a page " +
-    "load, so ask about the specific vehicle in question rather than looping " +
-    "over a fleet. When a result carries a `reconciliation` block, more than " +
-    "one source was consulted: report which one the value came from, and if it " +
-    "carries a `conflict`, say so and give both figures.",
+    "reading, the period holds too little data, or no vehicle in the fleet could " +
+    "report it — the reason says which. Report that gap rather than substituting " +
+    "another metric, and do not retry the same request expecting a different " +
+    "answer. " +
+    "For speed and last_known_location, and for the fleet metrics, this tool " +
+    "also reads the live Intellicar dashboard and reconciles it against recorded " +
+    "telemetry; that costs a page load. When a result carries a `reconciliation` " +
+    "block, more than one source was consulted: report which one the value came " +
+    "from, and if it carries a `conflict`, say so and give both figures.",
   schema: analysisInputSchema,
   timeoutMs: ANALYSIS_TOOL_TIMEOUT_MS,
   // Per-result origin names the table actually read; this is the fallback the
   // registry uses when the handler throws before a source answers.
   origin: "postgres:tarang_dev",
   handler: async (input, context) => {
-    const { vehicleNo, metric, derivation } = input;
+    const { vehicleNo, metric, derivation, aggregation } = input;
+
+    // The SUBJECT is read off the registry, never off a caller-supplied scope.
+    // The schema has already checked that `vehicleNo` matches what the metric
+    // needs, so this narrowing is a lookup rather than a second judgement — and
+    // the two can never disagree, because there is only one of them.
+    const isFleet = QUANTITY_REGISTRY[metric].scope === "fleet";
 
     const result = await runAnalysis(
       {
-        subject: { kind: "vehicle", vehicleNo },
+        subject: isFleet
+          ? { kind: "fleet" }
+          : // Guaranteed by the schema; the fallback keeps the type total
+            // without inventing a vehicle.
+            { kind: "vehicle", vehicleNo: vehicleNo ?? "" },
         quantities: [metric],
         ...(derivation === undefined
           ? {}
           : { derivation: { operation: derivation, window: resolveWindow(input) } }),
+        ...(aggregation === undefined ? {} : { aggregation: { operation: aggregation } }),
       },
       // Honoured between acquisitions rather than passed into Prisma, which
       // exposes no AbortSignal. The Tool Registry's race is what guarantees the
@@ -478,7 +594,7 @@ export const analysisToolSpec: ToolSpec<typeof analysisInputSchema> = {
     }
 
     const { provenance } = finding.reconciled.chosen;
-    const projected = toMetricResult(finding, vehicleNo);
+    const projected = toMetricResult(finding, isFleet ? undefined : vehicleNo);
 
     const contributingSources = toContributingSources(finding);
 
@@ -512,6 +628,69 @@ function describeMethod(
   table: string,
   column: string
 ): Record<string, unknown> {
+  /**
+   * The FLEET arm comes first, and the order is load-bearing (Milestone 5E).
+   *
+   * A dashboard-reported fleet count has no `reconciliation` block unless a
+   * second source was consulted, so `fleet_running` would otherwise fall through
+   * to the "latest telemetry reading" branch and be described as a table and a
+   * column — attributing a portal count to a database read.
+   *
+   * ## Coverage lives HERE, not in contributingSources
+   *
+   * This is where the windowed path already puts `samples` and `readings`, so a
+   * reader learns how much evidence a figure rests on from the same place
+   * whatever its shape. For a fleet aggregate that is the contributing-vehicle
+   * count against the population, and the span those measurements covered —
+   * which on this fleet reaches 59 days for pack temperature, and would
+   * otherwise be invisible behind a single number.
+   */
+  if (result.aggregation) {
+    const aggregation = result.aggregation;
+
+    if (aggregation.method === "reported") {
+      return {
+        basis: aggregation.basis,
+        module: table,
+        field: column,
+        // Deliberately no population: the dashboard publishes a count without
+        // publishing what it counted over, and stating a denominator we did not
+        // read would be inventing a scope.
+        countedBy: "intellicar dashboard",
+        reportedAt: result.reportedAt,
+        ...(result.reconciliation ? { rule: result.reconciliation.rule } : {}),
+      };
+    }
+
+    if (aggregation.method === "population") {
+      return {
+        basis: aggregation.basis,
+        table,
+        column,
+        population: aggregation.populationSize,
+        ...(result.reconciliation ? { rule: result.reconciliation.rule } : {}),
+      };
+    }
+
+    return {
+      basis: aggregation.basis,
+      table,
+      column,
+      operation: aggregation.operation,
+      population: aggregation.populationSize,
+      contributingVehicles: aggregation.contributingVehicles,
+      // Stated only when true, exactly as a truncated window is: silence about
+      // it would let an aggregate over an enumerated subset read as one over the
+      // whole fleet.
+      ...(aggregation.truncated ? { truncated: true } : {}),
+      ...(aggregation.extremeVehicleNo === null
+        ? {}
+        : { heldBy: aggregation.extremeVehicleNo }),
+      firstMeasuredAt: aggregation.firstMeasuredAt,
+      lastMeasuredAt: aggregation.lastMeasuredAt,
+    };
+  }
+
   // A live reading is not a table and a column, and calling it one would put a
   // dashboard module behind a word that means "database table" everywhere else
   // in this system. It gets its own shape, and the precedence rule travels with

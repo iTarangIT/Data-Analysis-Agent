@@ -1,0 +1,1050 @@
+{
+  "_comment": [
+    "Captured FLEET SAMPLES (Milestone 5E) — one measurement per vehicle, in the",
+    "shape aggregate.ts consumes. This is what makes fleet aggregation and the",
+    "coverage disclosure exercisable with no database, the same way",
+    "telemetry-series.json exercises series.ts.",
+    "",
+    "PROVENANCE. Every entry is REAL. Each is the latest reading of one vehicle,",
+    "read through the same projection the engine runs — so the placeholder floors",
+    "and the CAN signal timestamps are already applied. No value was altered and",
+    "none was invented. Captured 2026-08-03 from the loaded database, whose",
+    "population is 70 vehicles.",
+    "",
+    "WHY THESE THREE QUANTITIES. They span the whole coverage range this design",
+    "has to report honestly:",
+    "",
+    "- state_of_charge   70 of 70 vehicles contribute. Full coverage, and the",
+    "                    contributing measurements span 0.3 days.",
+    "- pack_temperature  69 of 70. One vehicle's latest CAN row carries no usable",
+    "                    battery_temp, so the coverage gap is REAL rather than",
+    "                    constructed — and the span is 59.4 DAYS, because the CAN",
+    "                    payload is a last-known-value snapshot and one vehicle's",
+    "                    latest temperature was measured in April while another's",
+    "                    was measured in June. This is the fixture that proves the",
+    "                    span is load-bearing.",
+    "- battery_health    1 of 70. The battery dataset covers a single vehicle, so",
+    "                    a fleet aggregate over it is honest about resting on one",
+    "                    measurement rather than confident about the fleet.",
+    "",
+    "`nonContributors` carries the REASON each excluded vehicle was excluded, so a",
+    "test can assert that a missing member is reported rather than counted as zero."
+  ],
+  "capturedAt": "2026-08-03T11:58:47.371Z",
+  "populationOrigin": "postgres:vehicles",
+  "populationSize": 70,
+  "quantities": {
+    "state_of_charge": {
+      "memberQuantity": "state_of_charge",
+      "container": "can_telemetry",
+      "field": "payload.soc",
+      "precision": 2,
+      "contributing": 70,
+      "samples": [
+        {
+          "vehicleNo": "TK-51105-02AZ-179386",
+          "value": 100,
+          "measuredAt": "2026-06-25T00:03:51.561Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179398",
+          "value": 100,
+          "measuredAt": "2026-06-25T02:16:41.051Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179405",
+          "value": 100,
+          "measuredAt": "2026-06-25T00:03:04.121Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179410",
+          "value": 89,
+          "measuredAt": "2026-06-25T00:07:57.709Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179413",
+          "value": 59,
+          "measuredAt": "2026-06-25T07:00:22.076Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179420",
+          "value": 100,
+          "measuredAt": "2026-06-25T02:30:39.311Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179424",
+          "value": 100,
+          "measuredAt": "2026-06-25T02:11:18.596Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179437",
+          "value": 100,
+          "measuredAt": "2026-06-25T03:06:21.619Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179459",
+          "value": 100,
+          "measuredAt": "2026-06-25T00:02:59.506Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179524",
+          "value": 84,
+          "measuredAt": "2026-06-25T04:47:51.380Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02DZ-213416",
+          "value": 53,
+          "measuredAt": "2026-06-25T03:06:39.104Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187805",
+          "value": 90,
+          "measuredAt": "2026-06-25T00:02:45.086Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187807",
+          "value": 95,
+          "measuredAt": "2026-06-25T00:02:43.440Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187809",
+          "value": 94,
+          "measuredAt": "2026-06-25T02:42:09.217Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187987",
+          "value": 72,
+          "measuredAt": "2026-06-25T02:50:13.529Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187989",
+          "value": 100,
+          "measuredAt": "2026-06-25T00:02:59.426Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187991",
+          "value": 57,
+          "measuredAt": "2026-06-25T02:21:24.611Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122432",
+          "value": 100,
+          "measuredAt": "2026-06-25T00:40:34.137Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122435",
+          "value": 92,
+          "measuredAt": "2026-06-25T00:00:30.989Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122439",
+          "value": 57,
+          "measuredAt": "2026-06-25T00:24:21.235Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122440",
+          "value": 99,
+          "measuredAt": "2026-06-25T00:02:50.393Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122441",
+          "value": 76,
+          "measuredAt": "2026-06-25T00:40:13.675Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122442",
+          "value": 89,
+          "measuredAt": "2026-06-25T00:56:02.888Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122448",
+          "value": 97,
+          "measuredAt": "2026-06-25T00:02:30.897Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147860",
+          "value": 98,
+          "measuredAt": "2026-06-25T02:16:46.677Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147913",
+          "value": 70,
+          "measuredAt": "2026-06-25T02:49:35.147Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147917",
+          "value": 99,
+          "measuredAt": "2026-06-25T00:02:49.311Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147920",
+          "value": 56,
+          "measuredAt": "2026-06-25T00:00:03.811Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04KY-160529",
+          "value": 35,
+          "measuredAt": "2026-06-25T00:09:41.955Z"
+        },
+        {
+          "vehicleNo": "TK-51105-06DZ-215008",
+          "value": 52,
+          "measuredAt": "2026-06-25T03:05:23.600Z"
+        },
+        {
+          "vehicleNo": "TK-51105-06LY-170889",
+          "value": 84,
+          "measuredAt": "2026-06-25T00:02:52.255Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161930",
+          "value": 92,
+          "measuredAt": "2026-06-25T03:05:08.316Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161936",
+          "value": 100,
+          "measuredAt": "2026-06-25T04:56:30.862Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161938",
+          "value": 99,
+          "measuredAt": "2026-06-25T00:02:36.391Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161940",
+          "value": 96,
+          "measuredAt": "2026-06-25T02:49:42.965Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161944",
+          "value": 100,
+          "measuredAt": "2026-06-25T02:19:21.048Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161949",
+          "value": 81,
+          "measuredAt": "2026-06-25T06:40:47.809Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161960",
+          "value": 99,
+          "measuredAt": "2026-06-25T02:07:24.687Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161972",
+          "value": 99,
+          "measuredAt": "2026-06-25T00:03:20.818Z"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-215923",
+          "value": 83,
+          "measuredAt": "2026-06-25T00:02:36.395Z"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-215934",
+          "value": 88,
+          "measuredAt": "2026-06-25T02:42:15.997Z"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-215936",
+          "value": 100,
+          "measuredAt": "2026-06-25T00:03:00.447Z"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-216031",
+          "value": 58,
+          "measuredAt": "2026-06-25T00:02:50.918Z"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171743",
+          "value": 98,
+          "measuredAt": "2026-06-25T03:05:28.100Z"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171750",
+          "value": 89,
+          "measuredAt": "2026-06-25T02:18:01.952Z"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171756",
+          "value": 100,
+          "measuredAt": "2026-06-25T02:58:50.303Z"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171764",
+          "value": 100,
+          "measuredAt": "2026-06-25T02:42:32.904Z"
+        },
+        {
+          "vehicleNo": "TK-51105-16JY-155588",
+          "value": 100,
+          "measuredAt": "2026-06-25T00:40:33.175Z"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139063",
+          "value": 74,
+          "measuredAt": "2026-06-25T02:46:59.163Z"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139067",
+          "value": 100,
+          "measuredAt": "2026-06-25T04:43:46.840Z"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139072",
+          "value": 46,
+          "measuredAt": "2026-06-25T07:09:12.135Z"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139077",
+          "value": 72,
+          "measuredAt": "2026-06-25T02:48:11.662Z"
+        },
+        {
+          "vehicleNo": "TK-51105-23IY-141757",
+          "value": 64,
+          "measuredAt": "2026-06-25T04:57:58.497Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144073",
+          "value": 82,
+          "measuredAt": "2026-06-25T05:08:01.540Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144075",
+          "value": 98,
+          "measuredAt": "2026-06-25T00:08:44.841Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144088",
+          "value": 100,
+          "measuredAt": "2026-06-25T07:17:55.307Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144314",
+          "value": 94,
+          "measuredAt": "2026-06-25T02:42:45.505Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144315",
+          "value": 91,
+          "measuredAt": "2026-06-25T02:43:18.789Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144327",
+          "value": 100,
+          "measuredAt": "2026-06-25T02:48:39.521Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144330",
+          "value": 96,
+          "measuredAt": "2026-06-25T02:50:31.189Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27KY-167741",
+          "value": 99,
+          "measuredAt": "2026-06-25T00:02:23.223Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27KY-167743",
+          "value": 94,
+          "measuredAt": "2026-06-25T02:49:32.329Z"
+        },
+        {
+          "vehicleNo": "TK-51105-28JY-157748",
+          "value": 72,
+          "measuredAt": "2026-06-25T02:36:51.462Z"
+        },
+        {
+          "vehicleNo": "TK-51105-28JY-157752",
+          "value": 99,
+          "measuredAt": "2026-06-25T00:35:32.864Z"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145503",
+          "value": 85,
+          "measuredAt": "2026-06-25T07:15:17.117Z"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145509",
+          "value": 55,
+          "measuredAt": "2026-06-25T02:50:51.778Z"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145529",
+          "value": 100,
+          "measuredAt": "2026-06-25T00:02:42.904Z"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145532",
+          "value": 76,
+          "measuredAt": "2026-06-25T01:25:48.963Z"
+        },
+        {
+          "vehicleNo": "TK-51105-29JY-158051",
+          "value": 95,
+          "measuredAt": "2026-06-25T00:03:00.169Z"
+        },
+        {
+          "vehicleNo": "TK-64105-04DZ-013630",
+          "value": 34,
+          "measuredAt": "2026-06-25T02:10:16.183Z"
+        }
+      ],
+      "nonContributors": []
+    },
+    "pack_temperature": {
+      "memberQuantity": "pack_temperature",
+      "container": "can_telemetry",
+      "field": "payload.battery_temp",
+      "precision": 2,
+      "contributing": 69,
+      "samples": [
+        {
+          "vehicleNo": "TK-51105-02AZ-179386",
+          "value": 43.65,
+          "measuredAt": "2026-06-24T11:38:01.289Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179398",
+          "value": 46.65,
+          "measuredAt": "2026-06-24T13:02:19.550Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179405",
+          "value": 43.55,
+          "measuredAt": "2026-06-24T09:29:53.145Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179410",
+          "value": 39.15,
+          "measuredAt": "2026-06-23T19:10:21.585Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179413",
+          "value": 41.75,
+          "measuredAt": "2026-06-25T05:10:13.337Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179420",
+          "value": 41.65,
+          "measuredAt": "2026-06-24T22:25:00.045Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179424",
+          "value": 37.65,
+          "measuredAt": "2026-06-24T18:50:58.480Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179437",
+          "value": 43.35,
+          "measuredAt": "2026-06-24T16:27:43.121Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179459",
+          "value": 38.45,
+          "measuredAt": "2026-06-24T20:56:49.809Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179524",
+          "value": 39.75,
+          "measuredAt": "2026-06-25T03:38:11.835Z"
+        },
+        {
+          "vehicleNo": "TK-51105-02DZ-213416",
+          "value": 39.55,
+          "measuredAt": "2026-06-25T02:46:39.104Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187805",
+          "value": 44.65,
+          "measuredAt": "2026-06-24T12:51:43.106Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187807",
+          "value": 41.55,
+          "measuredAt": "2026-06-24T16:57:31.648Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187809",
+          "value": 39.45,
+          "measuredAt": "2026-06-25T02:17:04.733Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187987",
+          "value": 40.15,
+          "measuredAt": "2026-06-25T02:27:06.776Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187989",
+          "value": 46.55,
+          "measuredAt": "2026-06-24T13:48:54.925Z"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187991",
+          "value": 43.65,
+          "measuredAt": "2026-06-24T14:06:34.237Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122432",
+          "value": 33.55,
+          "measuredAt": "2026-05-03T07:17:27.332Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122435",
+          "value": 38.25,
+          "measuredAt": "2026-06-02T15:50:31.025Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122439",
+          "value": 34.65,
+          "measuredAt": "2026-04-26T21:46:44.418Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122440",
+          "value": 43.35,
+          "measuredAt": "2026-06-10T04:43:22.630Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122441",
+          "value": 42.25,
+          "measuredAt": "2026-05-14T11:24:37.425Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122442",
+          "value": 36.55,
+          "measuredAt": "2026-06-05T09:20:16.347Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122448",
+          "value": 32.45,
+          "measuredAt": "2026-06-23T23:07:41.988Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147860",
+          "value": 36.55,
+          "measuredAt": "2026-06-24T02:48:55.782Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147913",
+          "value": 38.05,
+          "measuredAt": "2026-06-25T00:34:54.976Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147917",
+          "value": 45.45,
+          "measuredAt": "2026-06-24T10:38:34.278Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147920",
+          "value": 40.15,
+          "measuredAt": "2026-06-24T17:37:10.276Z"
+        },
+        {
+          "vehicleNo": "TK-51105-04KY-160529",
+          "value": 34.15,
+          "measuredAt": "2026-06-23T13:26:38.712Z"
+        },
+        {
+          "vehicleNo": "TK-51105-06DZ-215008",
+          "value": 40.85,
+          "measuredAt": "2026-06-25T02:27:46.807Z"
+        },
+        {
+          "vehicleNo": "TK-51105-06LY-170889",
+          "value": 40.05,
+          "measuredAt": "2026-06-24T23:34:51.006Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161930",
+          "value": 33.55,
+          "measuredAt": "2026-06-24T23:25:16.672Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161936",
+          "value": 31.75,
+          "measuredAt": "2026-06-25T02:05:04.892Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161938",
+          "value": 39.95,
+          "measuredAt": "2026-06-24T14:34:23.243Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161940",
+          "value": 40.65,
+          "measuredAt": "2026-06-24T15:44:12.392Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161944",
+          "value": 37.65,
+          "measuredAt": "2026-06-24T20:03:03.565Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161949",
+          "value": 40.85,
+          "measuredAt": "2026-06-25T05:46:11.468Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161960",
+          "value": 43.05,
+          "measuredAt": "2026-06-24T14:12:56.344Z"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161972",
+          "value": 39.55,
+          "measuredAt": "2026-06-24T16:29:57.174Z"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-215923",
+          "value": 45.15,
+          "measuredAt": "2026-06-24T15:21:39.929Z"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-215934",
+          "value": 38.15,
+          "measuredAt": "2026-06-25T02:40:45.997Z"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-215936",
+          "value": 39.95,
+          "measuredAt": "2026-06-23T02:05:08.112Z"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-216031",
+          "value": 39.05,
+          "measuredAt": "2026-06-21T02:31:03.799Z"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171743",
+          "value": 41.15,
+          "measuredAt": "2026-06-24T17:19:23.775Z"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171750",
+          "value": 36.85,
+          "measuredAt": "2026-06-25T01:04:45.877Z"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171756",
+          "value": 40.45,
+          "measuredAt": "2026-06-24T20:33:49.942Z"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171764",
+          "value": 45.05,
+          "measuredAt": "2026-06-24T11:32:02.418Z"
+        },
+        {
+          "vehicleNo": "TK-51105-16JY-155588",
+          "value": 45.25,
+          "measuredAt": "2026-06-24T13:06:31.237Z"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139063",
+          "value": 43.05,
+          "measuredAt": "2026-06-23T04:45:16.994Z"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139067",
+          "value": 41.25,
+          "measuredAt": "2026-06-24T15:39:24.664Z"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139072",
+          "value": 45.75,
+          "measuredAt": "2026-06-25T06:56:12.135Z"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139077",
+          "value": 40.45,
+          "measuredAt": "2026-06-23T07:41:02.101Z"
+        },
+        {
+          "vehicleNo": "TK-51105-23IY-141757",
+          "value": 33.25,
+          "measuredAt": "2026-06-24T09:42:14.417Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144073",
+          "value": 40.55,
+          "measuredAt": "2026-06-23T14:38:44.099Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144075",
+          "value": 34.55,
+          "measuredAt": "2026-06-20T00:10:38.922Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144088",
+          "value": 47.15,
+          "measuredAt": "2026-06-24T14:17:06.695Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144314",
+          "value": 47.05,
+          "measuredAt": "2026-06-24T14:14:07.259Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144315",
+          "value": 44.15,
+          "measuredAt": "2026-06-24T16:13:55.721Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144327",
+          "value": 37.55,
+          "measuredAt": "2026-06-25T00:30:00.503Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144330",
+          "value": 45.75,
+          "measuredAt": "2026-06-24T12:09:41.784Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27KY-167741",
+          "value": 42.75,
+          "measuredAt": "2026-06-24T13:44:52.582Z"
+        },
+        {
+          "vehicleNo": "TK-51105-27KY-167743",
+          "value": 34.55,
+          "measuredAt": "2026-06-25T00:59:45.289Z"
+        },
+        {
+          "vehicleNo": "TK-51105-28JY-157752",
+          "value": 43.45,
+          "measuredAt": "2026-06-24T14:23:19.784Z"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145503",
+          "value": 39.05,
+          "measuredAt": "2026-06-24T13:20:00.001Z"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145509",
+          "value": 44.05,
+          "measuredAt": "2026-06-24T10:38:40.221Z"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145529",
+          "value": 42.85,
+          "measuredAt": "2026-06-24T13:01:17.764Z"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145532",
+          "value": 44.25,
+          "measuredAt": "2026-06-24T17:49:38.032Z"
+        },
+        {
+          "vehicleNo": "TK-51105-29JY-158051",
+          "value": 36.95,
+          "measuredAt": "2026-06-23T23:48:20.076Z"
+        },
+        {
+          "vehicleNo": "TK-64105-04DZ-013630",
+          "value": 33.95,
+          "measuredAt": "2026-06-23T12:42:59.280Z"
+        }
+      ],
+      "nonContributors": [
+        {
+          "vehicleNo": "TK-51105-28JY-157748",
+          "reason": "The latest CAN reading for this vehicle carries no usable `battery_temp` signal."
+        }
+      ]
+    },
+    "battery_health": {
+      "memberQuantity": "battery_health",
+      "container": "battery_telemetry",
+      "field": "soh_pct",
+      "precision": 2,
+      "contributing": 1,
+      "samples": [
+        {
+          "vehicleNo": "TK-51105-02AZ-179386",
+          "value": 100,
+          "measuredAt": "2026-06-17T05:26:34.784Z"
+        }
+      ],
+      "nonContributors": [
+        {
+          "vehicleNo": "TK-51105-02AZ-179398",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179405",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179410",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179413",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179420",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179424",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179437",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179459",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-02AZ-179524",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-02DZ-213416",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187805",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187807",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187809",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187987",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187989",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-03BZ-187991",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122432",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122435",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122439",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122440",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122441",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122442",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04HY-122448",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147860",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147913",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147917",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04JY-147920",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-04KY-160529",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-06DZ-215008",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-06LY-170889",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161930",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161936",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161938",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161940",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161944",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161949",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161960",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-07KY-161972",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-215923",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-215934",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-215936",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-08DZ-216031",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171743",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171750",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171756",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-09LY-171764",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-16JY-155588",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139063",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139067",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139072",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-17IY-139077",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-23IY-141757",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144073",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144075",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144088",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144314",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144315",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144327",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-27IY-144330",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-27KY-167741",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-27KY-167743",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-28JY-157748",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-28JY-157752",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145503",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145509",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145529",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-29IY-145532",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-51105-29JY-158051",
+          "reason": "no battery row"
+        },
+        {
+          "vehicleNo": "TK-64105-04DZ-013630",
+          "reason": "no battery row"
+        }
+      ]
+    }
+  }
+}

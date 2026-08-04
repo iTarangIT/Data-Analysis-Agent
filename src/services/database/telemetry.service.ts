@@ -115,6 +115,138 @@ export function getVehicleByVehicleNo(
   return prisma.vehicle.findUnique({ where: { vehicleNo } });
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Fleet-scope reads (Milestone 5E)                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A telemetry row carrying its vehicle's fleet identifier.
+ *
+ * The fleet reads below select the relation because they return rows for MANY
+ * vehicles, so the identifier can no longer be echoed from the request the way
+ * the per-vehicle readers echo it. Selecting only `vehicle_no` keeps the join
+ * narrow — the surrogate bigint id still never leaves this layer.
+ */
+type WithVehicleNo<T> = T & { vehicle: { vehicleNo: string } };
+
+export type BatteryReadingWithVehicle = WithVehicleNo<BatteryReading>;
+export type GpsReadingWithVehicle = WithVehicleNo<GpsReading>;
+export type CanReadingWithVehicle = WithVehicleNo<CanReading>;
+
+/**
+ * How many vehicles one population read may enumerate.
+ *
+ * A runaway guard rather than a fleet size, exactly as the Vehicle Summary
+ * resolver's page cap is. This deployment registers 70, so the ceiling is far
+ * out of reach — but it is stated so that a fleet which outgrows it truncates
+ * VISIBLY rather than silently aggregating over an arbitrary subset.
+ */
+export const POPULATION_LIMIT = 5000;
+
+/**
+ * Every registered vehicle's fleet identifier, ascending.
+ *
+ * Ordered so the population is reproducible: two runs resolve the same set in
+ * the same order, which is what lets a fleet aggregate's tie-breaks be
+ * deterministic all the way down (see `prepareContributors`). One more than the
+ * limit is requested, so truncation is DETECTED rather than inferred from a
+ * result that happens to be exactly full.
+ */
+export async function listVehicleNos(
+  limit: number = POPULATION_LIMIT
+): Promise<{ vehicleNos: string[]; truncated: boolean }> {
+  const ceiling = clampLimit(limit, { default: POPULATION_LIMIT, max: POPULATION_LIMIT });
+
+  const rows = await prisma.vehicle.findMany({
+    select: { vehicleNo: true },
+    orderBy: { vehicleNo: "asc" },
+    take: ceiling + 1,
+  });
+
+  return {
+    vehicleNos: rows.slice(0, ceiling).map((row) => row.vehicleNo),
+    truncated: rows.length > ceiling,
+  };
+}
+
+/**
+ * How many vehicles are registered.
+ *
+ * A separate COUNT rather than the length of the list above, and the difference
+ * matters exactly when the list truncates: the count is the true size of the
+ * fleet, while the list is the subset an aggregate actually covered. Reporting
+ * one as the other would let a truncated read present itself as complete.
+ */
+export function countVehicles(): Promise<number> {
+  return prisma.vehicle.count();
+}
+
+/**
+ * The latest reading for each of the named vehicles, one row per vehicle.
+ *
+ * ## Why `distinct` and not one query per vehicle
+ *
+ * `distinct` on `vehicleId` with the newest-first ordering is pushed down as
+ * Postgres `DISTINCT ON`, so seventy vehicles cost ONE query. The 5E-1 discovery
+ * pass verified both halves of that against the live database: the rows returned
+ * match a hand-written `DISTINCT ON` exactly for all 70 vehicles, and `take`
+ * applies AFTER the deduplication rather than before it — which is the property
+ * that matters, because a `take` applied first would silently drop vehicles out
+ * of the population and make coverage a lie.
+ *
+ * No row ceiling is applied here, and none is needed: the result holds at most
+ * one row per named vehicle, and the caller's list is already bounded by
+ * `POPULATION_LIMIT`.
+ *
+ * ## Why the read is SCOPED to an explicit list
+ *
+ * An unscoped query would return whatever the table holds at the moment it runs,
+ * which is not necessarily the population the run resolved — a vehicle
+ * registered between the two would make coverage read 71 of 70. Passing the
+ * resolved identifiers makes the denominator and the numerator come from the
+ * same set by construction.
+ */
+export function getLatestBatteryReadingsForVehicles(
+  vehicleNos: string[]
+): Promise<BatteryReadingWithVehicle[]> {
+  if (vehicleNos.length === 0) return Promise.resolve([]);
+
+  return prisma.batteryTelemetry.findMany({
+    where: { vehicle: { vehicleNo: { in: vehicleNos } } },
+    distinct: ["vehicleId"],
+    orderBy: NEWEST_FIRST,
+    include: { vehicle: { select: { vehicleNo: true } } },
+  });
+}
+
+/** The latest GPS reading for each of the named vehicles. One row per vehicle. */
+export function getLatestGpsReadingsForVehicles(
+  vehicleNos: string[]
+): Promise<GpsReadingWithVehicle[]> {
+  if (vehicleNos.length === 0) return Promise.resolve([]);
+
+  return prisma.gpsTelemetry.findMany({
+    where: { vehicle: { vehicleNo: { in: vehicleNos } } },
+    distinct: ["vehicleId"],
+    orderBy: NEWEST_FIRST,
+    include: { vehicle: { select: { vehicleNo: true } } },
+  });
+}
+
+/** The latest CAN reading for each of the named vehicles. One row per vehicle. */
+export function getLatestCanReadingsForVehicles(
+  vehicleNos: string[]
+): Promise<CanReadingWithVehicle[]> {
+  if (vehicleNos.length === 0) return Promise.resolve([]);
+
+  return prisma.canTelemetry.findMany({
+    where: { vehicle: { vehicleNo: { in: vehicleNos } } },
+    distinct: ["vehicleId"],
+    orderBy: NEWEST_FIRST,
+    include: { vehicle: { select: { vehicleNo: true } } },
+  });
+}
+
 /** Most recent battery reading for a vehicle, or null if it has none. */
 export function getLatestBatteryReading(
   vehicleNo: string

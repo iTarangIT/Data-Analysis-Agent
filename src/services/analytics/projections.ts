@@ -4,7 +4,11 @@ import type {
   CanReadingRecord,
   GpsReadingRecord,
 } from "@/services/database/telemetry.records";
-import type { VehicleSummary } from "@/services/portal/normalizers";
+import type {
+  FleetOverview,
+  FleetOverviewMetricKey,
+  VehicleSummary,
+} from "@/services/portal/normalizers";
 
 import type { ObservationDetail, ObservationValue } from "./observations";
 
@@ -421,6 +425,60 @@ export function liveCoordinates(options: {
       },
       measuredAt: lastTalkTime(summary),
     };
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Fleet projections (Milestone 5E)                                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Read one count off the live Fleet Overview.
+ *
+ * The account-wide counterpart of `liveScalar`, and the only projection in this
+ * file whose subject is a population rather than a vehicle. It computes nothing:
+ * the dashboard counts its own running vehicles and this reads the number,
+ * which is why the observation it feeds is recorded as `method: "reported"`
+ * rather than `"aggregated"`.
+ *
+ * ## measuredAt is ALWAYS null, and that is the finding this rests on
+ *
+ * Fleet Overview publishes no "as of" timestamp — the extractor records that
+ * absence explicitly, and the 5E-1 discovery pass confirmed it against the live
+ * dashboard. `capturedAt` may not stand in for one: it is when Tarang looked,
+ * not when the fleet was in this state, and the rule that a live reading's
+ * measurement time is the vehicle's own (never `capturedAt`) is the same rule
+ * that keeps a month-stale Vehicle Summary from presenting itself as seconds
+ * old.
+ *
+ * Reporting null here is what makes the count comparison honest downstream: with
+ * no measurement time on either side there is no age model at all, which is
+ * precisely why a count is compared with `comparison: "count"` and its
+ * disagreements come back as `not_applicable` rather than `unknown`.
+ */
+export function fleetCount(options: {
+  metric: FleetOverviewMetricKey;
+  label: string;
+}): (overview: FleetOverview) => Projection {
+  const { metric, label } = options;
+
+  return (overview) => {
+    // Matched by KEY, which the normalizer has already matched by the label the
+    // portal rendered. Nothing here reads the dashboard's own text, so a moved
+    // card is one honest `available: false` from the normalizer rather than a
+    // silent reassignment here.
+    const found = overview.metrics.find((entry) => entry.key === metric);
+
+    if (found === undefined) {
+      return {
+        ok: false,
+        reason: `The Intellicar dashboard did not report ${label}.`,
+      };
+    }
+
+    if (!found.available) return { ok: false, reason: found.reason };
+
+    return { ok: true, value: found.value, measuredAt: null };
   };
 }
 

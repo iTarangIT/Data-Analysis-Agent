@@ -3,9 +3,18 @@ import {
   resolveSubject,
   type Acquisitions,
   type FeedSnapshot,
+  type SubjectResolution,
 } from "./acquisition";
+import {
+  aggregateFleet,
+  measurementSpan,
+  FLEET_OPERATION_LABELS,
+  type FleetSample,
+} from "./aggregate";
 import type {
+  Aggregation,
   Derivation,
+  FleetOperation,
   Observation,
   ObservationDetail,
   ReconciledValue,
@@ -22,6 +31,10 @@ import {
   FEED_LABELS,
   provenanceOf,
   QUANTITY_REGISTRY,
+  type FleetAggregateProvider,
+  type FleetLiveProvider,
+  type FleetPopulationProvider,
+  type HistoricalFeed,
   type HistoricalProvider,
   type LiveProvider,
   type QuantityKey,
@@ -56,22 +69,38 @@ import {
  * ## The six stages
  *
  *   1 PLAN        planner.ts        — request -> requirements. Pure lookup.
+ *                                     Also where P0, the scope gate, refuses a
+ *                                     question that cannot be asked (5E).
  *   2 VOCABULARY  quantity-registry — which source answers which quantity.
  *   3 ACQUIRE     acquisition.ts    — the only impure stage. Deduplicated.
  *   4 RECONCILE   reconcile.ts      — precedence P0-P7. Pure.
- *   5 COMPUTE     series.ts         — aggregates, change, trend. Pure (5C).
+ *   5 COMPUTE     series.ts         — over TIME: aggregates, change, trend (5C).
+ *     5b AGGREGATE aggregate.ts     — over a POPULATION: mean, min, max (5E).
  *   6 ASSEMBLE    here              — findings with full provenance.
  *
- * ## What Milestone 5C added, and what it deliberately did not
+ * ## The four kinds of number this engine reports
  *
- * Stage 5 became real: a request carrying a DERIVATION reads a window of rows
- * instead of one, projects each into a sample, and computes over the series. A
- * request WITHOUT one behaves exactly as it did at 5B and 2C — same shape, same
- * strings, same envelope — which is the differential test this slice is held to.
+ * Each is discriminated by which optional record its Observation carries, never
+ * by a caller's assertion and never by the magnitude of the value:
  *
- * Not added: multi-source reconciliation. Every quantity still resolves to one
- * historical provider, so `reconcile` still reports P2 on every finding, and
- * `Conflict` remains a shape nothing can produce. That is Milestone 5D.
+ *   neither          one vehicle, one measured reading            (5B)
+ *   derivation       one vehicle, computed over a window          (5C)
+ *   aggregation      a population, at its members' latest         (5E)
+ *   both             a population of windowed derivations         (modelled,
+ *                                                                  refused in
+ *                                                                  the planner)
+ *
+ * A request carrying none of them behaves exactly as it did at 5B and 2C — same
+ * shape, same strings, same envelope — which is the differential test every
+ * slice since has been held to.
+ *
+ * ## What a FLEET answer must carry that a per-vehicle one need not
+ *
+ * COVERAGE and SPAN. A mean over 70 of 70 vehicles and one over 1 of 70 are
+ * different claims, and a shape that could not tell them apart would let the
+ * second be reported as the first — both cases are real on this deployment. The
+ * span matters for the same reason: each vehicle's LATEST reading can be weeks
+ * older than another's, so a fleet figure is not automatically a picture of now.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -100,6 +129,31 @@ export interface AnalysisResult {
    */
   intent: AnalysisPlan["intent"];
   findings: Finding[];
+  /**
+   * The population a fleet AGGREGATE covered (Milestone 5E).
+   *
+   * Reported at the RESULT level rather than only inside each Aggregation
+   * because it is a property of the run: every aggregate in one analysis covers
+   * the same set, resolved once. A caller can then say "across 70 vehicles" once
+   * instead of repeating the qualifier per metric.
+   *
+   * ## Present only when something AGGREGATED over it
+   *
+   * Not merely "when the subject was a fleet". A request for the dashboard's own
+   * counts enumerates no population — the portal counts its own account, and
+   * Tarang's registered 70 is not the denominator of that figure. Reporting the
+   * resolved population beside it would invite exactly one wrong reading: that
+   * 102 running vehicles are 102 OF 70. So the field is absent unless a fleet
+   * aggregate actually used the set, which is the same discipline the Fleet
+   * Overview normalizer applies when it reports `fleet: null` rather than naming
+   * a scope the portal never showed.
+   */
+  population?: {
+    size: number;
+    origin: string;
+    /** True when more vehicles are registered than the run enumerated. */
+    truncated: boolean;
+  };
 }
 
 export interface AnalysisOptions {
@@ -121,18 +175,18 @@ export interface AnalysisOptions {
  */
 function projectOne(
   provider: HistoricalProvider,
-  snapshot: Exclude<FeedSnapshot, { mode: "live" }>,
+  feed: HistoricalFeed,
   reading: unknown
 ): Projection {
   switch (provider.feed) {
     case "battery":
-      if (snapshot.feed !== "battery") break;
+      if (feed !== "battery") break;
       return provider.project(reading as Parameters<typeof provider.project>[0]);
     case "can":
-      if (snapshot.feed !== "can") break;
+      if (feed !== "can") break;
       return provider.project(reading as Parameters<typeof provider.project>[0]);
     case "gps":
-      if (snapshot.feed !== "gps") break;
+      if (feed !== "gps") break;
       return provider.project(reading as Parameters<typeof provider.project>[0]);
   }
 
@@ -140,7 +194,7 @@ function projectOne(
   // a mismatch is a wiring bug in this engine rather than a data problem, and it
   // fails loudly instead of being reported as missing telemetry.
   throw new Error(
-    `Provider for the ${provider.feed} feed was given a ${snapshot.feed} snapshot.`
+    `Provider for the ${provider.feed} feed was given a ${feed} snapshot.`
   );
 }
 
@@ -173,7 +227,7 @@ function observeLatest(
   }
 
   const reportedAt = snapshot.reading.recordedAt;
-  const projection = projectOne(provider, snapshot, snapshot.reading);
+  const projection = projectOne(provider, snapshot.feed, snapshot.reading);
 
   if (!projection.ok) {
     return {
@@ -231,7 +285,7 @@ function collectSamples(
   const samples: Sample[] = [];
 
   for (const reading of snapshot.readings) {
-    const projection = projectOne(provider, snapshot, reading);
+    const projection = projectOne(provider, snapshot.feed, reading);
 
     if (!projection.ok) continue;
     if (typeof projection.value !== "number") continue;
@@ -398,7 +452,7 @@ function observeDerived(
 function observeLive(
   base: ObservationBaseFields,
   provider: LiveProvider,
-  snapshot: Extract<FeedSnapshot, { mode: "live" }>
+  snapshot: Extract<FeedSnapshot, { mode: "live"; scope: "vehicle" }>
 ): Observation {
   if (!snapshot.ok) {
     return {
@@ -433,6 +487,263 @@ function observeLive(
   };
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Fleet path (Milestone 5E)                                                 */
+/* -------------------------------------------------------------------------- */
+
+/** The fleet arm of a resolution, which every fleet observation needs. */
+type FleetResolution = Extract<SubjectResolution, { kind: "fleet" }>;
+
+/**
+ * Turn one account-wide dashboard count into an Observation.
+ *
+ * ## measuredAt is null, and the count comparison depends on it
+ *
+ * The Fleet Overview view publishes no "as of" timestamp, and `capturedAt` may
+ * not stand in for one — that is the same rule which makes a vehicle's live
+ * measurement time its Last Talk Time rather than the moment Tarang looked. So a
+ * dashboard count has a `reportedAt` and no `measuredAt`, permanently.
+ *
+ * That absence is exactly why `fleet_size` is compared with `comparison: "count"`
+ * and its disagreements come back as `not_applicable` rather than `unknown`: with
+ * no measurement time on either side there is no age model to appeal to, and a
+ * verdict that waited for one would never arrive.
+ *
+ * ## The Aggregation says REPORTED, and carries no coverage
+ *
+ * The dashboard counted; the engine did not. Recording that distinction is what
+ * stops an answer narrating a portal figure as something Tarang computed. And it
+ * carries no denominator, because the portal publishes a count without publishing
+ * what it counted over — inventing one would be the fabrication the Fleet
+ * Overview normalizer already refuses when it reports `fleet: null`.
+ */
+function observeFleetLive(
+  base: ObservationBaseFields,
+  provider: FleetLiveProvider,
+  snapshot: Extract<FeedSnapshot, { mode: "live"; scope: "fleet" }>
+): Observation {
+  if (!snapshot.ok) {
+    return {
+      ...base,
+      available: false,
+      measuredAt: null,
+      reportedAt: null,
+      reason: snapshot.reason,
+    };
+  }
+
+  const reportedAt = snapshot.overview.capturedAt;
+  const projection = provider.project(snapshot.overview);
+
+  if (!projection.ok) {
+    return {
+      ...base,
+      available: false,
+      measuredAt: null,
+      reportedAt,
+      reason: projection.reason,
+    };
+  }
+
+  return {
+    ...base,
+    available: true,
+    value: projection.value,
+    measuredAt: projection.measuredAt,
+    reportedAt,
+    aggregation: {
+      method: "reported",
+      populationOrigin: provider.origin,
+      basis: `${base.label.toLowerCase()} as counted by the Intellicar dashboard`,
+    },
+  };
+}
+
+/**
+ * Turn the registered fleet's size into an Observation.
+ *
+ * The value is a COUNT of the vehicle dimension, not a measurement of anything —
+ * so it carries neither a measurement time nor a reported time. A vehicle's row
+ * in the registry records when it was added to Tarang's database, which is a fact
+ * about the import rather than about the fleet, and reporting it as the moment
+ * the fleet was this size would be a claim nobody made.
+ */
+function observeFleetPopulation(
+  base: ObservationBaseFields,
+  provider: FleetPopulationProvider,
+  snapshot: Extract<FeedSnapshot, { mode: "fleet_population" }>
+): Observation {
+  return {
+    ...base,
+    available: true,
+    value: snapshot.count,
+    measuredAt: null,
+    reportedAt: null,
+    aggregation: {
+      method: "population",
+      populationSize: snapshot.count,
+      populationOrigin: `postgres:${provider.table}`,
+      basis: `count of the vehicles registered in ${provider.table}`,
+    },
+  };
+}
+
+/**
+ * Pull one usable measurement out of each member of the population.
+ *
+ * ## The population is walked, not the map
+ *
+ * Iteration is over `resolution.vehicleNos` — the resolved denominator — rather
+ * than over the readings that came back. A vehicle with no row in this feed is
+ * therefore SKIPPED while still counting against the population, which is what
+ * makes 1-of-70 coverage reportable. Walking the map instead would silently
+ * redefine the fleet as "vehicles that happen to have data", and every aggregate
+ * would report full coverage of a fleet it had quietly shrunk.
+ *
+ * Each member is read by the MEMBER quantity's own projection, so the placeholder
+ * floors, the CAN signal timestamps and the rounding are the same code that
+ * answers the per-vehicle question. A fleet mean cannot disagree with its members
+ * about what counts as a usable reading.
+ */
+function collectFleetSamples(
+  member: HistoricalProvider,
+  feed: HistoricalFeed,
+  snapshot: Extract<FeedSnapshot, { mode: "fleet_latest" }>,
+  resolution: FleetResolution
+): { samples: FleetSample[]; reportedAt: string | null } {
+  const samples: FleetSample[] = [];
+  let reportedAt: string | null = null;
+
+  for (const vehicleNo of resolution.vehicleNos) {
+    const reading = snapshot.byVehicle.get(vehicleNo);
+    if (reading === undefined) continue;
+
+    const projection = projectOne(member, feed, reading);
+
+    if (!projection.ok) continue;
+    // A coordinate cannot be aggregated, and no fleet quantity declares a member
+    // that produces one — there is no `fleet_last_known_location`. The check is
+    // what makes that a guarantee rather than a convention, and it keeps this
+    // function total.
+    if (typeof projection.value !== "number") continue;
+
+    samples.push({
+      vehicleNo,
+      value: projection.value,
+      measuredAt: projection.measuredAt,
+    });
+
+    // The freshest ROW behind the aggregate, which is the fleet counterpart of
+    // "the newest row in the window" that a derived value is reported against.
+    if (reportedAt === null || reading.recordedAt > reportedAt) {
+      reportedAt = reading.recordedAt;
+    }
+  }
+
+  return { samples, reportedAt };
+}
+
+/**
+ * Aggregate one quantity across the population, reporting thin coverage as an
+ * answer.
+ *
+ * ## The insufficiency contract, at population scale
+ *
+ * Two shortfalls can stop an aggregate, and BOTH come back as an unavailable
+ * Observation carrying its Aggregation — never as an exception:
+ *
+ *   1. the fleet holds no vehicles at all;
+ *   2. no vehicle in it carries a usable measurement of this quantity.
+ *
+ * What is deliberately NOT a shortfall is thin coverage. One vehicle of seventy
+ * is answered, with the coverage attached, because "state of health averages 100%
+ * across 1 of 70 vehicles" is a true and actionable statement while a refusal
+ * would suppress it. This is the same judgement the windowed path makes when it
+ * reports a mean over two readings rather than demanding a fuller window.
+ *
+ * The Aggregation is built AFTER the aggregation is attempted but attached either
+ * way, so an answer that could not be computed still says how much evidence
+ * existed — exactly what makes an insufficiency answer actionable rather than
+ * merely honest.
+ */
+function observeFleetAggregate(
+  base: ObservationBaseFields,
+  provider: FleetAggregateProvider,
+  snapshot: Extract<FeedSnapshot, { mode: "fleet_latest" }>,
+  resolution: FleetResolution,
+  operation: FleetOperation
+): Observation {
+  const memberDefinition = QUANTITY_REGISTRY[provider.memberQuantity];
+  const member = memberDefinition.historical;
+  const memberLabel = memberDefinition.label.toLowerCase();
+  const { precision } = QUANTITY_REGISTRY[base.quantity];
+  const { populationSize } = resolution;
+
+  const { samples, reportedAt } = collectFleetSamples(
+    member,
+    snapshot.feed,
+    snapshot,
+    resolution
+  );
+
+  const { prepared, result } = aggregateFleet(operation, samples, precision);
+  const { firstMeasuredAt, lastMeasuredAt } = measurementSpan(prepared);
+  const contributingVehicles = prepared.length;
+  const operationLabel = FLEET_OPERATION_LABELS[operation];
+
+  const aggregation: Aggregation = {
+    method: "aggregated",
+    operation,
+    populationSize,
+    contributingVehicles,
+    firstMeasuredAt,
+    lastMeasuredAt,
+    truncated: resolution.truncated,
+    extremeVehicleNo: result.ok ? result.extremeVehicleNo : null,
+    populationOrigin: resolution.populationOrigin,
+    basis:
+      `${operationLabel} of ${memberLabel} across ${contributingVehicles} of ` +
+      `${populationSize} vehicle${populationSize === 1 ? "" : "s"}`,
+  };
+
+  const unavailable = (reason: string): Observation => ({
+    ...base,
+    available: false,
+    measuredAt: null,
+    reportedAt,
+    aggregation,
+    reason,
+  });
+
+  if (populationSize === 0) {
+    return unavailable(
+      `No vehicles are registered, so the ${operationLabel} ` +
+        `${memberLabel} cannot be computed.`
+    );
+  }
+
+  if (!result.ok) {
+    return unavailable(
+      `None of the ${populationSize} vehicles in the fleet carries a usable ` +
+        `${memberLabel} measurement, so the ${operationLabel} cannot be ` +
+        `computed. ${FEED_LABELS[member.feed]} telemetry is recorded for ` +
+        `${snapshot.byVehicle.size} of them.`
+    );
+  }
+
+  return {
+    ...base,
+    available: true,
+    value: result.value,
+    // The freshest evidence the number rests on, matching the windowed path. The
+    // full spread is in the Aggregation, so a figure assembled from measurements
+    // 59 days apart is never mistaken for a reading of the fleet right now.
+    measuredAt: lastMeasuredAt,
+    reportedAt,
+    aggregation,
+  };
+}
+
 /**
  * Turn one acquired candidate into one Observation.
  *
@@ -445,7 +756,9 @@ function observe(
   quantity: QuantityKey,
   candidate: CandidateSource,
   acquisitions: Acquisitions,
-  derivation: DerivationRequest | undefined
+  resolution: SubjectResolution,
+  derivation: DerivationRequest | undefined,
+  aggregation: FleetOperation | undefined
 ): Observation {
   const { label, unit } = QUANTITY_REGISTRY[quantity];
   const base: ObservationBaseFields = {
@@ -466,8 +779,60 @@ function observe(
     );
   }
 
+  // Fleet candidates branch FIRST, on the same discriminant the planner and the
+  // acquirer dispatch on. Every mismatch below is a wiring bug rather than a fact
+  // about the fleet, so each fails loudly instead of being reported as absent
+  // telemetry — the discipline the feed/snapshot mismatch has followed since 2C.
+  if (candidate.scope === "fleet") {
+    if (resolution.kind !== "fleet") {
+      throw new Error(
+        `Quantity "${quantity}" is fleet-scope but the subject resolved to a vehicle.`
+      );
+    }
+
+    if (candidate.sourceClass === "live") {
+      if (snapshot.mode !== "live" || snapshot.scope !== "fleet") {
+        throw new Error(
+          `Quantity "${quantity}" planned a fleet live source but acquired a ${snapshot.mode} snapshot.`
+        );
+      }
+
+      return observeFleetLive(base, candidate.provider, snapshot);
+    }
+
+    if (candidate.provider.kind === "population") {
+      if (snapshot.mode !== "fleet_population") {
+        throw new Error(
+          `Quantity "${quantity}" planned a population count but acquired a ${snapshot.mode} snapshot.`
+        );
+      }
+
+      return observeFleetPopulation(base, candidate.provider, snapshot);
+    }
+
+    if (snapshot.mode !== "fleet_latest") {
+      throw new Error(
+        `Quantity "${quantity}" planned a fleet aggregate but acquired a ${snapshot.mode} snapshot.`
+      );
+    }
+
+    if (aggregation === undefined) {
+      throw new Error(
+        `Quantity "${quantity}" acquired a fleet reading without an operation to aggregate with.`
+      );
+    }
+
+    return observeFleetAggregate(
+      base,
+      candidate.provider,
+      snapshot,
+      resolution,
+      aggregation
+    );
+  }
+
   if (candidate.sourceClass === "live") {
-    if (snapshot.mode !== "live") {
+    if (snapshot.mode !== "live" || snapshot.scope !== "vehicle") {
       throw new Error(
         `Quantity "${quantity}" planned a live source but acquired a ${snapshot.mode} snapshot.`
       );
@@ -484,6 +849,15 @@ function observe(
 
   if (snapshot.mode === "latest") {
     return observeLatest(base, candidate.provider, snapshot);
+  }
+
+  // A vehicle candidate can only have been given a per-vehicle snapshot. A fleet
+  // one here would mean the planner keyed a vehicle requirement against a fleet
+  // read — a wiring bug, so it fails loudly.
+  if (snapshot.mode !== "window") {
+    throw new Error(
+      `Quantity "${quantity}" is vehicle-scope but acquired a ${snapshot.mode} snapshot.`
+    );
   }
 
   if (derivation === undefined) {
@@ -519,9 +893,15 @@ export async function runAnalysis(
   // Subject resolution comes first and is allowed to throw: an unregistered
   // vehicle is a real fault, and distinguishing it from "no data" is the whole
   // reason it is resolved before anything is read.
-  await resolveSubject(plan.subject);
+  //
+  // From Milestone 5E it also RETURNS something. A fleet's population is not
+  // recoverable downstream — it has to be read — and every aggregate's
+  // denominator is that set, so it is resolved once here and carried into both
+  // the reads and the observations. That single resolution is what guarantees the
+  // numerator and the denominator describe the same fleet.
+  const resolution = await resolveSubject(plan.subject);
 
-  const acquisitions = await acquire(plan, options);
+  const acquisitions = await acquire(plan, resolution, options);
 
   // 4/6 — Reconcile each quantity, then assemble.
   //
@@ -534,7 +914,14 @@ export async function runAnalysis(
       QUANTITY_REGISTRY[requirement.quantity];
 
     const candidates = requirement.candidates.map((candidate) =>
-      observe(requirement.quantity, candidate, acquisitions, plan.derivation)
+      observe(
+        requirement.quantity,
+        candidate,
+        acquisitions,
+        resolution,
+        plan.derivation,
+        plan.aggregation?.operation
+      )
     );
 
     return {
@@ -545,5 +932,30 @@ export async function runAnalysis(
     };
   });
 
-  return { subject: plan.subject, intent: plan.intent, findings };
+  // Read off the PLAN rather than off the findings: whether a population was
+  // aggregated over is a fact about what was asked for, and deriving it from the
+  // plan means it cannot change with how much data happened to come back.
+  const aggregatedOverPopulation = plan.requirements.some((requirement) =>
+    requirement.candidates.some(
+      (candidate) =>
+        candidate.scope === "fleet" &&
+        candidate.sourceClass === "historical" &&
+        candidate.provider.kind === "aggregate"
+    )
+  );
+
+  return {
+    subject: plan.subject,
+    intent: plan.intent,
+    findings,
+    ...(resolution.kind === "fleet" && aggregatedOverPopulation
+      ? {
+          population: {
+            size: resolution.populationSize,
+            origin: resolution.populationOrigin,
+            truncated: resolution.truncated,
+          },
+        }
+      : {}),
+  };
 }

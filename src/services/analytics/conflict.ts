@@ -31,13 +31,19 @@ import type {
  * — the engine would stop being reproducible from its inputs, which is the one
  * property the whole design is built on.
  *
- * ## Not wired yet
+ * ## Who calls this
  *
- * Nothing in the engine calls this at 5D-2. Acquisition produces no live
- * candidate until 5D-3, so there is never a second observation to compare. It is
- * built and verified first, against fixtures, for the same reason the Portal Tool
- * was written and deliberately left unregistered at Milestone 4A: the hard part
- * is worth proving before the plumbing that will depend on it exists.
+ * `reconcile.ts`, once a quantity has produced two available candidates from
+ * different source classes. That first happened at Milestone 5D-3, when
+ * acquisition gained a live provider; before then this module was built and
+ * verified against fixtures alone, for the same reason the Portal Tool was
+ * written and deliberately left unregistered at Milestone 4A — the hard part is
+ * worth proving before the plumbing that depends on it exists.
+ *
+ * Milestone 5E added the `count` comparison, whose subjects are two REGISTRIES
+ * rather than two measurements. It shares the arithmetic and replaces the age
+ * model; see `AgeExplanation` for why that needed a fourth state rather than a
+ * reuse of "unknown".
  */
 
 /**
@@ -47,21 +53,45 @@ import type {
  * discovery pass rather than chosen for roundness — see quantity-registry.ts,
  * where each is recorded with the observation that produced it.
  */
-export interface ComparisonSpec {
-  comparison: ValueComparison;
+interface ComparisonBase {
   /** At or below this the two sources agree. In `deltaUnit`. */
   threshold: number;
   /** The quantity's own unit, or "m" when positions are compared. */
   deltaUnit: string;
-  /**
-   * The most this quantity could plausibly change in one hour.
-   *
-   * An upper bound on physical change, not an average and not an observed
-   * maximum: it exists to decide whether a difference is EXPLICABLE, so it must
-   * sit above what the fleet actually does rather than describe it.
-   */
-  plausibleChangePerHour: number;
 }
+
+/**
+ * A DISCRIMINATED UNION, not a shape with an optional field (Milestone 5E).
+ *
+ * `plausibleChangePerHour` is required by the two arms where change over time is
+ * the explanation, and unrepresentable in the arm where it is not. A count of
+ * registered vehicles has no rate of plausible drift — a fleet does not warm up
+ * or roll downhill — so a spec that carried one would be inviting a number
+ * nobody could calibrate, and calibration against measurement is the rule every
+ * value in this file already obeys.
+ *
+ * Same discipline as `QuantityDefinition`, which will not accept a live provider
+ * without a comparison, and as `defineCapability`, which will not accept a
+ * targeted module without an identity assertion.
+ */
+export type ComparisonSpec = ComparisonBase &
+  (
+    | {
+        comparison: Extract<ValueComparison, "scalar" | "distance">;
+        /**
+         * The most this quantity could plausibly change in one hour.
+         *
+         * An upper bound on physical change, not an average and not an observed
+         * maximum: it exists to decide whether a difference is EXPLICABLE, so it
+         * must sit above what the fleet actually does rather than describe it.
+         */
+        plausibleChangePerHour: number;
+      }
+    | {
+        comparison: Extract<ValueComparison, "count">;
+        plausibleChangePerHour?: undefined;
+      }
+  );
 
 const MS_PER_HOUR = 3_600_000;
 const EARTH_RADIUS_M = 6_371_000;
@@ -116,6 +146,10 @@ export function measureDelta(
     return distanceMetres(left, right);
   }
 
+  // `count` shares this branch with `scalar` on purpose: the ARITHMETIC of
+  // comparing two counts is subtraction, and duplicating it would be inventing a
+  // difference where there is none. What `count` changes is the age model, which
+  // is decided in `detectConflict` and not here.
   if (isCoordinates(left) || isCoordinates(right)) return null;
   return Math.abs(left - right);
 }
@@ -176,6 +210,18 @@ function describe(
 ): string {
   const amount = `${round(delta, 2)} ${spec.deltaUnit}`;
 
+  // Written from the fact that a count is EXACT. There is no scatter to sit
+  // above and no elapsed time to appeal to, so the sentence says what is true —
+  // two registries disagree — instead of reaching for a plausibility the
+  // quantity does not have.
+  if (explanation === "not_applicable") {
+    return (
+      `The two sources disagree by ${amount}. This is an exact count rather ` +
+      `than a measurement, so the difference is not something elapsed time can ` +
+      `explain: the two sources are counting different sets.`
+    );
+  }
+
   if (explanation === "unknown" || ageMs === null || plausible === null) {
     return (
       `The two sources differ by ${amount}, more than the ${spec.threshold} ` +
@@ -231,23 +277,37 @@ export function detectConflict(
   // case, and inventing a distinction would put an empty conflict in the answer.
   if (delta === null || delta <= spec.threshold) return null;
 
+  // Still measured for a count, even though nothing is concluded from it: when
+  // both sides happen to carry a measurement time it is worth reporting, and a
+  // field that is sometimes informative should not be blanked because it is
+  // sometimes not.
   const ageDifferenceMs = ageGapMs(reported.measuredAt, against.measuredAt);
 
+  // A COUNT has no age model (Milestone 5E-1). The population sources are two
+  // registries, not two measurements of one drifting quantity, so there is no
+  // rate to multiply by the gap — and crucially, the absence is permanent rather
+  // than a timestamp that failed to render. Reporting it as "unknown" would make
+  // a structural disagreement wait for evidence that is never coming, and the
+  // fleet size would read as settled while its two sources differed by 250.
   const plausibleChange =
-    ageDifferenceMs === null
+    spec.comparison === "count" || ageDifferenceMs === null
       ? null
       : (ageDifferenceMs / MS_PER_HOUR) * spec.plausibleChangePerHour;
 
-  // The tri-state the discovery pass forced. An unknown age is NOT escalated to
-  // "unexplained": a missing measurement time is a gap in the evidence, not
-  // evidence of disagreement, and treating it as the latter would let a portal
-  // rendering artefact dispute every value in the fleet.
+  // The tri-state the 5D-1 discovery pass forced, plus the fourth state the 5E-1
+  // pass forced. An unknown age is NOT escalated to "unexplained": a missing
+  // measurement time is a gap in the evidence, not evidence of disagreement, and
+  // treating it as the latter would let a portal rendering artefact dispute every
+  // value in the fleet. A NOT APPLICABLE age is the opposite case and is not
+  // softened for the same reason: time was never the explanation here.
   const ageExplanation: AgeExplanation =
-    plausibleChange === null
-      ? "unknown"
-      : delta <= plausibleChange
-        ? "explained"
-        : "unexplained";
+    spec.comparison === "count"
+      ? "not_applicable"
+      : plausibleChange === null
+        ? "unknown"
+        : delta <= plausibleChange
+          ? "explained"
+          : "unexplained";
 
   return {
     against: {

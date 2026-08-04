@@ -280,6 +280,10 @@ const ANALYTICS_PURE = [
   "src/services/analytics/reconcile.ts",
   "src/services/analytics/series.ts",
   "src/services/analytics/conflict.ts",
+  // Milestone 5E. Aggregates values already in memory across a population,
+  // exactly as series.ts aggregates them across time, and is exercisable against
+  // fixtures/fleet-samples.json with no database and no portal.
+  "src/services/analytics/aggregate.ts",
 ];
 
 const AGENT_ZONE = {

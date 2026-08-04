@@ -23,15 +23,17 @@
  * is in the Analytics purity zone in eslint.config.mjs for the same reason
  * normalizers.ts is in the Portal one.
  *
- * `Derivation` arrived at Milestone 5C with the first real computation, and
- * `Conflict` arrives at 5D-2 with the first code that can produce one —
- * conflict.ts, which is exercised against fixtures before any live acquisition
- * exists. What is still absent is `ReconciledValue.conflict` and its
- * disposition: nothing SELECTS between two candidates until 5D-3, so a
- * reconciliation carrying a conflict remains a shape no code path builds. The
- * precedent is the one §19 records for TARGET_AMBIGUOUS and for
- * src/lib/langsmith.ts: a declaration that cannot be reached is not a head
- * start, it is a claim the code does not honour.
+ * `Derivation` arrived at Milestone 5C with the first real computation,
+ * `Conflict` at 5D-2 with the first code that could produce one, and its
+ * disposition at 5D-3 with the first reconciliation that could select between
+ * two candidates. `Aggregation` arrives at 5E with the first value that
+ * describes a POPULATION rather than a vehicle.
+ *
+ * Each was declared in the slice that filled it, never before, because the
+ * precedent §19 records for TARGET_AMBIGUOUS and for src/lib/langsmith.ts is
+ * that a declaration which cannot be reached is not a head start — it is a claim
+ * the code does not honour. `MemberDerivation` below is the one approved
+ * exception, and it says so where it is declared.
  */
 
 /* -------------------------------------------------------------------------- */
@@ -178,6 +180,181 @@ export interface Derivation {
 }
 
 /* -------------------------------------------------------------------------- */
+/*  Aggregation                                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What may be computed ACROSS a population, as opposed to across time.
+ *
+ * Three members, and the absences are deliberate. There is no `count`: the only
+ * count 5E reports is a population size, which is not an aggregate over member
+ * measurements and has its own method below — declaring an operation nothing
+ * performs would be a branch no test could enter, the judgement already recorded
+ * for TARGET_AMBIGUOUS and for the removed zero-span series failure.
+ *
+ * There is no `sum` either, because none of the quantities in this catalogue is
+ * additive: seventy states of charge do not add up to anything, and a fleet that
+ * "totals 6005%" is a number with no referent.
+ */
+export const FLEET_OPERATIONS = ["mean", "minimum", "maximum"] as const;
+
+export type FleetOperation = (typeof FLEET_OPERATIONS)[number];
+
+/**
+ * The operation a fleet question gets when it does not name one.
+ *
+ * "What is the fleet's state of charge" has an obvious reading and refusing it
+ * pending a choice would be pedantry. Defaulting is safe here — unlike the
+ * Milestone 5B intent flag it replaced nothing and hides nothing — because the
+ * operation actually used is ALWAYS stated in the resulting `Aggregation`, so a
+ * default can never be mistaken for a choice the caller made.
+ */
+export const DEFAULT_FLEET_OPERATION: FleetOperation = "mean";
+
+/**
+ * How a fleet value came to be, in the shape the answer must disclose.
+ *
+ * THREE METHODS, because three genuinely different things can produce a number
+ * about a fleet, and presenting any of them as another would be a false claim
+ * about how much work Tarang did:
+ *
+ *   - "reported"   — the source published the number. The Intellicar dashboard
+ *                    counts its own running vehicles; Tarang read that count and
+ *                    computed nothing. No members were read.
+ *   - "aggregated" — the engine computed over one measurement per member. This
+ *                    is the only method that carries coverage, because it is the
+ *                    only one where members were consulted individually.
+ *   - "population" — the value IS the size of the resolved population. Not an
+ *                    aggregate over measurements: a vehicle's existence in the
+ *                    registry is not a measurement of it.
+ *
+ * This is to a fleet answer exactly what `Derivation` present/absent is to a
+ * per-vehicle one — the honest discriminator that stops "the dashboard says 128
+ * are running" being narrated as something the engine worked out.
+ */
+export type AggregationMethod = "reported" | "aggregated" | "population";
+
+/**
+ * A windowed computation applied to each member before they were aggregated.
+ *
+ * MODELLED, NOT PRODUCED. Nothing in Milestone 5E builds one: a fleet question
+ * over a period is refused in the planner, because a population × window read is
+ * expensive and this dataset cannot support it — the CAN feed holds a mean of
+ * 1.13 rows per vehicle (5E-1 discovery), so a per-vehicle trend across the
+ * fleet would be an insufficiency answer seventy times over.
+ *
+ * It is declared anyway, as an explicitly approved exception to this codebase's
+ * rule against unreachable declarations, for one reason: it fixes the SHAPE of
+ * two-stage aggregation now, so that enabling it later is a planner change
+ * rather than a redesign of the answer. What it deliberately does NOT do is nest
+ * a full `Derivation` per member — three hundred and twenty of those would flood
+ * the model's context — so it summarises how many members produced a value and
+ * how many fell short.
+ */
+export interface MemberDerivation {
+  operation: DerivationOperation;
+  window: AnalysisWindow;
+  membersAttempted: number;
+  membersProducingValue: number;
+  /** Members whose own window held too little evidence to compute. */
+  membersInsufficient: number;
+}
+
+interface AggregationBase {
+  /** Where the population came from, e.g. "postgres:vehicles". */
+  populationOrigin: string;
+  /** One line naming what was done, for the user-facing Sources block. */
+  basis: string;
+}
+
+/**
+ * How a value about a FLEET was arrived at (Milestone 5E).
+ *
+ * ## Why this is a sibling of Derivation and not an extension of it
+ *
+ * A `Derivation` describes a computation over TIME for one subject: a window,
+ * the rows it returned, the measurements inside them, the span they covered. An
+ * `Aggregation` describes a computation over a POPULATION. Merging them would
+ * produce a record with a `window` that means nothing for a fleet snapshot and a
+ * `populationSize` that means nothing for a per-vehicle trend — and a record
+ * whose fields are conditionally meaningless is exactly the shape this codebase
+ * keeps declining to build.
+ *
+ * The two COMPOSE instead: an observation may carry both, and `memberDerivation`
+ * is where the per-member half is summarised when it does.
+ *
+ * ## Coverage is the point of this record
+ *
+ * `contributingVehicles` against `populationSize` is the fleet counterpart of
+ * `sampleCount` against `readingCount`, and it exists for the same reason: a
+ * mean state of charge over 70 of 70 vehicles and one over 1 of 70 are different
+ * claims, and a shape that could not tell them apart would let the second be
+ * reported as the first. On the sampled data those two cases are both real —
+ * state of charge covers 70 of 70, state of health covers 1 of 70.
+ *
+ * ## The span is load-bearing, not decorative
+ *
+ * `firstMeasuredAt` and `lastMeasuredAt` bound the measurements the value rests
+ * on, and on this fleet they are 59.4 DAYS apart for pack temperature (5E-1
+ * discovery): the CAN payload is a last-known-value snapshot, so one vehicle's
+ * latest temperature was measured in April while another's was measured in June.
+ * A fleet mean over that is a true statement about the latest reading of each
+ * vehicle, and a badly misleading statement about the fleet right now. Carrying
+ * the span is what keeps the first from being read as the second.
+ */
+export type Aggregation = AggregationBase &
+  (
+    | {
+        /** The source published this number; no member was read. */
+        method: "reported";
+        /**
+         * Deliberately no population size and no coverage.
+         *
+         * The dashboard publishes a count without publishing what it counted
+         * over, and stating a denominator we did not read would be inventing a
+         * scope — the same fabrication the Fleet Overview normalizer refuses when
+         * it reports `fleet: null` rather than naming a fleet the portal never
+         * showed.
+         */
+        operation?: undefined;
+      }
+    | {
+        /** The value is the size of the resolved population. */
+        method: "population";
+        populationSize: number;
+        operation?: undefined;
+      }
+    | {
+        method: "aggregated";
+        operation: FleetOperation;
+        /** Vehicles the population resolved to. The denominator. */
+        populationSize: number;
+        /** Vehicles that supplied a usable measurement. The numerator. */
+        contributingVehicles: number;
+        /** Measurement time of the oldest contributing measurement. */
+        firstMeasuredAt: string | null;
+        /** Measurement time of the newest contributing measurement. */
+        lastMeasuredAt: string | null;
+        /**
+         * True when the population read hit its row ceiling, so the aggregate
+         * covers fewer vehicles than the population holds. Disclosed rather than
+         * absorbed, exactly as a truncated window is.
+         */
+        truncated: boolean;
+        /**
+         * The vehicle holding the reported value, for a minimum or a maximum.
+         *
+         * Null for a mean, which no single vehicle holds. This is why the record
+         * exists rather than the value going in `ObservationDetail`, which is
+         * `Record<string, number>` and cannot carry a fleet identifier.
+         */
+        extremeVehicleNo: string | null;
+        /** Present only when each member was itself computed over a window. */
+        memberDerivation?: MemberDerivation;
+      }
+  );
+
+/* -------------------------------------------------------------------------- */
 /*  Observations                                                              */
 /* -------------------------------------------------------------------------- */
 
@@ -212,6 +389,23 @@ interface ObservationBase {
    * and it is what stops the second being reported as the first.
    */
   derivation?: Derivation;
+  /**
+   * Present exactly when this observation describes a POPULATION rather than one
+   * vehicle (Milestone 5E).
+   *
+   * The two optionals are independent, and their four combinations are the four
+   * kinds of number this engine can report:
+   *
+   *   neither          one vehicle, one measured reading          (5B)
+   *   derivation       one vehicle, computed over a window        (5C)
+   *   aggregation      a population, at its members' latest       (5E)
+   *   both             a population of per-vehicle derivations    (modelled)
+   *
+   * Presence is the discriminator in both cases, for the same reason: a reader
+   * must never have to infer from a number's magnitude whether it describes one
+   * pack or seventy.
+   */
+  aggregation?: Aggregation;
 }
 
 /**
@@ -278,8 +472,13 @@ export type Observation = AvailableObservation | UnavailableObservation;
  * different distance at different latitudes — so a position is compared as a
  * great-circle DISTANCE in metres, which is why `Conflict.deltaUnit` need not be
  * the quantity's own unit.
+ *
+ * `count` arrives at Milestone 5E and is not a third way of subtracting: the
+ * arithmetic is the scalar one. What it changes is the AGE MODEL. A count is a
+ * registry total rather than a measurement that drifts, so no amount of elapsed
+ * time explains two sources disagreeing about it — see `AgeExplanation`.
  */
-export type ValueComparison = "scalar" | "distance";
+export type ValueComparison = "scalar" | "distance" | "count";
 
 /**
  * Whether the time between two measurements accounts for their difference.
@@ -299,8 +498,32 @@ export type ValueComparison = "scalar" | "distance";
  *                     presented as authoritative.
  *   - "unknown"     — one side has no measurement time, so plausibility cannot
  *                     be assessed. Reported, never guessed, and NOT escalated.
+ *
+ * ## The fourth state, and why it is not "unknown" (Milestone 5E-1 discovery)
+ *
+ * "not_applicable" — the quantity has no age model at all, so there is nothing
+ * to assess rather than something that could not be read.
+ *
+ * The distinction is exact and it is the reason a fourth member was preferable
+ * to overloading the third. "unknown" describes a TRANSIENT gap: the portal's
+ * Last Talk Time cell is intermittently unreadable, and escalating that would
+ * let a rendering artefact dispute every value in the fleet. A fleet COUNT is a
+ * different case — the Fleet Overview view publishes no "as of" time at all and
+ * never will, and `capturedAt` may not stand in for one (a live reading's
+ * measurement time is when the vehicle reported, never when Tarang looked). So
+ * its missing measurement time is permanent and structural.
+ *
+ * Collapsing the two would mean a fleet size reporting "resolved" for ever while
+ * its two sources differ by 250 vehicles, because the machinery kept waiting for
+ * a timestamp that is never coming. "not_applicable" is therefore DISPUTED: an
+ * exact count that two registries disagree about is a disagreement, and no
+ * elapsed time is going to account for it.
  */
-export type AgeExplanation = "explained" | "unexplained" | "unknown";
+export type AgeExplanation =
+  | "explained"
+  | "unexplained"
+  | "unknown"
+  | "not_applicable";
 
 /**
  * Two sources disagreeing about one quantity, by more than tolerance.
@@ -347,7 +570,13 @@ export interface Conflict {
   threshold: number;
   /** Gap between the two measurement times. Null when either is unknown. */
   ageDifferenceMs: number | null;
-  /** How much could plausibly have changed over that gap. Null when unknown. */
+  /**
+   * How much could plausibly have changed over that gap.
+   *
+   * Null when the gap is unknown, and null for a COUNT comparison — where the
+   * question does not arise rather than being unanswerable, because a registry
+   * total has no rate of plausible change to bound it with.
+   */
   plausibleChange: number | null;
   ageExplanation: AgeExplanation;
   /** Safe to show a user, and safe to hand the model. */
@@ -381,8 +610,15 @@ export interface Conflict {
  * quantity per scope) and P6 (one number, one provider) are structural — the
  * registry holds a single `live` field and `chosen` is a single Observation, so
  * neither can be violated rather than merely rejected. P7 (naming discipline) is
- * enforced where the mapping is declared. P0 (scope gate) needs a fleet-scope
- * provider to exclude, and arrives at 5E.
+ * enforced where the mapping is declared.
+ *
+ * P0 (the scope gate) arrives at Milestone 5E and is NOT a member either, for
+ * the same reason: it selects nothing. Both of its inputs — the subject's kind
+ * and the quantity's scope — are static and available before any read, so it is
+ * enforced in the PLANNER, where a mismatch is refused as a question that cannot
+ * be asked rather than silently dropped from a candidate list. A rule belongs
+ * where its inputs are, which is the identical argument that puts P4 in
+ * reconcile.ts and not in the planner.
  */
 export type PrecedenceRule =
   | "P1_current_prefers_live"
@@ -402,6 +638,11 @@ export type PrecedenceRule =
  * instinct as Milestone 4B's refusal to normalise a page that never rendered
  * into confident nulls. An unknown age is NOT disputed: a missing measurement
  * time is a gap in the evidence, not evidence of disagreement.
+ *
+ * An age that is NOT APPLICABLE is disputed (Milestone 5E). The two read alike
+ * and are opposites: "unknown" means the evidence about time is missing, so no
+ * verdict can be reached; "not_applicable" means time was never going to be the
+ * explanation, so the disagreement stands on its own.
  */
 export type ReconciliationDisposition = "resolved" | "disputed";
 
