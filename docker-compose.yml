@@ -1,0 +1,80 @@
+# Local Docker parity — DEVELOPMENT AND PRE-DEPLOY VERIFICATION ONLY.
+#
+# This is not how Tarang is deployed. Railway builds the same Dockerfile and
+# attaches its own volume and its own PostgreSQL. What this file buys is the
+# ability to exercise the parts most likely to be wrong on a first Railway
+# deploy, on a fast local loop instead of a slow remote one:
+#
+#   - the entrypoint's chown/drop-privileges sequence against a root-owned
+#     volume mount, which is the single most failure-prone step;
+#   - that Chromium actually launches as a non-root user in this image;
+#   - that the encrypted session under SESSION_STORE_DIR survives
+#     `docker compose down` followed by `docker compose up` — the local
+#     equivalent of a Railway redeploy.
+#
+# Usage:
+#   docker compose up --build
+#   docker compose down          # containers go, the named volume stays
+#   docker compose down -v       # also destroys the session volume
+#
+# Secrets come from .env.local, which is gitignored and excluded from the image
+# by .dockerignore. It is read by Compose on the HOST and injected as
+# environment variables — it is never copied into the image.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tarang
+      POSTGRES_PASSWORD: tarang
+      POSTGRES_DB: tarang
+    ports:
+      # Exposed so `npm run db:migrate`, `db:studio` and the manual telemetry
+      # import (docs/DATA-IMPORT.md) can reach it from the host.
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tarang -d tarang"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      # Supplies OPENROUTER_*, INTELLICAR_*, CREDENTIAL_ENCRYPTION_KEY.
+      - .env.local
+    environment:
+      # Declared AFTER env_file so these win. The values in .env.local point at
+      # a host database and a host-relative session directory; inside the
+      # container both must be different.
+      NODE_ENV: production
+      DATABASE_URL: postgresql://tarang:tarang@postgres:5432/tarang
+      # The mount below is at /data; the store gets its own subdirectory so
+      # session-store.ts's `mkdir(..., { mode: 0o700 })` actually applies —
+      # mkdir sets the mode only on directories it creates, and the mount point
+      # already exists.
+      SESSION_STORE_DIR: /data/sessions
+      PLAYWRIGHT_HEADLESS: "true"
+      LOG_LEVEL: info
+    volumes:
+      # A NAMED volume, mirroring Railway's persistent volume. It is owned by
+      # root when first created, which is exactly the condition the entrypoint
+      # exists to handle — so this reproduces the real failure mode rather than
+      # papering over it. A bind mount would inherit host ownership and would
+      # NOT be a faithful test.
+      - session-store:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  session-store:
