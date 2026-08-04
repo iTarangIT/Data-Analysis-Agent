@@ -210,6 +210,7 @@ COPY --from=builder --chown=pwuser:pwuser /app/prisma ./prisma
 # serverExternalPackages keeps Playwright resolved from node_modules at runtime
 # instead of bundled. Without this file the server would try to use a bundled
 # Playwright and fail to find its driver.
+COPY --from=builder --chown=pwuser:pwuser /app/prisma.config.ts ./prisma.config.ts
 COPY --chown=pwuser:pwuser package.json next.config.ts ./
 
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
