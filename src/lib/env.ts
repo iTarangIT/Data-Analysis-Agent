@@ -187,3 +187,108 @@ export function authEnv(): AuthEnv {
 export function isAuthEnvConfigured(): boolean {
   return authEnvSchema.safeParse(process.env).success;
 }
+
+/**
+ * Reverse geocoding configuration (Phase 3).
+ *
+ * A THIRD schema, lazy for exactly the reason `authEnv()` is: only the geocoding
+ * path reads these, and putting them in `envSchema` would make a boot — and a
+ * telemetry question — depend on configuration that has nothing to do with
+ * either. Geocoding is a presentation enhancement; nothing about it may be able
+ * to fail a build or an answer.
+ *
+ * EVERY FIELD HAS A DEFAULT, so this schema cannot fail. That is deliberate and
+ * stronger than laziness alone: a malformed geocoding variable degrades to the
+ * default rather than throwing, because the worst outcome this feature is
+ * allowed to have is that a coordinate stays a coordinate.
+ *
+ * ## Privacy, and why the endpoint is a variable
+ *
+ * Reverse geocoding sends VEHICLE POSITIONS to whatever endpoint is configured.
+ * That is inherent to the feature rather than a property of this provider, and
+ * GEOCODING_ENABLED=false removes it entirely — the UI then shows exactly the
+ * coordinates it showed before Phase 3.
+ *
+ * ## Why BigDataCloud
+ *
+ * The OpenStreetMap public Nominatim instance was measured returning
+ * `HTTP 403 Access denied` from a data-centre network — the condition a Railway
+ * deployment meets — which made the previous default operationally dead. Of the
+ * providers compared, BigDataCloud was the only one that answered a data-centre
+ * IP with no credential, and its structured administrative hierarchy resolves
+ * rural coordinates to a town and district rather than to the nearest building.
+ */
+const geocodingEnvSchema = z.object({
+  GEOCODING_ENABLED: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((value) => value === "true"),
+  /** Provider origin. Both endpoints below live under it. */
+  GEOCODING_BASE_URL: z
+    .string()
+    .min(1)
+    .default("https://api.bigdatacloud.net")
+    .transform((url) => url.replace(/\/+$/, "")),
+  /**
+   * Optional BigDataCloud API key.
+   *
+   * ABSENT is the supported default: the service then calls the keyless
+   * `reverse-geocode-client` endpoint, so a fresh clone resolves addresses with
+   * nothing configured at all.
+   *
+   * PRESENT switches to `reverse-geocode`, the endpoint BigDataCloud designates
+   * for server-to-server use. Both return the same payload, so this changes one
+   * URL and nothing else — no code path, no parsing, no cache behaviour.
+   *
+   * Setting it is the recommended production posture: the keyless endpoint is
+   * named for client use, and while it serves a server correctly, a deployment
+   * should not rest on an endpoint whose name signals a different intent. A key
+   * is free and needs no card.
+   */
+  GEOCODING_API_KEY: z.string().min(1).optional(),
+  /**
+   * Contact address embedded in the User-Agent.
+   *
+   * Not demanded by this provider, unlike the previous one. Kept because a
+   * service that can be contacted about its traffic receives a warning rather
+   * than a block.
+   */
+  GEOCODING_CONTACT: z.string().min(1).default("unset@example.com"),
+  /** Ceiling for one provider call. Short: nothing waits on this. */
+  GEOCODING_TIMEOUT_MS: z.coerce.number().int().positive().default(4_000),
+  /**
+   * Minimum gap between provider calls.
+   *
+   * 250 ms rather than the 1 s the previous provider's policy demanded — that
+   * figure was Nominatim's requirement, not a general one, and carrying it over
+   * would delay the first location card on a report for no reason. It stays
+   * non-zero because the cache already collapses repeat lookups, so a small gap
+   * costs nothing and keeps a burst of distinct coordinates civil.
+   */
+  GEOCODING_MIN_INTERVAL_MS: z.coerce.number().int().nonnegative().default(250),
+});
+
+export type GeocodingEnv = z.infer<typeof geocodingEnvSchema>;
+
+let cachedGeocodingEnv: GeocodingEnv | undefined;
+
+/**
+ * Validated geocoding configuration.
+ *
+ * Cannot throw — every field is defaulted — so a caller never needs a guard and
+ * a misconfiguration can never surface as a failed answer.
+ */
+export function geocodingEnv(): GeocodingEnv {
+  if (cachedGeocodingEnv === undefined) {
+    const parsed = geocodingEnvSchema.safeParse(process.env);
+
+    // Unreachable while every field carries a default; falling back to the
+    // parsed defaults rather than throwing keeps that guarantee true even if a
+    // future field forgets one.
+    cachedGeocodingEnv = Object.freeze(
+      parsed.success ? parsed.data : geocodingEnvSchema.parse({})
+    );
+  }
+
+  return cachedGeocodingEnv;
+}

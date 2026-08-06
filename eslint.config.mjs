@@ -50,6 +50,27 @@ const DATA_ZONE = {
 };
 
 /**
+ * Reverse geocoding, forbidden to everything that produces an answer (Phase 3).
+ *
+ * Added to each existing zone's own pattern list rather than declared as a zone
+ * object of its own, and that is load-bearing: flat config does not merge rules
+ * across matching objects — the last match wins outright — so a later object
+ * listing `src/services/analytics/**` and `src/tools/**` would silently REPLACE
+ * their whole restriction set and disable every authentication and browser rule
+ * in this file. Each zone states its complete set; this joins those sets.
+ *
+ * The agent zone needs no entry: it already bans `@/services/*` wholesale.
+ */
+const GEOCODING_ZONE = {
+  group: ["@/services/geocoding/*", "@/services/geocoding/**"],
+  message:
+    "Facts, the Analysis Engine, the Portal Service, the Planner and the Tool " +
+    "Registry must not know reverse geocoding exists (Phase 3). An address is a " +
+    "presentation label added by the UI after a report has rendered; it never " +
+    "enters an answer, and never reaches the model's context.",
+};
+
+/**
  * What a PROVIDER may not reach (Milestone 5B).
  *
  * The Analysis Engine sits ABOVE the Portal Service and the Database Service and
@@ -95,6 +116,7 @@ const authIsolation = [
                 "(SAD §9, Milestone 3). The Session Manager is consumed BY services; " +
                 "it consumes none of them.",
             },
+            GEOCODING_ZONE,
           ],
         },
       ],
@@ -123,6 +145,7 @@ const authIsolation = [
                 "The Database Service is the bottom of the data path. It knows " +
                 "nothing of the portal, the tools or the agent (SAD §4, §12).",
             },
+            GEOCODING_ZONE,
           ],
         },
       ],
@@ -134,7 +157,7 @@ const authIsolation = [
     // browser.
     files: ["src/tools/**"],
     rules: {
-      "no-restricted-imports": ["error", { patterns: [AUTH_ZONE, BROWSER_ZONE] }],
+      "no-restricted-imports": ["error", { patterns: [AUTH_ZONE, BROWSER_ZONE, GEOCODING_ZONE] }],
     },
   },
   {
@@ -207,6 +230,7 @@ const portalIsolation = [
                 "authenticated; it never asks for one, and never sees a credential.",
             },
             DATA_ZONE,
+            GEOCODING_ZONE,
           ],
         },
       ],
@@ -216,7 +240,7 @@ const portalIsolation = [
     // The Portal Service: authentication IS its dependency; the data path is not.
     files: [PORTAL_SERVICE],
     rules: {
-      "no-restricted-imports": ["error", { patterns: [DATA_ZONE] }],
+      "no-restricted-imports": ["error", { patterns: [DATA_ZONE, GEOCODING_ZONE] }],
     },
   },
   {
@@ -236,6 +260,7 @@ const portalIsolation = [
                 "the Extractor contract that names a Page lives in portal.service.ts.",
             },
             DATA_ZONE,
+            GEOCODING_ZONE,
           ],
         },
       ],
@@ -310,6 +335,7 @@ const analyticsIsolation = [
                 "Database access goes through the Database Service, the only " +
                 "Prisma caller (SAD §12). The engine reads telemetry, not rows.",
             },
+            GEOCODING_ZONE,
           ],
         },
       ],
@@ -355,6 +381,62 @@ const analyticsIsolation = [
                 "is what lets them run against fixtures with no database and no " +
                 "portal — the same boundary normalizers.ts holds.",
             },
+            GEOCODING_ZONE,
+          ],
+        },
+      ],
+    },
+  },
+];
+
+/* -------------------------------------------------------------------------- */
+/*  Geocoding (Phase 3)                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Reverse geocoding is a PRESENTATION enhancement, and this zone is what keeps
+ * that true rather than aspirational.
+ *
+ * A coordinate is telemetry; the address above it is a third party's opinion
+ * about that coordinate, fetched by the browser after a report has already
+ * rendered. Nothing that produces an answer may depend on it — so the Analysis
+ * Engine, the Portal Service, the Session Manager, the Database Service, the
+ * tools and the agent must not import it, and it must not import them.
+ *
+ * The restriction runs in BOTH directions, for the same reason the
+ * authentication zone does:
+ *
+ *   - INWARD, so a geocoding outage can never delay, alter or fail a telemetry
+ *     answer, and so an address can never reach the model's context and be
+ *     restated as though a vehicle had reported it.
+ *   - OUTWARD, so this service cannot read a vehicle, a session or a row. It is
+ *     handed two numbers by a route and returns two strings.
+ */
+const geocodingIsolation = [
+  {
+    files: ["src/services/geocoding/**"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            AUTH_ZONE,
+            BROWSER_ZONE,
+            AGENT_ZONE,
+            {
+              group: [
+                "@/services/analytics/*",
+                "@/services/database/*",
+                "@/services/portal/*",
+                "@/lib/prisma",
+              ],
+              message:
+                "Reverse geocoding is a presentation enhancement (Phase 3). It " +
+                "receives two numbers and returns a label; it reads no vehicle, " +
+                "no session and no row.",
+            },
+            // Deliberately no GEOCODING_ZONE here: this IS the geocoding module,
+            // and its own files must be able to import each other.
           ],
         },
       ],
@@ -368,6 +450,7 @@ const eslintConfig = defineConfig([
   ...authIsolation,
   ...portalIsolation,
   ...analyticsIsolation,
+  ...geocodingIsolation,
   // Override default ignores of eslint-config-next.
   globalIgnores([
     // Default ignores of eslint-config-next:

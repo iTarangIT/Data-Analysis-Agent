@@ -1,26 +1,156 @@
 @import "tailwindcss";
 
+/**
+ * Tarang design tokens (Phase 1 UX redesign).
+ *
+ * ## Colour encodes PROVENANCE, never the value of a metric
+ *
+ * The only calibrated thresholds in this system are reconciliation tolerances —
+ * speed 2 km/h, position 50 m, count 0 (src/services/analytics/quantity-registry.ts).
+ * They answer "do two sources disagree", never "is this value good". No healthy /
+ * warning / critical band is declared anywhere for state of charge, temperature,
+ * cell spread or state of health.
+ *
+ * So a 12% state of charge renders in exactly the same ink as 98%. Colour is
+ * reserved entirely for where a number CAME FROM and whether it could be
+ * reported. Inventing a severity ramp here would put a fabricated judgement
+ * behind a real number, which is the failure the grounding contract exists to
+ * prevent. When thresholds are declared and calibrated, a severity ramp can be
+ * added beside these tokens rather than by repurposing them.
+ *
+ * Every state is carried by icon + label + colour, never colour alone.
+ */
+
 :root {
+  /* Pre-existing tokens, preserved so existing utilities keep working. */
   --background: #ffffff;
-  --foreground: #171717;
+  --foreground: #0f172a;
+
+  /* Surfaces */
+  --surface: #ffffff;
+  --surface-raised: #f8fafc;
+  --surface-sunken: #f1f5f9;
+  --hairline: #e2e8f0;
+  --hairline-strong: #cbd5e1;
+
+  /* Ink */
+  --ink: #0f172a;
+  --ink-muted: #475569;
+  --ink-faint: #94a3b8;
+
+  /* Provenance / data state */
+  --live: #0d9488;
+  --live-surface: #f0fdfa;
+  --historical: #475569;
+  --historical-surface: #f1f5f9;
+  --disputed: #b45309;
+  --disputed-surface: #fffbeb;
+  --unavailable: #94a3b8;
+  --unavailable-surface: #f8fafc;
+  --critical: #b91c1c;
+  --critical-surface: #fef2f2;
+
+  /**
+   * RESERVED — nothing in the Analysis Engine produces an estimate, so no
+   * component may render this state. It is declared so that the day something
+   * does emit one, the token already exists and the value is not invented under
+   * deadline. See docs/UX-REDESIGN.md §0.2.
+   */
+  --estimated: #7c3aed;
+  --estimated-surface: #f5f3ff;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0b0f19;
+    --foreground: #e2e8f0;
+
+    --surface: #0f1523;
+    --surface-raised: #151d2e;
+    --surface-sunken: #0b0f19;
+    --hairline: #1e293b;
+    --hairline-strong: #334155;
+
+    --ink: #e2e8f0;
+    --ink-muted: #94a3b8;
+    --ink-faint: #64748b;
+
+    --live: #2dd4bf;
+    --live-surface: #042f2e;
+    --historical: #94a3b8;
+    --historical-surface: #1e293b;
+    --disputed: #fbbf24;
+    --disputed-surface: #2c1c02;
+    --unavailable: #64748b;
+    --unavailable-surface: #131a28;
+    --critical: #f87171;
+    --critical-surface: #2a0e0e;
+
+    --estimated: #a78bfa;
+    --estimated-surface: #1e1435;
+  }
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
+  --color-surface-sunken: var(--surface-sunken);
+  --color-hairline: var(--hairline);
+  --color-hairline-strong: var(--hairline-strong);
+
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-faint: var(--ink-faint);
+
+  --color-live: var(--live);
+  --color-live-surface: var(--live-surface);
+  --color-historical: var(--historical);
+  --color-historical-surface: var(--historical-surface);
+  --color-disputed: var(--disputed);
+  --color-disputed-surface: var(--disputed-surface);
+  --color-unavailable: var(--unavailable);
+  --color-unavailable-surface: var(--unavailable-surface);
+  --color-critical: var(--critical);
+  --color-critical-surface: var(--critical-surface);
+
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
+/**
+ * The declared Geist faces are now actually applied.
+ *
+ * layout.tsx has always loaded Geist and Geist Mono and exposed them as
+ * --font-geist-sans / --font-geist-mono, but this rule previously hard-set
+ * `font-family: Arial, Helvetica, sans-serif`, which overrode them for the whole
+ * document. Arial has no tabular figures, so metric values could not be aligned
+ * in a grid.
+ */
 body {
   background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  color: var(--ink);
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+/**
+ * Metric values, counts and timestamps are typeset with TABULAR figures so
+ * digits occupy identical width. Without this, a value updating from 9.9 to 10.0
+ * shifts its own baseline, and a column of readings fails to align — the single
+ * most visible difference between a chat surface and an analytics surface.
+ */
+@utility numeric {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/** Section headers: small, letterspaced caps. Used by every report section. */
+@utility eyebrow {
+  font-size: 0.6875rem;
+  line-height: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }

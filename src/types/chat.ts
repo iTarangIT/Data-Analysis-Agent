@@ -88,13 +88,256 @@ export interface ToolEnvelope<TData = unknown> {
   error?: string;
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Run progress (Phase 2)                                                    */
+/* -------------------------------------------------------------------------- */
+
 /**
- * NDJSON frames emitted by /api/chat — one JSON object per line.
- * `sources` is sent once, after the answer, and is derived from the tool calls
- * that actually executed during the run.
+ * What a stage describes. A CLOSED vocabulary, deliberately.
+ *
+ * A free-text status string would let any call site invent a stage, and the
+ * first invented one would be a claim about the backend that nothing verifies.
+ * Every member below corresponds to exactly one point in the existing code where
+ * that operation genuinely begins or ends — see docs/ARCHITECTURE.md §15.
+ *
+ * The UI owns the WORDING (src/components/report/ProgressTimeline.tsx). The
+ * backend emits what happened; how it reads is a presentation decision, which is
+ * the same split that keeps charts out of the protocol.
+ */
+export type StageKind =
+  /** The model is choosing what to do. Emitted once per run. */
+  | "planning"
+  /** One tool call, from start to finish. */
+  | "tool"
+  /** The requested vehicle was proven to exist before anything was read. */
+  | "vehicle_resolved"
+  /** The fleet population was enumerated. `count` is the denominator. */
+  | "fleet_resolved"
+  /** One distinct telemetry read. `detail` names the feed. */
+  | "database_read"
+  /** Browser work for the Intellicar portal is about to begin. */
+  | "portal_connect"
+  /** The stored session was still valid — no login happened. */
+  | "session_reused"
+  /** The stored session had expired and is being replaced. */
+  | "session_expired"
+  /** A real sign-in is happening, because no usable session existed. */
+  | "session_login"
+  /** One dashboard module read. `detail` names the module. */
+  | "portal_read"
+  /** Precedence is selecting which source answers each quantity. */
+  | "reconciling"
+  /** The model has begun writing the answer. */
+  | "writing"
+  /** The run finished. `count` carries the measured duration in milliseconds. */
+  | "completed";
+
+/**
+ * Where a stage is in its life.
+ *
+ * A stage left `active` when a run ends IS the failure marker — the operation
+ * that was in flight when execution stopped. That is why no "failed run" stage
+ * is invented: the absence of a closing transition already says where it
+ * stopped, and inventing one would be describing work that did not happen.
+ */
+export type StageStatus = "active" | "ok" | "failed";
+
+/**
+ * One real backend operation, reported as it happens (Phase 2).
+ *
+ * ## The honesty contract
+ *
+ * A stage is emitted ONLY at the point the operation it names actually begins or
+ * ends, by the component that performs it. Nothing is timed, interpolated,
+ * predicted or padded: there is no synthetic progress, no minimum display
+ * duration, and no stage for work that did not occur. A run that never touches
+ * the portal emits no portal stage; a run that reuses a session emits
+ * `session_reused` and never `session_login`.
+ *
+ * ## Discardable, unlike every other frame
+ *
+ * Dropping a stage costs nothing — the answer, its facts and its sources are
+ * unchanged. That is precisely why it is a separate frame type rather than
+ * another arm of `tool_result`: a consumer must be able to tell what is safe to
+ * ignore, and these two are opposite answers to that question.
+ */
+export interface RunStage {
+  /**
+   * Stable identity for one logical stage.
+   *
+   * Repeated across a stage's transitions — `active` then `ok` — so a consumer
+   * REPLACES rather than appends. Two stages of the same kind that describe
+   * different work carry different ids (`database_read:can`, `database_read:gps`),
+   * so the dedup never collapses genuinely distinct reads.
+   */
+  id: string;
+  kind: StageKind;
+  status: StageStatus;
+  /**
+   * Short, safe context — a feed name, a module name, a tool name.
+   *
+   * NEVER a credential, cookie, URL, selector, SQL fragment or page content, and
+   * never a tool parameter: /api/chat already declines to record those, and a
+   * stage must not become the channel that does what the log policy refused.
+   */
+  detail?: string;
+  /** A measured count where one applies — vehicles, rows, milliseconds. */
+  count?: number;
+  /** When this transition happened, ISO 8601. Measured, never estimated. */
+  at: string;
+}
+
+/**
+ * THE /api/chat STREAMING PROTOCOL.
+ *
+ * NDJSON: one JSON object per line, `Content-Type: application/x-ndjson`. This
+ * type is the whole contract, and the rules below are part of it.
+ *
+ * ## Why a discriminated union rather than one general envelope
+ *
+ * A generic `{ type: "payload", kind: ... }` frame was considered and rejected
+ * before Phase 1 was merged. Two reasons decided it.
+ *
+ * The first is that these frames have genuinely different LIFECYCLES, and the
+ * type is what records the difference. Dropping a progress frame costs nothing —
+ * the answer is unchanged. Dropping a `tool_result` silently removes a fact from
+ * a report whose entire claim is that every number is traceable. A shape that
+ * presented the two as interchangeable would be telling every consumer something
+ * false about what it is safe to ignore.
+ *
+ * The second is that this codebase has already settled the question elsewhere,
+ * in the same words: a record whose fields are conditionally meaningless is the
+ * shape it keeps declining to build (see `Aggregation` in
+ * src/services/analytics/observations.ts, declared a SIBLING of `Derivation`
+ * rather than an extension of it, for exactly this reason). Collapsing the
+ * discriminant into an inner field would also move it from somewhere the
+ * compiler enforces to somewhere it does not.
+ *
+ * ## ORDERING GUARANTEES
+ *
+ * A consumer may rely on all of the following, and on nothing else:
+ *
+ *   1. Frames arrive in EMISSION ORDER, and each is a complete line. A reader
+ *      must buffer partial lines: a frame can be split across two network
+ *      chunks, and one chunk can carry several frames.
+ *   2. `done` or `error` TERMINATES the stream. Nothing follows either.
+ *   3. `sources` is sent EXACTLY ONCE on a successful run, immediately before
+ *      `done`, and describes every tool call that actually executed.
+ *   4. A `tool_result` is emitted once per tool call whose envelope parsed, at
+ *      the moment that call completed — so every `tool_result` precedes
+ *      `sources`, and the union of `tool_result` frames corresponds to the
+ *      entries in `sources`.
+ *   5. `token` frames may be interleaved with `tool_result` frames, in either
+ *      direction, and a run may emit either without the other.
+ *   6. `stage` frames arrive in CAUSAL ORDER: a stage is emitted synchronously
+ *      at the point its operation begins or ends, so a later stage can never
+ *      precede an earlier operation. A stage carrying an `id` already seen
+ *      SUPERSEDES the earlier one — consumers replace by id, they do not append.
+ *      The same `(id, status)` pair is never emitted twice.
+ *
+ * DELIBERATELY NOT GUARANTEED: that any frame type appears at all. A cancelled
+ * run ends without `done`; a run that calls no tool emits no `tool_result`; a
+ * run whose tools all fail to parse emits none either. A run may end with a
+ * stage still `active` — that is not a protocol violation, it is how the stream
+ * says where execution stopped. A consumer must render from what arrived, never
+ * wait for what did not.
+ *
+ * ## FORWARD COMPATIBILITY — the rule that lets this protocol grow
+ *
+ * A CONSUMER MUST IGNORE FRAMES WHOSE `type` IT DOES NOT RECOGNISE.
+ *
+ * This is what makes adding a frame a non-breaking change, and it is why this
+ * union can stay specific instead of turning into a general container: the cost
+ * of a new member is a branch in whoever wants it, and nothing at all in whoever
+ * does not.
+ *
+ * The rule must be honoured EXPLICITLY, not by accident. An exhaustive `switch`
+ * with an `assertNever` default would satisfy the compiler today and turn every
+ * future frame into a client-side crash — which is the precise failure this rule
+ * exists to prevent. See the `default` branch in src/app/page.tsx.
+ *
+ * There is deliberately NO protocol version field. The client and the route ship
+ * in one Next.js build and deploy as one container (SAD §17), so there is no
+ * independently-versioned consumer to negotiate with, and a version nothing can
+ * disagree about is unreachable ceremony — the judgement SAD §19 already records
+ * for TARGET_AMBIGUOUS.
+ *
+ * ## RESERVED, and not declared until something emits them
+ *
+ *   `artifact` — Phase 6. A REFERENCE to a generated report — id, kind, title,
+ *                href, size — and never inline bytes. NDJSON is line-delimited,
+ *                so a base64 document is one enormous line that defeats a
+ *                line-buffered reader; `send()` serialises synchronously, so a
+ *                large frame would block the run; and an artifact downloaded
+ *                tomorrow cannot live in a stream that ended today. CLAUDE.md
+ *                rule 3 already assigns reports to Inngest and SAD §18 already
+ *                gives them their own download route.
+ *
+ * It is not declared here yet, because a declaration that nothing can reach is
+ * not a head start — it is a claim the code does not honour (SAD §19). `stage`
+ * was reserved on the same terms and is declared below now that Phase 2 emits
+ * it from the components that perform the work.
+ *
+ * Markdown, charts and fleet summaries need NO new frame: prose already arrives
+ * as `token`, and a chart or a summary is a rendering of data that already
+ * arrives as `tool_result`. Adding a frame for either would move a presentation
+ * decision to the server.
  */
 export type ChatStreamFrame =
+  /** One chunk of the model's answer text. Append in order. */
   | { type: "token"; value: string }
+  /**
+   * One completed tool call, with the data it produced (Phase 1 UX redesign).
+   *
+   * ## Why this frame exists
+   *
+   * The route has always parsed the full envelope on `on_tool_end` and then kept
+   * only `envelope.source`, discarding `envelope.data`. That data is the
+   * Analysis Engine's finished work — the value, its unit, both timestamps, the
+   * derivation, the aggregation and the reconciliation — all computed
+   * deterministically and then available to the UI only as whatever prose the
+   * model chose to write about it.
+   *
+   * So the report the user sees could never be more precise than the narration,
+   * and a number could never be rendered apart from the sentence containing it.
+   * This frame carries the already-parsed envelope to the client so FACTS can be
+   * rendered from tool output and ANALYSIS from model tokens — two different
+   * frames feeding two different components, which is what makes it structurally
+   * impossible for the two to interleave.
+   *
+   * ## Named for its PRODUCER
+   *
+   * `tool_result`, not `result`. Later milestones will carry report results and
+   * artifact results, and a frame called `result` would have to be disambiguated
+   * against every one of them. Naming the producer is what keeps `stage` and
+   * `artifact` from ever colliding with this.
+   *
+   * ## Additive by construction
+   *
+   * Nothing is removed and nothing is reordered: `token`, `sources`, `error` and
+   * `done` are emitted exactly as before, with the same values at the same
+   * points in the stream. `sources` is still sent separately and still built
+   * from the same array, so the Sources block is unchanged even for a client
+   * that reads only that.
+   *
+   * The envelope is SELF-DESCRIBING via `source.tool`, so the client narrows on
+   * the tool name rather than needing a second field to tell it what `data` is.
+   */
+  | { type: "tool_result"; value: ToolEnvelope }
+  /**
+   * One real backend operation, as it happens (Phase 2).
+   *
+   * DISCARDABLE: dropping every stage frame leaves the answer, its facts and its
+   * sources byte-identical. That property is the reason this is its own frame
+   * type — a consumer must be able to tell at the discriminant what is safe to
+   * ignore, and `stage` and `tool_result` are opposite answers to that question.
+   *
+   * Replace by `id`, do not append. See RunStage.
+   */
+  | { type: "stage"; value: RunStage }
+  /** Every tool call that executed. Once, immediately before `done`. */
   | { type: "sources"; value: SourceAttribution[] }
+  /** The run failed. Terminal. Never emitted for a cancellation. */
   | { type: "error"; message: string }
+  /** The run completed. Terminal. */
   | { type: "done" };

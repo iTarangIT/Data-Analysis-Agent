@@ -355,6 +355,99 @@ The Report Service turns analysis results into business documents: executive sum
 | 9      | The agent composes the answer and its Sources block; tokens stream to the UI; the full run is traced in LangSmith                      |
 | 10     | The Memory Manager persists messages and learned preferences; audit and log entries are written                                        |
 
+### The /api/chat streaming protocol
+
+Step 9 streams NDJSON — one JSON object per line, `Content-Type: application/x-ndjson`. The contract is declared in `src/types/chat.ts` as the discriminated union `ChatStreamFrame`; this section records the rules a consumer may rely on.
+
+| Frame | Cardinality | Consumer action |
+|--------------|-----------------------|-----------------------------------------------|
+| `token` | many | Append to the answer text |
+| `tool_result` | one per parsed tool call | Accumulate — this is the report's EVIDENCE |
+| `stage` | many, discardable | Replace by `id` — real backend progress |
+| `sources` | once, before `done` | Replace the attribution list |
+| `error` | 0–1, terminal | Show the message; the run failed |
+| `done` | once, terminal | The run completed |
+
+**Ordering guarantees.** Frames arrive in emission order, and each is a complete line — a reader must buffer partial lines, because one frame may be split across two network chunks and one chunk may carry several frames. `done` and `error` are terminal; nothing follows either. `sources` is sent exactly once on a successful run, immediately before `done`, and every `tool_result` precedes it, so the union of `tool_result` frames corresponds to the entries in `sources`. `token` and `tool_result` may interleave in either direction. `stage` frames arrive in causal order — each is emitted synchronously at the point its operation begins or ends — and a repeated `id` supersedes the earlier frame rather than adding a row; the same `(id, status)` pair is never sent twice.
+
+**Not guaranteed:** that any frame type appears at all. A cancelled run ends without `done`; a run that calls no tool emits no `tool_result`. A run may end with a stage still `active` — that is not a violation, it is how the stream reports where execution stopped. A consumer renders from what arrived and never waits for what did not.
+
+### Run progress (Phase 2)
+
+A `stage` names one real backend operation. Progress exists only because a component performed work and said so: nothing is timed, interpolated, predicted or padded, there is no percentage — the pipeline has no denominator — and a run that never touches the portal emits no portal stage.
+
+Stages are reported through `src/lib/run-progress.ts`, an `AsyncLocalStorage` scope opened by `/api/chat` and read implicitly by the services beneath it. It is shaped like `childLogger` for the same reason: a service says what it is doing and never learns that an HTTP stream exists. Outside a request there is no store, so `reportStage` is a no-op and `npm run auth:login` and `npm run portal:fetch` exercise identical code paths while emitting nothing.
+
+The emitter guarantees four things, and they are what make an emit call safe inside a module whose behaviour must stay identical: it never throws, never awaits, never changes control flow, and never emits a duplicate `(id, status)`.
+
+| Stage | Emitted by | When |
+|--------------------|--------------------|------------------------------------------------|
+| `planning` | Agent loop | First model turn |
+| `tool` | Agent loop | Tool start → tool end, keyed by run id |
+| `vehicle_resolved` | Analysis Engine | After the vehicle is proven to exist |
+| `fleet_resolved` | Analysis Engine | After the population is enumerated |
+| `database_read` | Analysis Engine | Per distinct read, dispatch → settle |
+| `portal_connect` | Session Manager | Once browser work is committed to |
+| `session_reused` | Session Manager | The stored session probed valid — no login |
+| `session_expired` | Session Manager | The stored session had expired |
+| `session_login` | Session Manager | A real sign-in, start → saved |
+| `portal_read` | Portal Service | Navigate → extract, per module |
+| `reconciling` | Analysis Engine | Precedence begins selecting sources |
+| `writing` | Agent loop | First answer token |
+| `completed` | Agent loop | Run finished, with measured duration |
+
+A stage may never carry a credential, cookie, storageState, URL, selector, SQL fragment, page content or tool parameter. `detail` is a feed name, a module name or a tool name. `/api/chat` already declines to log tool parameters; a stage must not become the channel that does what the log policy refused.
+
+**Failure is reported by absence, not by invention.** A stage left `active` when a run ends *is* the marker for where execution stopped, so no recovery stage is emitted for work that never happened. Tool failures close their own stage as `failed`, reusing the outcome the log record already computed, so the timeline and the log cannot disagree.
+
+**Forward compatibility.** A consumer MUST IGNORE frames whose `type` it does not recognise, and must do so explicitly — an exhaustive `switch` with an `assertNever` default would satisfy the compiler today and turn the first new frame type into a runtime crash for every browser holding a cached bundle. This rule is what lets the union stay specific instead of becoming a general `payload` container: adding a member costs a branch in whoever wants it and nothing at all in whoever does not.
+
+There is deliberately no protocol version field. The client and the route ship in one build and deploy as one container (Section 17), so there is no independently-versioned consumer to negotiate with, and a version nothing can disagree about is unreachable ceremony — the judgement Section 19 already records for `TARGET_AMBIGUOUS`.
+
+**Reserved, and not declared until something emits it.** `artifact` carries a REFERENCE to a generated report — id, kind, title, href, size — and never inline bytes: NDJSON is line-delimited, so a base64 document is one enormous line that defeats a line-buffered reader; the stream serialises synchronously, so a large frame would block the run; and an artifact downloaded tomorrow cannot live in a stream that ended today. Reports are already assigned to Inngest (Section 13) with their own download route (Section 18). `stage` was reserved on the same terms and is declared as of Phase 2, below.
+
+Markdown, charts and fleet summaries need no new frame: prose already arrives as `token`, and a chart or a summary is a rendering of data that already arrives as `tool_result`. A frame for either would move a presentation decision to the server.
+
+### Reverse geocoding (Phase 3)
+
+A coordinate is telemetry; the address shown above it is a label. The two are never merged, and the coordinate is never replaced, abbreviated or discarded — `LocationDisplay.coordinates` is non-nullable, so a component cannot render a location without it even by mistake.
+
+```
+Location Card (LocationValue)
+      │
+      ▼  formatLocation()          src/lib/location.ts        pure
+Location Formatter
+      │
+      ▼  useReverseGeocode()       client hook, after render
+Reverse Geocoder ──► /api/geocode ──► geocoder.service.ts ──► provider
+                                            │
+                                            ├─ address.ts    pure normalization
+                                            └─ cache.ts      swappable cache
+```
+
+**Nothing that produces an answer knows this exists.** The Analysis Engine, Portal Service, Session Manager, Database Service, Planner, Tool Registry and agent neither import it nor are imported by it — enforced in both directions by `GEOCODING_ZONE` in `eslint.config.mjs`. The label is fetched by the BROWSER after a report has already rendered, so it never enters the model's context and can never be restated as though a vehicle had reported it.
+
+**It cannot fail an answer.** `reverseGeocode()` never throws: a disabled deployment, an invalid coordinate, a rate limit, a timeout, a provider outage and a coordinate with no name all return `null`, and the UI then shows exactly what it showed before Phase 3. `/api/geocode` answers 200 with `{"address": null}` for every one of them — there is deliberately no error status and no error field, because an error the UI is required to ignore is noise, and a shape carrying one would invite a component to render "Failed to look up location" beside a perfectly good coordinate. The UI never displays "Unknown", "N/A" or a failure string.
+
+**Caching** is keyed on the coordinate rounded to 4 decimal places, about 11 metres. That is calibrated rather than chosen: the Milestone 5D-1 pass measured consecutive GPS fixes for a *stationary* vehicle scattering by up to 11.26 m, so keying on the raw value would miss the cache on every read for exactly the vehicles that never move. Successful lookups live 24 hours; no-results live 10 minutes, so a transient outage cannot suppress addresses for a day. `GeocodeCache` is a two-method async interface with an in-process implementation; `setGeocodeCache()` is the seam a Redis-backed one slots into with no consumer change. Measured: 10 requests inside one bucket produce exactly 1 provider call.
+
+**Provider calls are serialised and spaced** by `GEOCODING_MIN_INTERVAL_MS` (default 250 ms). The gap is courtesy rather than compliance — no published policy demands it here — and the cache already collapses repeat lookups, so it costs nothing while keeping a burst of distinct coordinates civil.
+
+**The provider is BigDataCloud**, selected after the OpenStreetMap public Nominatim instance was measured returning `HTTP 403 Access denied` from a data-centre network — the condition a Railway deployment meets — which left the previous default architecturally sound and operationally dead. Of the providers compared (BigDataCloud, Geoapify, OpenRouteService, LocationIQ, Nominatim), BigDataCloud was the only one that answered a data-centre IP with **no credential**; the other three returned `401`. It also returns a structured administrative hierarchy rather than the nearest map object, so a rural coordinate resolves to its town and district instead of to whichever building happens to be closest — which matters for a fleet that does not operate in city centres.
+
+**Two endpoints, one response schema, one environment variable:**
+
+| `GEOCODING_API_KEY` | Endpoint | Use |
+|---|---|---|
+| unset *(default)* | `/data/reverse-geocode-client` | Zero configuration — a fresh clone resolves addresses immediately |
+| set | `/data/reverse-geocode` | The endpoint BigDataCloud designates for server-to-server use |
+
+Both return the same payload, so switching changes one URL and nothing else: no code path, no parsing, no cache behaviour. Setting a key is the recommended production posture — the keyless endpoint is named for client use, and while it serves a server correctly, a deployment should not rest on an endpoint whose name signals a different intent. A key is free and needs no card.
+
+**Configuration** is `geocodingEnv()` in `src/lib/env.ts` — a third schema, lazy like `authEnv()` and with every field defaulted, so it cannot throw and cannot fail a boot or a build. `GEOCODING_ENABLED=false` removes the feature entirely.
+
+> **Privacy.** Reverse geocoding sends vehicle positions to whatever endpoint is configured. That is inherent to the feature rather than a property of this provider. `GEOCODING_ENABLED=false` removes it, and the UI then shows exactly the coordinates it showed before Phase 3.
+
 ## 16. Observability, Logging & Configuration
 
 ### LangSmith
@@ -517,6 +610,22 @@ tarang-agent/
 
 │ │ └── session-refresh.ts
 
+│ │ ├── geocoding/ \# Reverse geocoding — presentation only (Phase 3)
+
+│ │ │ ├── geocoder.service.ts \# Provider call, throttle, timeout; never throws
+
+│ │ │ ├── address.ts \# Pure normalization of a provider payload
+
+│ │ │ └── cache.ts \# Swappable cache; in-memory by default
+
+│ ├── components/ \# Presentation only — no service, no Prisma, no agent
+
+│ │ ├── chat/ \# Composer and transcript pieces
+
+│ │ ├── report/ \# Facts, Evidence, Sources — the answer's fixed grammar
+
+│ │ └── ui/ \# Disclosure, Markdown — shared primitives
+
 │ ├── lib/
 
 │ │ ├── prisma.ts \# Singleton client
@@ -524,6 +633,10 @@ tarang-agent/
 │ │ ├── logger.ts \# Pino + redaction
 
 │ │ ├── env.ts \# Zod-validated environment
+
+│ │ ├── format.ts \# Pure presentation formatting; never re-rounds a value
+
+│ │ ├── facts.ts \# Tool envelopes -> the fact rows the report renders
 
 │ │ └── langsmith.ts
 

@@ -1,96 +1,86 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
+import { Composer } from "@/components/chat/Composer";
+import { AnalystReport } from "@/components/report/AnalystReport";
 import type {
   ChatMessage,
   ChatStreamFrame,
-  ContributingSource,
+  RunStage,
   SourceAttribution,
+  ToolEnvelope,
 } from "@/types/chat";
 
+/**
+ * The chat surface.
+ *
+ * ## What changed in Phase 1, and what deliberately did not
+ *
+ * The STREAMING LOGIC below is unchanged: the same request body, the same
+ * NDJSON reader, the same line buffering, the same history filter, the same
+ * error handling. One branch was added for the `tool_result` frame, which
+ * carries the tool envelope the route already parsed, and the chain became a
+ * `switch` so that the protocol's ignore-unknown-frames rule is stated in code
+ * rather than implied by the absence of an `else` (see ChatStreamFrame).
+ *
+ * What changed is everything downstream of it. An answer is no longer a
+ * paragraph of text with a provenance list underneath — it is a report whose
+ * FACTS come from tool output and whose ANALYSIS comes from the model, rendered
+ * by two different components so the two can never blend.
+ */
+
 type UiMessage = ChatMessage & {
+  /** Completed tool calls, in the order they finished. */
+  results?: ToolEnvelope[];
+  /** Real backend operations, in first-seen order, deduplicated by id. */
+  stages?: RunStage[];
   sources?: SourceAttribution[];
   failed?: boolean;
 };
 
-/**
- * Every source that took part in one answer, when more than one did
- * (Milestone 5D-4).
- *
- * Rendered beneath the source that ANSWERED rather than replacing it, because
- * the two say different things: `origin` above is where the number came from,
- * and this is what else was consulted. A source marked "not reported" was read
- * and set aside — showing it is the point, since an attribution that listed only
- * the winner would hide that a second source was ever looked at.
- */
-function ContributingSources({ sources }: { sources: ContributingSource[] }) {
-  return (
-    <ul className="mt-1 space-y-0.5 border-l border-black/10 pl-2 dark:border-white/15">
-      {sources.map((source, index) => (
-        <li key={`${source.origin}-${index}`} className="opacity-70">
-          <span
-            className={
-              source.role === "chosen" ? "font-medium" : "italic opacity-70"
-            }
-          >
-            {source.origin}
-          </span>
-          <span className="opacity-60">
-            {" · "}
-            {source.sourceClass}
-            {source.role === "alternative" ? " · not reported" : ""}
-            {source.available ? "" : " · no data"}
-          </span>
-          {source.measuredAt ? (
-            <span className="opacity-50">
-              {" · measured "}
-              {new Date(source.measuredAt).toLocaleString()}
-            </span>
-          ) : null}
-          {source.basis ? (
-            <div className="opacity-60">{source.basis}</div>
-          ) : null}
-        </li>
-      ))}
-    </ul>
-  );
-}
+const EXAMPLES = [
+  "How many vehicles are running right now?",
+  "What is the fleet's average state of charge?",
+  "What is the state of health of TK-51105-02AZ-179386?",
+];
 
-function SourcesBlock({ sources }: { sources: SourceAttribution[] }) {
+function EmptyState({ onPick }: { onPick: (question: string) => void }) {
   return (
-    <div className="mt-4 border-t border-black/10 pt-3 dark:border-white/15">
-      <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide opacity-60">
-        Sources
+    <div className="py-10">
+      <h2 className="text-lg font-semibold tracking-tight text-ink">
+        Ask about the fleet
       </h2>
-      <ul className="space-y-2">
-        {sources.map((source, index) => (
-          <li
-            key={`${source.tool}-${source.timestamp}-${index}`}
-            className="text-xs leading-relaxed opacity-80"
-          >
-            <span className="font-medium">{source.tool}</span>
-            <span className="opacity-60"> · {source.origin}</span>
-            <div className="font-mono opacity-60">
-              {JSON.stringify(source.params)}
-            </div>
-            {source.method ? (
-              <div className="opacity-60">
-                {Object.entries(source.method)
-                  .map(([key, value]) => `${key}: ${String(value)}`)
-                  .join(" · ")}
-              </div>
-            ) : null}
-            {source.contributingSources &&
-            source.contributingSources.length > 0 ? (
-              <ContributingSources sources={source.contributingSources} />
-            ) : null}
-            <div className="opacity-50">
-              {new Date(source.timestamp).toLocaleString()}
-            </div>
+      <p className="mt-1 max-w-[60ch] text-sm leading-relaxed text-ink-muted">
+        Tarang answers from recorded telemetry and the live Intellicar
+        dashboard. Every figure is reported with the source that produced it,
+        when it was measured, and how it was computed.
+      </p>
+
+      <ul className="mt-5 space-y-2">
+        {EXAMPLES.map((example) => (
+          <li key={example}>
+            <button
+              type="button"
+              onClick={() => onPick(example)}
+              className="w-full rounded-lg border border-hairline bg-surface px-3.5 py-2.5 text-left text-sm text-ink-muted transition-colors hover:border-hairline-strong hover:text-ink"
+            >
+              {example}
+            </button>
           </li>
         ))}
       </ul>
+    </div>
+  );
+}
+
+function UserMessage({ content }: { content: string }) {
+  return (
+    <div>
+      <p className="eyebrow mb-1.5 text-ink-faint">You asked</p>
+      <p className="border-l-2 border-hairline-strong pl-3 text-[0.9375rem] leading-relaxed text-ink">
+        {content}
+      </p>
     </div>
   );
 }
@@ -101,6 +91,13 @@ export default function ChatPage() {
   const [busy, setBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Kept as an effect rather than being called inside the read loop, so the
+  // scroll happens after React has committed the new content rather than
+  // against the previous height.
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+  }, [messages]);
+
   /** Mutate the in-flight assistant message, which is always the last one. */
   const updateLast = (patch: (message: UiMessage) => UiMessage) => {
     setMessages((current) =>
@@ -110,8 +107,7 @@ export default function ChatPage() {
     );
   };
 
-  async function send() {
-    const question = input.trim();
+  async function send(question: string) {
     if (!question || busy) return;
 
     const history: ChatMessage[] = [
@@ -145,23 +141,101 @@ export default function ChatPage() {
       const decoder = new TextDecoder();
       let buffer = "";
 
+      /**
+       * One NDJSON frame.
+       *
+       * A `switch` with an explicit, documented `default` — see that branch for
+       * why this is the shape the protocol requires rather than a style choice.
+       */
       const handleFrame = (line: string) => {
         if (!line.trim()) return;
         const frame = JSON.parse(line) as ChatStreamFrame;
 
-        if (frame.type === "token") {
-          updateLast((message) => ({
-            ...message,
-            content: message.content + frame.value,
-          }));
-        } else if (frame.type === "sources") {
-          updateLast((message) => ({ ...message, sources: frame.value }));
-        } else if (frame.type === "error") {
-          updateLast((message) => ({
-            ...message,
-            content: message.content || frame.message,
-            failed: true,
-          }));
+        switch (frame.type) {
+          case "token":
+            updateLast((message) => ({
+              ...message,
+              content: message.content + frame.value,
+            }));
+            return;
+
+          case "tool_result":
+            // Appended rather than replaced: a run may call several tools, and
+            // each envelope describes one of them.
+            updateLast((message) => ({
+              ...message,
+              results: [...(message.results ?? []), frame.value],
+            }));
+            return;
+
+          case "stage":
+            /**
+             * REPLACE BY ID, in first-seen order.
+             *
+             * A stage reports transitions — `active` then `ok` — under one id, so
+             * appending would render the same operation twice. Replacing in
+             * place keeps the timeline in causal order while letting a row
+             * change state without moving.
+             */
+            updateLast((message) => {
+              const stages = message.stages ?? [];
+              const index = stages.findIndex(
+                (stage) => stage.id === frame.value.id
+              );
+
+              if (index === -1) {
+                return { ...message, stages: [...stages, frame.value] };
+              }
+
+              const next = stages.slice();
+              next[index] = frame.value;
+              return { ...message, stages: next };
+            });
+            return;
+
+          case "sources":
+            updateLast((message) => ({ ...message, sources: frame.value }));
+            return;
+
+          case "error":
+            updateLast((message) => ({
+              ...message,
+              content: message.content || frame.message,
+              failed: true,
+            }));
+            return;
+
+          case "done":
+            // Terminal marker. The read loop ends on its own when the stream
+            // closes, so there is nothing to do beyond not treating it as
+            // unrecognised.
+            return;
+
+          default:
+            /**
+             * IGNORE UNRECOGNISED FRAMES. This branch is the protocol's
+             * forward-compatibility guarantee, and it is deliberate rather than
+             * incidental.
+             *
+             * `stage` arrives in Phase 2 and `artifact` in Phase 6. Both must be
+             * addable without breaking a client that predates them — a browser
+             * holding a cached bundle is exactly such a client, and it exists on
+             * every deploy — so a frame this build has never heard of must be
+             * dropped in silence.
+             *
+             * DO NOT replace this with an exhaustiveness check. The obvious
+             * refactor here is `default: assertNever(frame)`, which would
+             * satisfy the compiler today and turn the first new frame type into
+             * a runtime crash for every client that had not reloaded. The
+             * compiler cannot see the future frames; this branch is what
+             * accommodates them.
+             *
+             * Deliberately silent: not a log, not an error, not a placeholder
+             * in the transcript. An unknown frame is a newer server talking to
+             * an older client, which is a normal condition during a rollout and
+             * not a fault.
+             */
+            return;
         }
       };
 
@@ -173,8 +247,6 @@ export default function ChatPage() {
         const lines = buffer.split("\n");
         buffer = lines.pop() ?? "";
         lines.forEach(handleFrame);
-
-        scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
       }
 
       handleFrame(buffer);
@@ -192,70 +264,53 @@ export default function ChatPage() {
   }
 
   return (
-    <main className="mx-auto flex h-dvh w-full max-w-3xl flex-col gap-4 p-6">
-      <header>
-        <h1 className="text-lg font-semibold">Tarang</h1>
-        <p className="text-sm opacity-60">
-          AI data analyst for EV battery fleets. Every number is traceable to
-          the tool that produced it.
+    <main className="mx-auto flex h-dvh w-full max-w-3xl flex-col px-6">
+      <header className="shrink-0 border-b border-hairline py-5">
+        <div className="flex items-baseline gap-2.5">
+          <span aria-hidden className="text-live">
+            ▪
+          </span>
+          <h1 className="text-base font-semibold tracking-tight text-ink">
+            Tarang
+          </h1>
+          <p className="eyebrow text-ink-faint">Fleet Analyst</p>
+        </div>
+        <p className="mt-1 text-xs text-ink-muted">
+          AI data analyst for EV battery fleets. Every number is traceable to the
+          tool that produced it.
         </p>
       </header>
 
-      <div ref={scrollRef} className="flex-1 space-y-6 overflow-y-auto">
+      <div ref={scrollRef} className="flex-1 space-y-10 overflow-y-auto py-6">
         {messages.length === 0 ? (
-          <p className="text-sm opacity-50">
-            Try: “What&apos;s the battery health of battery B-1042?”
-          </p>
+          <EmptyState onPick={(question) => void send(question)} />
         ) : null}
 
-        {messages.map((message, index) => (
-          <article key={index}>
-            <div className="mb-1 text-xs font-semibold uppercase tracking-wide opacity-50">
-              {message.role === "user" ? "You" : "Tarang"}
-            </div>
-            <div
-              className={`whitespace-pre-wrap text-sm leading-relaxed ${
-                message.failed ? "text-red-600 dark:text-red-400" : ""
-              }`}
-            >
-              {message.content ||
-                (busy && index === messages.length - 1 ? "…" : "")}
-            </div>
-            {message.sources && message.sources.length > 0 ? (
-              <SourcesBlock sources={message.sources} />
-            ) : null}
-          </article>
-        ))}
+        {messages.map((message, index) =>
+          message.role === "user" ? (
+            <UserMessage key={index} content={message.content} />
+          ) : (
+            <AnalystReport
+              key={index}
+              content={message.content}
+              results={message.results ?? []}
+              stages={message.stages ?? []}
+              sources={message.sources ?? []}
+              failed={message.failed}
+              streaming={busy && index === messages.length - 1}
+            />
+          )
+        )}
       </div>
 
-      <form
-        className="flex gap-2"
-        onSubmit={(event) => {
-          event.preventDefault();
-          void send();
-        }}
-      >
-        <textarea
+      <div className="shrink-0 pb-6">
+        <Composer
           value={input}
-          onChange={(event) => setInput(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              void send();
-            }
-          }}
-          rows={2}
-          placeholder="Ask about the fleet…"
-          className="flex-1 resize-none rounded-lg border border-black/15 bg-transparent p-3 text-sm outline-none focus:border-black/40 dark:border-white/20 dark:focus:border-white/50"
+          onChange={setInput}
+          onSubmit={() => void send(input.trim())}
+          busy={busy}
         />
-        <button
-          type="submit"
-          disabled={busy || !input.trim()}
-          className="self-end rounded-lg bg-foreground px-4 py-2.5 text-sm font-medium text-background disabled:opacity-40"
-        >
-          {busy ? "Thinking…" : "Send"}
-        </button>
-      </form>
+      </div>
     </main>
   );
 }

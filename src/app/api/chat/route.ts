@@ -6,6 +6,7 @@ import { z } from "zod";
 import { AGENT_RECURSION_LIMIT, getAgent } from "@/agent/agent";
 import { parseToolEnvelope } from "@/agent/tool-registry";
 import { childLogger } from "@/lib/logger";
+import { reportStage, withRunProgress } from "@/lib/run-progress";
 import type { ChatStreamFrame, SourceAttribution } from "@/types/chat";
 
 /**
@@ -199,50 +200,137 @@ export async function POST(request: Request) {
       runLog.info({ messageCount: messages.length }, "Agent run started.");
 
       try {
-        const events = agent.streamEvents(
-          { messages },
-          { version: "v2", recursionLimit: AGENT_RECURSION_LIMIT, signal }
-        );
+        /**
+         * The run's stage scope (Phase 2).
+         *
+         * Opened HERE because the route owns the request, and therefore owns the
+         * run's progress record for exactly the reason it already owns the
+         * request id and the log record — the argument this file's header
+         * already makes about observability. Everything under this call — the
+         * graph, every tool, the Analysis Engine, the Portal Service and the
+         * Session Manager — reports into `send` without naming a transport.
+         *
+         * Only the event loop is wrapped. `sources` and `done` are emitted after
+         * it, unchanged and in the same order, so the scope cannot affect
+         * termination.
+         */
+        await withRunProgress(
+          (stage) => send({ type: "stage", value: stage }),
+          async () => {
+            const events = agent.streamEvents(
+              { messages },
+              { version: "v2", recursionLimit: AGENT_RECURSION_LIMIT, signal }
+            );
 
-        for await (const event of events) {
-          if (event.event === "on_chat_model_stream") {
-            // Deliberately unlogged: this fires once per token.
-            const text = chunkToText(event.data?.chunk);
-            if (text) send({ type: "token", value: text });
-          } else if (event.event === "on_tool_start") {
-            openSpans.set(event.run_id, {
-              tool: event.name,
-              startedAt: Date.now(),
+            for await (const event of events) {
+              if (event.event === "on_chat_model_start") {
+                // The model is deciding what to do. Deduplicated by id, so the
+                // second model turn — the one that writes the answer — does not
+                // report planning a second time.
+                reportStage({
+                  id: "planning",
+                  kind: "planning",
+                  status: "ok",
+                });
+              } else if (event.event === "on_chat_model_stream") {
+                // Deliberately unlogged: this fires once per token.
+                const text = chunkToText(event.data?.chunk);
+
+                if (text) {
+                  // The first token with actual text is the honest moment the
+                  // answer starts being written. Emitted before the token so a
+                  // consumer never renders prose under a timeline that has not
+                  // reached it.
+                  reportStage({ id: "writing", kind: "writing", status: "ok" });
+                  send({ type: "token", value: text });
+                }
+              } else if (event.event === "on_tool_start") {
+                openSpans.set(event.run_id, {
+                  tool: event.name,
+                  startedAt: Date.now(),
+                });
+
+                // Keyed by run_id for the same reason `openSpans` is: two calls
+                // to one tool in a run must not be confused for one another.
+                //
+                // `detail` is the tool NAME only. The parameters are available
+                // here and are deliberately not carried — this file already
+                // declines to log them, and a stage must not become the channel
+                // that does what the log policy refused.
+                reportStage({
+                  id: `tool:${event.run_id}`,
+                  kind: "tool",
+                  status: "active",
+                  detail: event.name,
+                });
+              } else if (event.event === "on_tool_end") {
+                const envelope = parseToolEnvelope(event.data?.output);
+
+                if (envelope) {
+                  sources.push(envelope.source);
+
+                  // The same envelope, forwarded rather than discarded, so the
+                  // UI can render the tool's own numbers instead of re-reading
+                  // them out of the model's prose (see
+                  // ChatStreamFrame."tool_result"). Nothing is computed here:
+                  // this is the object `parseToolEnvelope` already returned one
+                  // line above.
+                  send({ type: "tool_result", value: envelope });
+                }
+
+                const span = openSpans.get(event.run_id);
+                openSpans.delete(event.run_id);
+                toolCalls += 1;
+
+                // Name, duration and outcome — never the parameters, and never
+                // the result data. The error text IS included: it is written to
+                // be safe to show (it already reaches the model's context), and
+                // without it "outcome: error" says nothing a reader can act on.
+                // A timeout is one of these errors, identifiable by its message
+                // and by a duration that sits on the tool's budget.
+                const durationMs =
+                  span === undefined ? undefined : Date.now() - span.startedAt;
+                const failed = typeof envelope?.error === "string";
+
+                const record = {
+                  tool: span?.tool ?? event.name,
+                  durationMs,
+                  outcome: failed ? "error" : "ok",
+                  ...(failed ? { error: envelope?.error } : {}),
+                };
+
+                if (failed) runLog.warn(record, "Tool call failed.");
+                else runLog.info(record, "Tool call completed.");
+
+                // Closes the stage opened at `on_tool_start`, reusing the
+                // outcome and the duration this branch already computed for the
+                // log record — so the timeline and the log can never disagree
+                // about whether a tool succeeded.
+                reportStage({
+                  id: `tool:${event.run_id}`,
+                  kind: "tool",
+                  status: failed ? "failed" : "ok",
+                  detail: span?.tool ?? event.name,
+                  ...(durationMs === undefined ? {} : { count: durationMs }),
+                });
+              }
+            }
+
+            // The event stream is exhausted, so the run's work is over.
+            //
+            // Emitted INSIDE the scope deliberately: `reportStage` reads the
+            // AsyncLocalStorage store, so a call placed after the enclosing
+            // `withRunProgress` returns would find no store and silently do
+            // nothing. Carries the MEASURED elapsed time that `finally` already
+            // reports to the log.
+            reportStage({
+              id: "completed",
+              kind: "completed",
+              status: "ok",
+              count: Date.now() - startedAt,
             });
-          } else if (event.event === "on_tool_end") {
-            const envelope = parseToolEnvelope(event.data?.output);
-            if (envelope) sources.push(envelope.source);
-
-            const span = openSpans.get(event.run_id);
-            openSpans.delete(event.run_id);
-            toolCalls += 1;
-
-            // Name, duration and outcome — never the parameters, and never the
-            // result data. The error text IS included: it is written to be safe
-            // to show (it already reaches the model's context), and without it
-            // "outcome: error" says nothing a reader can act on. A timeout is
-            // one of these errors, identifiable by its message and by a duration
-            // that sits on the tool's budget.
-            const durationMs =
-              span === undefined ? undefined : Date.now() - span.startedAt;
-            const failed = typeof envelope?.error === "string";
-
-            const record = {
-              tool: span?.tool ?? event.name,
-              durationMs,
-              outcome: failed ? "error" : "ok",
-              ...(failed ? { error: envelope?.error } : {}),
-            };
-
-            if (failed) runLog.warn(record, "Tool call failed.");
-            else runLog.info(record, "Tool call completed.");
           }
-        }
+        );
 
         send({ type: "sources", value: sources });
         send({ type: "done" });

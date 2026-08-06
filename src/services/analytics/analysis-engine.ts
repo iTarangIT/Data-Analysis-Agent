@@ -1,3 +1,5 @@
+import { reportStage } from "@/lib/run-progress";
+
 import {
   acquire,
   resolveSubject,
@@ -902,6 +904,21 @@ export async function runAnalysis(
   const resolution = await resolveSubject(plan.subject);
 
   const acquisitions = await acquire(plan, resolution, options);
+
+  /**
+   * Stages 4-6 begin (Phase 2).
+   *
+   * Emitted between acquisition and the findings map, which is the exact point
+   * precedence starts choosing which source answers each quantity. A single
+   * `ok` rather than an active/ok pair because everything below this line is
+   * pure, synchronous and sub-millisecond — bracketing it would report a
+   * duration of zero and imply the user was waiting on it.
+   *
+   * This is a notification and nothing more: it reads no state, returns nothing,
+   * and is a no-op outside a request. The engine's determinism is untouched —
+   * the same request still produces the same findings from the same inputs.
+   */
+  reportStage({ id: "reconciling", kind: "reconciling", status: "ok" });
 
   // 4/6 — Reconcile each quantity, then assemble.
   //

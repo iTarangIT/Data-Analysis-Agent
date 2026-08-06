@@ -2,6 +2,7 @@ import type { BrowserContext } from "playwright";
 
 import { isAuthEnvConfigured } from "@/lib/env";
 import { childLogger } from "@/lib/logger";
+import { occurrenceId, reportStage } from "@/lib/run-progress";
 import * as credentials from "@/services/credentials/credential-manager";
 
 import {
@@ -237,6 +238,7 @@ function cancelled(): SessionError {
 /** Log in, persist the sealed state, and hand the fresh context to `run`. */
 async function loginAndRun<T>(
   run: (context: BrowserContext) => Promise<T>,
+  loginStageId: string,
   signal?: AbortSignal
 ): Promise<T> {
   return await withContext(
@@ -266,6 +268,15 @@ async function loginAndRun<T>(
       // timed-out first portal request cheap — the login it paid for is saved,
       // so the user's retry takes the reuse path.
       await store.save(await context.storageState());
+
+      // Closes the stage opened before `loginAndRun`. Reached only past the
+      // `outcome.ok` guard above, so it reports a sign-in that actually
+      // succeeded rather than one that was attempted.
+      reportStage({
+        id: loginStageId,
+        kind: "session_login",
+        status: "ok",
+      });
 
       return await run(context);
     },
@@ -365,6 +376,27 @@ export function withAuthenticatedContext<T>(
       throw new SessionError("CREDENTIALS_REJECTED", rejected.message);
     }
 
+    /**
+     * Browser work is now genuinely committed to (Phase 2).
+     *
+     * Placed AFTER the queue, the cancellation check, the configuration check
+     * and the rejection latch — every path that returns without touching the
+     * portal has already been taken, so this is the first point at which
+     * "connecting to Intellicar" is a true statement rather than an intention.
+     * An unconfigured deployment and a latched-off one report nothing, which is
+     * correct: they never connect.
+     *
+     * Carries no account, no credential and no URL — see the Session Manager's
+     * own convention for `SessionStatus`.
+     */
+    const sessionStageId = occurrenceId("portal-session");
+
+    reportStage({
+      id: sessionStageId,
+      kind: "portal_connect",
+      status: "active",
+    });
+
     try {
       const stored = await store.load();
 
@@ -382,6 +414,18 @@ export function withAuthenticatedContext<T>(
           if (probe === "valid") {
             await store.touch();
             log.info({ savedAt: stored.savedAt }, "Reusing the stored Intellicar session.");
+
+            // The brief's explicit case: a reused session must read "session
+            // reused", never "authenticating". Emitted on the SAME branch as the
+            // log line above and only after the probe returned valid, so it can
+            // never claim a reuse that did not happen. No login occurs on this
+            // path, so no login stage is emitted on it either.
+            reportStage({
+              id: sessionStageId,
+              kind: "session_reused",
+              status: "ok",
+            });
+
             return { outcome: "used" as const, value: await run(context) };
           }
 
@@ -409,11 +453,33 @@ export function withAuthenticatedContext<T>(
         if (signal?.aborted) throw cancelled();
 
         log.info("Stored Intellicar session has expired; re-authenticating.");
+
+        // Distinguished from a first sign-in because they are different facts
+        // about the deployment, and because the cancellation guard above has
+        // already ruled out the one case where "expired" would be a lie.
+        reportStage({
+          id: sessionStageId,
+          kind: "session_expired",
+          status: "ok",
+        });
       } else {
         log.info("No stored Intellicar session; authenticating.");
       }
 
-      return await loginAndRun(run, signal);
+      // Reached ONLY when a real sign-in is about to happen — the reuse branch
+      // above returns before it. Left `active`: `loginAndRun` either succeeds,
+      // in which case the portal read that follows is the visible progress, or
+      // throws, in which case a stage still active is precisely the report that
+      // execution stopped at the login.
+      const loginStageId = occurrenceId("portal-login");
+
+      reportStage({
+        id: loginStageId,
+        kind: "session_login",
+        status: "active",
+      });
+
+      return await loginAndRun(run, loginStageId, signal);
     } finally {
       if (CLOSE_BROWSER_AFTER_RUN) await closeBrowser();
     }

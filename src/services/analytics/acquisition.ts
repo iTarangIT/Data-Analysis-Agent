@@ -27,6 +27,7 @@ import {
   type PortalModule,
 } from "@/services/portal/portal.service";
 import { isAuthEnvConfigured } from "@/lib/env";
+import { reportStage } from "@/lib/run-progress";
 
 import type { AnalysisWindow } from "./observations";
 import type { AnalysisPlan, AnalysisSubject, CandidateSource } from "./planner";
@@ -278,6 +279,16 @@ export async function resolveSubject(
   if (subject.kind === "fleet") {
     const { vehicleNos, truncated } = await fetchFleetPopulation();
 
+    // Reported AFTER the read, so the count is the one that came back rather
+    // than one this line predicted. The population is the denominator of every
+    // aggregate in the run, which is why it is worth naming at all.
+    reportStage({
+      id: "subject",
+      kind: "fleet_resolved",
+      status: "ok",
+      count: vehicleNos.length,
+    });
+
     return {
       kind: "fleet",
       vehicleNos,
@@ -288,6 +299,17 @@ export async function resolveSubject(
   }
 
   await requireVehicle({ vehicleNo: subject.vehicleNo });
+
+  // Only reached when the vehicle EXISTS — `requireVehicle` throws otherwise —
+  // so this reports a proven fact rather than an attempt. The identifier is the
+  // caller's own input travelling back to the caller's own browser; it is not a
+  // tool parameter being logged.
+  reportStage({
+    id: "subject",
+    kind: "vehicle_resolved",
+    status: "ok",
+    detail: subject.vehicleNo,
+  });
 
   return { kind: "vehicle", vehicleNo: subject.vehicleNo };
 }
@@ -547,6 +569,34 @@ function fetchFleetLatest(
   }
 }
 
+/**
+ * Which table a candidate reads, or null when it reads no table at all
+ * (Phase 2).
+ *
+ * PURE, and a mirror of `fetchCandidate`'s dispatch rather than a second
+ * judgement about it: it branches on the same discriminants in the same order,
+ * so a candidate that reaches Postgres here is exactly one that reaches Postgres
+ * there. Returning null for a LIVE candidate is what keeps a portal scrape from
+ * being announced as a database read — the Portal Service reports its own.
+ *
+ * A fleet aggregate resolves its table through the MEMBER quantity, exactly as
+ * the fetch does, so §19's authoritative-feed table decides what is named here
+ * and this function restates none of it.
+ */
+function databaseReadTable(candidate: CandidateSource): string | null {
+  if (candidate.sourceClass === "live") return null;
+
+  if (candidate.scope === "fleet") {
+    const provider = candidate.provider;
+
+    return provider.kind === "population"
+      ? provider.table
+      : QUANTITY_REGISTRY[provider.memberQuantity].historical.table;
+  }
+
+  return candidate.provider.table;
+}
+
 /** Start the fetch one candidate needs, whichever class it belongs to. */
 function fetchCandidate(
   candidate: CandidateSource,
@@ -642,10 +692,41 @@ export async function acquire(
   const { signal } = options;
   const pending = new Map<string, Promise<FeedSnapshot>>();
 
+  /**
+   * The table each pending DATABASE read is against, keyed exactly as the read
+   * is (Phase 2).
+   *
+   * Held so the closing stage can name the same table the opening one did,
+   * without re-deriving it from a candidate the settle loop no longer has. A
+   * LIVE candidate is absent from this map: a portal read is not a database
+   * read, and the Portal Service reports its own.
+   *
+   * This map is progress bookkeeping and nothing else — it is never read by the
+   * acquisition itself, so the reads, their order, their deduplication and their
+   * results are exactly what they were.
+   */
+  const readTables = new Map<string, string>();
+
   for (const requirement of plan.requirements) {
     for (const candidate of requirement.candidates) {
       if (signal?.aborted) throw new AcquisitionCancelledError();
       if (pending.has(candidate.acquisitionKey)) continue;
+
+      const table = databaseReadTable(candidate);
+
+      if (table !== null) {
+        readTables.set(candidate.acquisitionKey, table);
+
+        // Emitted BEFORE the fetch is dispatched, because the line below starts
+        // it immediately. Every read in a plan is started here, so they are
+        // genuinely concurrent and reporting them all as active is accurate.
+        reportStage({
+          id: `db:${candidate.acquisitionKey}`,
+          kind: "database_read",
+          status: "active",
+          detail: table,
+        });
+      }
 
       pending.set(
         candidate.acquisitionKey,
@@ -658,6 +739,20 @@ export async function acquire(
 
   for (const [key, promise] of pending) {
     settled.set(key, await promise);
+
+    const table = readTables.get(key);
+
+    // Closed only for a read that opened. A throw from `await` leaves the stage
+    // `active`, which is exactly how the timeline reports where execution
+    // stopped — no recovery stage is invented for it.
+    if (table !== undefined) {
+      reportStage({
+        id: `db:${key}`,
+        kind: "database_read",
+        status: "ok",
+        detail: table,
+      });
+    }
   }
 
   return settled;

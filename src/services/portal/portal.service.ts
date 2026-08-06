@@ -3,6 +3,7 @@ import type { z } from "zod";
 
 import { authEnv } from "@/lib/env";
 import { childLogger } from "@/lib/logger";
+import { occurrenceId, reportStage } from "@/lib/run-progress";
 import {
   SessionError,
   withAuthenticatedContext,
@@ -570,6 +571,39 @@ async function readModule(
   try {
     const url = `${authEnv().INTELLICAR_BASE_URL}${capability.path}`;
 
+    /**
+     * One id for THIS attempt (Phase 3 fix).
+     *
+     * A run can read the same module twice — the first read timing out on a cold
+     * page and the model retrying — and a constant id made the second attempt
+     * invisible: its `active` was suppressed as a duplicate and its `ok` closed
+     * the first attempt's row, rendering a failure followed by a success as one
+     * long success. Taking a per-attempt id is what keeps both visible.
+     */
+    const stageId = occurrenceId(`portal:${capability.module}`);
+
+    /**
+     * The dashboard read begins here (Phase 2).
+     *
+     * Opened before the navigation and closed after the extraction, so it spans
+     * the whole slow leg — navigate, resolve, wait for readiness, extract — which
+     * is the part of a run a user is actually waiting on. Reported as ONE stage
+     * rather than four because the phases underneath it are implementation
+     * detail; what a fleet manager needs is that the dashboard is being read and
+     * which module.
+     *
+     * `detail` is the MODULE ID only. The URL is in scope on the line above and
+     * is deliberately not carried: this service's whole error convention is that
+     * nothing it surfaces names a URL, a selector or page content, and a stage is
+     * held to the same rule as a message.
+     */
+    reportStage({
+      id: stageId,
+      kind: "portal_read",
+      status: "active",
+      detail: capability.module,
+    });
+
     // `domcontentloaded`, never `networkidle`: this portal holds map tiles and
     // polling open, so idle may arrive late or never (the same finding that
     // shaped the authenticator's probe). Readiness is asserted below, against
@@ -619,7 +653,21 @@ async function readModule(
     }
 
     stopIfCancelled();
-    return await capability.read(page, request);
+
+    const data = await capability.read(page, request);
+
+    // Closed only past every phase and past Zod validation, so it reports a
+    // module that was genuinely read rather than one that was reached. Any
+    // failure above leaves the stage `active`, which is how the timeline shows
+    // where the run stopped.
+    reportStage({
+      id: stageId,
+      kind: "portal_read",
+      status: "ok",
+      detail: capability.module,
+    });
+
+    return data;
   } finally {
     // The context is closed by the Session Manager; the page is this
     // function's to release, and a close failure must not mask a real error.

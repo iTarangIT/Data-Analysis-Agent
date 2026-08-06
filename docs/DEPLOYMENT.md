@@ -78,6 +78,32 @@ touches a build stage.
 `PORT`, `NODE_ENV` and `HOSTNAME` are handled by Railway and the image. Do not
 set them manually.
 
+### Reverse geocoding (Phase 3) — every variable is optional
+
+Location cards show a human-readable address above the coordinate. **Set nothing
+and it works**: the whole schema is defaulted and validated lazily, so a missing
+or malformed value degrades to the default and can never fail a boot, a build or
+an answer. If the provider is unreachable the card shows the coordinate exactly
+as it did before the feature existed.
+
+| Variable | Value | Secret | Notes |
+|---|---|---|---|
+| `GEOCODING_ENABLED` | `true` | | Set `false` to switch the feature off entirely. Cards then show coordinates only. |
+| `GEOCODING_BASE_URL` | `https://api.bigdatacloud.net` | | Provider origin. This is the default; override only to point at a different host. |
+| `GEOCODING_API_KEY` | BigDataCloud key | ✅ | **Optional but recommended in production.** Absent → the keyless `/data/reverse-geocode-client` endpoint. Present → `/data/reverse-geocode`, the endpoint BigDataCloud designates for server-to-server use. Same response either way, so this changes one URL and nothing else. Free, no card. |
+| `GEOCODING_CONTACT` | `ops@yourdomain` | | Embedded in the `User-Agent`. Not required by this provider; a contactable caller gets a warning rather than a block. |
+| `GEOCODING_TIMEOUT_MS` | `4000` | | Ceiling for one provider call. Nothing waits on it — the report has already rendered. |
+| `GEOCODING_MIN_INTERVAL_MS` | `250` | | Minimum gap between provider calls. |
+
+> **Privacy.** Reverse geocoding sends vehicle positions to the configured
+> endpoint. That is inherent to the feature, not to this provider.
+> `GEOCODING_ENABLED=false` removes it.
+>
+> **Why not Nominatim.** OpenStreetMap's public instance returns
+> `HTTP 403 Access denied` to data-centre IPs — measured, and the condition a
+> Railway deployment meets. BigDataCloud was the only compared provider that
+> answers a data-centre IP with no credential.
+
 ---
 
 ## 4. Railway setup, in order
