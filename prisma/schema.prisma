@@ -30,6 +30,94 @@ datasource db {
   provider = "postgresql"
 }
 
+/// The four preferences a user may store (SAD §7, Phase 4E).
+///
+/// A DATABASE-LEVEL closed vocabulary, deliberately. Adding a kind then costs a
+/// migration, which is the right amount of friction: a new kind is an
+/// architectural decision that amends §7, not a value someone adds in passing.
+///
+/// Every member is a PREFERENCE — something the user chose. None is a
+/// measurement, and there is no member under which one could be filed.
+enum MemoryKind {
+  preferred_vehicle
+  preferred_metric
+  default_window_days
+  report_style
+
+  @@map("memory_kind")
+}
+
+/// How a stored preference came to be.
+///
+/// Both members mean A PERSON DECIDED: `user_stated` is one they set outright,
+/// `user_confirmed` one the system proposed and they accepted. There is
+/// deliberately NO `inferred` member — the agent never writes memory (CLAUDE.md
+/// rule 7), so a model-generated preference is unrepresentable rather than
+/// merely discouraged.
+enum MemorySource {
+  user_stated
+  user_confirmed
+
+  @@map("memory_source")
+}
+
+/// Long-term memory — durable, user-owned context (SAD §7, Phase 4E).
+///
+/// The FIRST table in this schema that is not imported telemetry, and therefore
+/// the first the application itself writes.
+///
+/// ## What it may hold, and what it may never hold
+///
+/// Preferences only: which vehicle a user usually asks about, which metric,
+/// what period, how they like answers written. NEVER a measurement — no state
+/// of charge, state of health, temperature, location, speed or fleet count.
+/// PostgreSQL's telemetry tables and the Intellicar portal remain the
+/// authoritative sources, and a stored reading would be a fourth source class
+/// the reconciliation engine knows nothing about: no provenance, no honest
+/// measuredAt, and nothing for precedence to adjudicate. A stale preference is a
+/// default the next message overrides; a stale measurement is a wrong number
+/// presented as a fact.
+///
+/// ## ownerId
+///
+/// Mandatory, with NO database default, so a row without an owner cannot exist
+/// even by mistake. It is the application user id derived server-side from the
+/// sealed session cookie (Phase 4D) — never a value any client supplied.
+///
+/// Deliberately NOT a foreign key: there is no User table, because application
+/// users live in APP_USERS (SAD §10). A plain String means this model does not
+/// depend on where users are stored, so moving them into a table later is an
+/// additive migration that adds a relation and changes no query.
+///
+/// ## @@unique([ownerId, kind]) — one value per preference per user
+///
+/// This single constraint IS the update-and-conflict policy. Setting a
+/// preference REPLACES that user's existing value for that kind; there is no
+/// history, no second row, and no read-time reconciliation, because two
+/// conflicting values are unrepresentable rather than resolved. That is the
+/// opposite of the Analysis Engine's problem, which must reconcile precisely
+/// because it has two independent sources; memory has exactly one — the user.
+///
+/// It also serves every query: a lookup by owner uses the index's leading
+/// column, so no separate index on owner_id is needed.
+model MemoryEntry {
+  id      BigInt       @id @default(autoincrement())
+  ownerId String       @map("owner_id")
+  kind    MemoryKind
+  /// Shape decided by `kind`, validated by Zod on write AND on read. jsonb
+  /// rather than four nullable typed columns, which would be three nulls per
+  /// row plus a constraint keeping them consistent with `kind` — the same
+  /// "mostly nulls" argument that keeps the three telemetry tables separate.
+  value   Json         @db.JsonB
+  source  MemorySource
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([ownerId, kind])
+  @@map("memory_entries")
+}
+
 /// Vehicle dimension — the shared join key for all three telemetry tables.
 /// `vehicle_no` is the fleet identifier carried by every dataset
 /// (format TK-#####-##@@-######, uniform across all 300 sample rows). It is

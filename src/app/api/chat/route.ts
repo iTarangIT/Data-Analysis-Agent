@@ -3,10 +3,17 @@ import { randomUUID } from "node:crypto";
 import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import { z } from "zod";
 
-import { AGENT_RECURSION_LIMIT, getAgent } from "@/agent/agent";
+import { AGENT_RECURSION_LIMIT, RUN_CONTEXT_KEY, getAgent } from "@/agent/agent";
+import type { RunContext } from "@/agent/prompts";
 import { parseToolEnvelope } from "@/agent/tool-registry";
+import { isAppAuthEnabled } from "@/lib/env";
+import { MAX_MESSAGE_CHARS, boundHistory } from "@/lib/history";
 import { childLogger } from "@/lib/logger";
 import { reportStage, withRunProgress } from "@/lib/run-progress";
+import { METRIC_PATTERN, VEHICLE_NO_PATTERN } from "@/lib/turn-context";
+import { getAppPrincipal } from "@/services/identity/principal";
+import { getPreferences } from "@/services/memory/memory.service";
+import { isEmptyPreferences } from "@/types/memory";
 import type { ChatStreamFrame, SourceAttribution } from "@/types/chat";
 
 /**
@@ -64,15 +71,76 @@ type RunOutcome =
   /** The run threw for a reason that was not cancellation. */
   | "failed";
 
+/**
+ * The client's turn context (Phase 4A) — UNTRUSTED INPUT.
+ *
+ * The browser derives it from the `tool_result` envelopes the stream already
+ * delivered and sends it back with the next question, because there is no
+ * server-side conversation store to hold it in. It therefore arrives with
+ * exactly the trust the `messages` array already has: none. The client could
+ * always have typed a vehicle identifier into a message, so this widens no
+ * boundary — but it does reach the SYSTEM PROMPT, which the messages do not, so
+ * it is bounded here before it can.
+ *
+ * The bound is on SHAPE and CHARACTERS, not on membership: an identifier is
+ * checked against `VEHICLE_NO_PATTERN` and a metric against `METRIC_PATTERN`,
+ * both of which exclude whitespace and punctuation. An injected sentence
+ * therefore cannot be represented as a subject or a metric. Membership is
+ * deliberately not checked here — the Analysis Tool's own enum rejects an
+ * unknown metric and `requireVehicle` rejects an unknown vehicle, so the worst
+ * a surviving value can do is make the model ask about the wrong REAL thing,
+ * visibly, in an answer that always names its subject.
+ */
+const turnContextSchema = z.object({
+  subjects: z
+    .array(
+      z.discriminatedUnion("kind", [
+        z.object({
+          kind: z.literal("vehicle"),
+          vehicleNo: z.string().regex(VEHICLE_NO_PATTERN),
+        }),
+        z.object({ kind: z.literal("fleet") }),
+      ])
+    )
+    .max(3),
+  metrics: z.array(z.string().regex(METRIC_PATTERN)).max(3),
+  window: z
+    .object({ from: z.iso.datetime(), to: z.iso.datetime() })
+    .optional(),
+});
+
 const requestSchema = z.object({
   messages: z
     .array(
       z.object({
         role: z.enum(["user", "assistant"]),
-        content: z.string().min(1),
+        /**
+         * REJECTED above the ceiling, never truncated (Phase 4B).
+         *
+         * `.min(1)` bounded the empty case and nothing else, on a route that
+         * takes an unauthenticated POST — so one pasted file could exceed any
+         * context window in a two-message conversation, independently of how
+         * many messages there are.
+         *
+         * Cutting the text instead would answer a question the user did not
+         * ask. Refusing says so, and the 400 already carries field paths.
+         */
+        content: z.string().min(1).max(MAX_MESSAGE_CHARS),
       })
     )
     .min(1, "At least one message is required"),
+  /**
+   * DEGRADES RATHER THAN FAILS — `.catch(undefined)`, not a bare `.optional()`.
+   *
+   * A malformed context is a hint that did not survive, and a hint must never
+   * be able to fail a question: the run then proceeds with exactly the prompt
+   * it used before Phase 4A. This is the posture Phase 3 already took for
+   * geocoding, where the worst outcome the feature is allowed to have is that a
+   * coordinate stays a coordinate. It also means a browser holding a cached
+   * bundle from a future revision cannot 400 a chat request on a field the
+   * answer does not depend on.
+   */
+  turnContext: turnContextSchema.optional().catch(undefined),
 });
 
 /** Pull display text out of a streamed model chunk. */
@@ -104,6 +172,36 @@ export async function POST(request: Request) {
   const runLog = log.child({ requestId });
   const startedAt = Date.now();
 
+  /**
+   * Application identity (SAD §10, Phase 4D).
+   *
+   * FIRST, before the body is even read: an unauthenticated caller must not be
+   * able to make this endpoint parse anything, open a browser, query telemetry
+   * or spend a single token. That is the whole point of protecting it — this
+   * route drives a live customer portal and a paid model.
+   *
+   * `getAppPrincipal()` returns null immediately when APP_AUTH_ENABLED is
+   * false, without reading a cookie or validating any configuration, so a
+   * deployment that has not enabled authentication follows exactly the path it
+   * followed before Phase 4D.
+   *
+   * The identity is SERVER-DERIVED and there is no other source: it comes from
+   * a cookie this server sealed and just opened. The request body is never
+   * consulted for it, and there is deliberately no header or query parameter
+   * that could name a user — a caller-supplied identity would not be an
+   * identity, it would be a request to be believed.
+   */
+  const principal = await getAppPrincipal();
+
+  if (isAppAuthEnabled() && principal === null) {
+    runLog.warn("Rejected an unauthenticated chat request.");
+
+    return Response.json(
+      { error: "Authentication required." },
+      { status: 401, headers: { [REQUEST_ID_HEADER]: requestId } }
+    );
+  }
+
   const body: unknown = await request.json().catch(() => null);
   const parsed = requestSchema.safeParse(body);
 
@@ -121,11 +219,80 @@ export async function POST(request: Request) {
     );
   }
 
-  const messages = parsed.data.messages.map((message) =>
+  /**
+   * The history bound, applied where it cannot be skipped (Phase 4B).
+   *
+   * The client already applies `boundHistory` to this same array, so for the
+   * Tarang UI this line is a no-op. It is here for everything that is not the
+   * Tarang UI: a browser holding a bundle from before Phase 4B, a script, a
+   * future consumer. The route owns the request, so the route owns the ceiling
+   * — the same argument that already puts the request id, the log record and
+   * the stage scope here.
+   *
+   * It TRIMS rather than rejecting, unlike the per-message ceiling above. The
+   * two differ because the failures differ: an over-long message means the
+   * caller sent something this system will not answer, while an over-long
+   * history means only that a conversation got long, which is not a mistake and
+   * must not 400 a perfectly good question.
+   */
+  const bounded = boundHistory(parsed.data.messages);
+
+  const messages = bounded.map((message) =>
     message.role === "user"
       ? new HumanMessage(message.content)
       : new AIMessage(message.content)
   );
+
+  /**
+   * This run's context (Phase 4A).
+   *
+   * `now` is read HERE, from the instant this request already measures its
+   * duration from, so the run has exactly one clock read and the model is never
+   * told a time the client asserted. Absent entirely when the client sent no
+   * context — a first question, or one whose earlier tool calls all failed —
+   * and that absence is what keeps such a run identical to a pre-Phase-4A one.
+   */
+  /**
+   * The signed-in user's stored preferences (Phase 4E).
+   *
+   * Read BESIDE the agent and before the prompt is built — the position the
+   * approved architecture specifies, and the only one that works: the Planner
+   * is pure and deterministic, so a preference reaching it would mean the same
+   * question no longer plans the same way.
+   *
+   * OWNERSHIP: `principal.userId` is a branded OwnerId minted only by
+   * `principal.ts`, only after opening a sealed cookie this server issued. No
+   * preference can be read for anyone else, because there is no function that
+   * takes anything but an OwnerId.
+   *
+   * NO PRINCIPAL, NO MEMORY. An unauthenticated run — every run while
+   * APP_AUTH_ENABLED is false — skips the query entirely, so a deployment that
+   * has not enabled authentication performs no memory read at all and follows
+   * exactly the path it followed before Phase 4E.
+   */
+  const preferences =
+    principal === null ? undefined : await getPreferences(principal.userId);
+
+  const hasPreferences =
+    preferences !== undefined && !isEmptyPreferences(preferences);
+
+  /**
+   * Built when there is EITHER conversation context or a stored preference.
+   *
+   * Both arms are optional, and when neither is present no `configurable` is
+   * passed at all — so `withRunContext(undefined)` returns SYSTEM_PROMPT
+   * unchanged and the run is byte-identical to a pre-Phase-4A one. A user who
+   * has stored nothing is in exactly that case, which is why Phase 4E needs no
+   * feature flag: an empty table IS the off switch.
+   */
+  const runContext: RunContext | undefined =
+    parsed.data.turnContext || hasPreferences
+      ? {
+          now: new Date(startedAt).toISOString(),
+          ...(parsed.data.turnContext ? { turn: parsed.data.turnContext } : {}),
+          ...(hasPreferences ? { memory: preferences } : {}),
+        }
+      : undefined;
 
   const agent = getAgent();
   const encoder = new TextEncoder();
@@ -197,7 +364,24 @@ export async function POST(request: Request) {
 
       let outcome: RunOutcome = "failed";
 
-      runLog.info({ messageCount: messages.length }, "Agent run started.");
+      // Whether a context arrived, never what was in it. Its subjects and
+      // metrics are tool PARAMETERS by another route, and this file's log policy
+      // already declines to record those.
+      runLog.info(
+        {
+          messageCount: messages.length,
+          // How many turns the bound dropped. A COUNT, never the content — and
+          // zero for every request from a client that applied the same bound,
+          // so a non-zero value here identifies a consumer that did not.
+          historyDropped: parsed.data.messages.length - bounded.length,
+          runContext: runContext !== undefined,
+          // Whether preferences were applied, never which. A preferred vehicle
+          // is a tool parameter by another name, and this file already declines
+          // to log those.
+          memory: hasPreferences,
+        },
+        "Agent run started."
+      );
 
       try {
         /**
@@ -219,7 +403,20 @@ export async function POST(request: Request) {
           async () => {
             const events = agent.streamEvents(
               { messages },
-              { version: "v2", recursionLimit: AGENT_RECURSION_LIMIT, signal }
+              {
+                version: "v2",
+                recursionLimit: AGENT_RECURSION_LIMIT,
+                signal,
+                // Spread conditionally, exactly as the envelope's optional
+                // members are, so a run without context passes the identical
+                // options object it has always passed. The agent's prompt
+                // function is the only reader; nothing between here and it —
+                // the graph, the registry, a tool, a service — looks at this
+                // key or knows it exists.
+                ...(runContext
+                  ? { configurable: { [RUN_CONTEXT_KEY]: runContext } }
+                  : {}),
+              }
             );
 
             for await (const event of events) {

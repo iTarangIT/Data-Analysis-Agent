@@ -9,6 +9,75 @@ export interface ChatMessage {
   content: string;
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Turn context (Phase 4A — short-term run context)                          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * What an earlier turn was ABOUT. Never what it measured.
+ *
+ * The same two-arm shape the Analysis Engine's `AnalysisSubject` uses, restated
+ * here for the same reason `ContributingSource.sourceClass` is: this module is
+ * the contract between the Route Handler and a CLIENT component, and importing
+ * the engine's types would pull server code into the browser bundle.
+ *
+ * The fleet arm carries no identifier because this deployment has no fleet to
+ * name — the planner already records why.
+ */
+export type TurnSubject =
+  | { kind: "vehicle"; vehicleNo: string }
+  | { kind: "fleet" };
+
+/**
+ * SHORT-TERM RUN CONTEXT — what earlier turns asked about (Phase 4A).
+ *
+ * ## The one rule that defines this type
+ *
+ * IT RECORDS QUESTIONS, NEVER ANSWERS. There is no state of charge here, no
+ * state of health, no temperature, no location, no speed and no count — and
+ * there is no field one could be put in. That is not a convention this type
+ * asks callers to respect; every field below is a subject, a metric NAME or a
+ * period, so a measurement is unrepresentable.
+ *
+ * The reason is the grounding contract (SAD §6). A value that reached the model
+ * without a tool envelope behind it is a number the Sources block cannot
+ * account for, and the whole architecture exists to make that impossible. This
+ * type exists so "that vehicle" resolves — not so a number can be remembered.
+ *
+ * ## Derived from envelopes, never from prose
+ *
+ * Built only from `ToolEnvelope.source` of tool calls that ACTUALLY EXECUTED
+ * (`src/lib/turn-context.ts`), which is the same construction that makes the
+ * Sources block impossible to fabricate. Nothing here is read out of what the
+ * model wrote.
+ *
+ * ## It travels UP the wire
+ *
+ * Unlike every other type in this file, this one goes from the browser to
+ * `/api/chat` in the REQUEST BODY. The streaming protocol below is untouched:
+ * `tool_result` already carries every envelope to the client, so the client can
+ * derive this itself and no new frame is needed. It is therefore UNTRUSTED
+ * INPUT, re-validated in the route against bounded shapes before it can reach a
+ * prompt — see `VEHICLE_NO_PATTERN` and `METRIC_PATTERN`.
+ *
+ * ## Why "last" is index 0 rather than its own field
+ *
+ * `lastSubject` beside `recentSubjects` would be one value with two homes and a
+ * second thing to keep in step — the judgement this codebase already records
+ * when it declines to put a `population` field beside the `Aggregation` that
+ * carries the same number. The arrays are MOST-RECENT-FIRST, so element 0 IS
+ * the last one, and the prompt renderer is what gives the two positions their
+ * different words.
+ */
+export interface TurnContext {
+  /** Distinct subjects, most-recent-first. Element 0 is the last one asked about. */
+  subjects: TurnSubject[];
+  /** Distinct metric NAMES, most-recent-first. Element 0 is the last one requested. */
+  metrics: string[];
+  /** The most recent absolute period analysed. Absent when no derivation ran. */
+  window?: { from: string; to: string };
+}
+
 /**
  * One source that took part in producing a result (Milestone 5D-4).
  *

@@ -49,7 +49,7 @@ The intent of the original architecture is preserved — one agent, a small set 
 | ORM                 | Prisma                                   | Type-safe data access and migrations                                                |
 | Database            | PostgreSQL                               | Telemetry, app data, memory, audit                                                  |
 | Validation          | Zod                                      | Tool schemas, API input, environment validation                                     |
-| Authentication      | Clerk                                    | Application user authentication (Auth.js documented as the self-hosted alternative) |
+| Authentication      | Custom sealed-cookie sessions (Phase 4D) | Application user authentication. NOT Clerk and NOT Auth.js — see §10 |
 | Background jobs     | Inngest                                  | Scheduled sync, session refresh, retries                                            |
 | Reports             | Markdown + PDF (rendered via Playwright) | Business output                                                                     |
 | Observability       | LangSmith                                | Agent tracing and monitoring                                                        |
@@ -63,7 +63,7 @@ The intent of the original architecture is preserved — one agent, a small set 
 
 *Figure 1 — Request path through the single Next.js application to external systems*
 
-A user's question enters the React 19 chat interface, passes Clerk's authentication middleware, and posts to the /api/chat Route Handler. The handler runs on the Node.js runtime and streams tokens back to the browser while the LangChain JS agent works. The agent reasons over the request, selects tools from the Tool Registry, and delegates every real-world side effect — scraping, database reads, report generation — to the service layer. Playwright reaches Intellicar, Prisma reaches PostgreSQL, every agent run is traced to LangSmith, and Inngest executes scheduled and background work through the same codebase. Everything ships as one long-lived Node.js process.
+A user's question enters the React 19 chat interface, passes the application session check in the Route Handler (Phase 4D — there is no middleware), and posts to the /api/chat Route Handler. The handler runs on the Node.js runtime and streams tokens back to the browser while the LangChain JS agent works. The agent reasons over the request, selects tools from the Tool Registry, and delegates every real-world side effect — scraping, database reads, report generation — to the service layer. Playwright reaches Intellicar, Prisma reaches PostgreSQL, every agent run is traced to LangSmith, and Inngest executes scheduled and background work through the same codebase. Everything ships as one long-lived Node.js process.
 
 ### From two codebases to one
 
@@ -100,9 +100,9 @@ Tarang remains a single agent. It is built with LangChain JS using the modern to
 
 The agent is responsible for:
 
-- Prompt management — versioned system and tool prompts kept in src/agent/prompts.ts.
+- Prompt management — versioned system and tool prompts kept in src/agent/prompts.ts. Currently SYSTEM_PROMPT_VERSION 1.3.0. As of Phase 4A the prompt is assembled by a FUNCTION of the run's state and config rather than being a fixed string, which is how a singleton agent carries per-run context; with no context it produces the fixed string unchanged.
 
-- Conversation memory — loaded and persisted through the Memory Manager (Section 7).
+- Conversation memory — short-term only. The transcript is held by the browser and resent per request, bounded by Phase 4B; structured references arrive as the Phase 4A run context. There is no Memory Manager and no long-term memory (Section 7).
 
 - Tool selection — LLM tool-calling against the Zod schemas published by the Tool Registry.
 
@@ -153,6 +153,154 @@ This enforces the project's computed-only rule: metrics originate from tool outp
 
 The Memory Manager separates two kinds of memory with different lifetimes, storage and rules.
 
+### Implementation status — read this before the tables below
+
+The two tables in this section are the DESIGN TARGET, not a description of the running system. As of Phase 4B:
+
+| Capability | Status | Where it actually lives |
+|---|---|---|
+| Short-term conversation turns | **Built** (Phase 4A / 4B) | Held by the BROWSER and resent per request; never persisted. See §15 "Short-term run context". |
+| Short-term structured references | **Built** (Phase 4A) | `TurnContext`, derived from tool envelopes; injected into the system prompt for one run. |
+| Reasoning state / intermediate tool outputs | **Built** | In-process LangGraph state, discarded when the run completes. There is no checkpointer. |
+| **Long-term memory (per user)** | **BUILT** (Phase 4E) | `MemoryEntry` table + `src/services/memory/`. Four preference kinds, owner-scoped. |
+
+**Long-term memory is implemented as of Phase 4E**, and its prerequisite — a verified application identity — arrived in Phase 4D (§10). Everything below describes what the code does today; anything still planned is marked as such.
+
+The `Conversation` and `Message` models of §12 remain UNBUILT: conversation transcripts are still held by the browser (Phase 4A/4B) and are not persisted. `UserMemory` was superseded by `MemoryEntry`, described below.
+
+### Long-term memory — BUILT (Phase 4E)
+
+Durable, user-owned context that survives across conversations. **It never replaces telemetry**: PostgreSQL's telemetry tables and the Intellicar portal remain the authoritative sources for every operational number, and memory stores no measurement of any kind.
+
+#### The model
+
+`MemoryEntry` — `prisma/schema.prisma`, migration `20260809162449_add_memory_entries`.
+
+| Field | Notes |
+|---|---|
+| `id` | `BigInt`, autoincrement. Never exposed by the API — it does not survive `JSON.stringify`, and `(ownerId, kind)` already identifies a row. |
+| `ownerId` | **Mandatory, no database default.** The application user id, derived server-side from the sealed session cookie (§10). Not a foreign key: there is no `User` table, users live in `APP_USERS`. |
+| `kind` | Postgres enum `memory_kind`. |
+| `value` | `jsonb`, shape decided by `kind`, Zod-validated on write AND on read. |
+| `source` | Postgres enum `memory_source`. |
+| `createdAt` / `updatedAt` | `timestamptz(3)`, matching every other model. |
+
+**Approved kinds, and only these four:** `preferred_vehicle`, `preferred_metric`, `default_window_days`, `report_style`.
+
+**Approved sources, and only these two:** `user_stated` (the user set it outright) and `user_confirmed` (the system proposed, the user accepted). There is deliberately **no `inferred`** — the agent never writes memory, so a model-generated preference has no member to be filed under.
+
+#### Uniqueness — `@@unique([ownerId, kind])`
+
+**One value per preference kind per user.** This single constraint IS the update-and-conflict policy: setting a preference REPLACES that user's existing value for that kind. There is no history, no second row and no read-time reconciliation, because two conflicting values are unrepresentable rather than resolved.
+
+That is deliberately the opposite of the Analysis Engine's problem. The engine must reconcile because it has two independent sources with their own measurement times; memory has exactly one source — the user — so there is nothing to adjudicate. A user who contradicts themselves has changed their mind, and the later statement wins.
+
+#### What memory may and may not hold
+
+**MAY:** a preferred vehicle, a preferred metric, a default window, a reporting style — stable, user-authored, non-authoritative.
+
+**MAY NOT, and cannot:** state of health, state of charge, temperature, location, speed, fleet counts, telemetry readings, tool results, portal data, transient reasoning, model-generated claims or session state. There is no field any of them could occupy, the value schemas are `.strict()` so an unknown key is REFUSED rather than silently dropped, and there is **no free-text kind in v1** — which is what makes an injected sentence unstorable.
+
+A stale preference is a default the next message overrides. A stale measurement would be a wrong number presented as a fact, and would additionally be a source class the reconciliation engine knows nothing about: no provenance, no honest `measuredAt`, nothing for precedence to select between.
+
+#### The Memory Service — `src/services/memory/memory.service.ts`
+
+The only module that touches `prisma.memoryEntry`, which makes the isolation boundary reviewable with one grep. It owns list/read, create/update (upsert) and delete, and nothing else: it resolves no telemetry, calls no tool, reaches no Portal Service, Analysis Engine, Planner or Session Manager, and performs no authentication of its own.
+
+**Ownership is enforced by the compiler, not by discipline.** Every function takes `OwnerId` as its first parameter, and `OwnerId` is a branded type whose only constructor lives in `principal.ts`, reached only after a sealed cookie has been opened and found current. So there is no zero-argument "list all memory", a client-supplied string cannot be passed as an owner (`OwnerId` is assignable to `string` but never from one), and no principal means no call — anonymous persistence is unreachable rather than merely forbidden. Every query additionally carries `ownerId` in its `WHERE`, so the database enforces what the types already do.
+
+#### Creation policy — THE AGENT NEVER WRITES MEMORY
+
+Writes happen only through `PUT`/`DELETE /api/memory` on an authenticated request: a deliberate user action, outside the agent loop. There is no memory tool, no registry entry and no prompt text describing the route, so **prompt injection has no write primitive at all** — the same argument §19 makes for why authentication is an internal service and never a tool. Level 1's four-tool ceiling is untouched.
+
+There is no automatic extraction, and no parsing of model output into memory.
+
+**Not built, deliberately:** a memory management UI. `/api/memory` is the approved route surface; a preferences screen is a later decision.
+
+#### Retrieval
+
+Read in `/api/chat`, **beside the agent and before the prompt is built** — never inside the Planner, which is pure and deterministic and whose reproducibility a preference would destroy.
+
+```
+Authenticated request -> principal -> getPreferences(ownerId)
+                                          |
+                                          v  configurable (the Phase 4A seam)
+                                    prompt function -> Agent
+                                          |
+        Planner -> Tools -> Analysis Engine -> Portal -> Report
+        (none of these know memory exists)
+```
+
+It reuses the **existing** `configurable` + prompt-function seam, so no new mechanism was added and **`ChatStreamFrame` is unchanged** — memory is not a frame, and is never sent as a `tool_result`, because it is user preference and not evidence. `MEMORY_ZONE` forbids the Planner, Analysis Engine, Tool Registry, tools, Portal Service, Session Manager and telemetry services from importing it.
+
+The prompt block states, before any value: these are settings the user chose, they are not measurements, they fill a gap rather than override the question, and a preferred vehicle is a SUBJECT and never a value — the tool is still called for every number.
+
+**No feature flag, and none is needed.** With no rows the block renders nothing and the prompt is byte-identical to Phase 4A's; with no authenticated principal the query is not even issued. An empty table IS the off switch, which is why §19's objection to a meaningless flag applied here too.
+
+#### Write-time validation — shape at the service, EXISTENCE at the route (Phase 4F)
+
+Phase 4E bounded the **characters** of a stored value, not its **membership**. `preferred_vehicle` accepted any identifier-shaped string and `preferred_metric` any lower-case token, so `{"vehicleNo":"SOH-92.5-percent"}` was storable: it could never become a *cited* number, because the Sources block is built mechanically from tool envelopes, but it persisted across sessions and rendered as a labelled line in a system prompt. That is a longer life than the Phase 4A run context the bound was borrowed from, so the trade no longer holds.
+
+Validation is therefore **split across two layers**, and the split is structural rather than stylistic:
+
+| Layer | Validates | Why there |
+|---|---|---|
+| `memory.service.ts` | **Shape.** `.strict()` Zod per kind, on write and again on read. | It is the only module that may touch `prisma.memoryEntry`, so shape has exactly one home. |
+| `/api/memory` `PUT` | **Existence.** `preferred_vehicle` must name a row in `vehicles`; `preferred_metric` must be a member of `QUANTITIES`. | `MEMORY_ZONE` forbids the memory service from importing the Database Service, the Portal Service or the Analysis Engine — *"a preference that could read them would be the first step toward one that caches them"*. The zone's own comment already prescribes this: **if a stored value needs checking against the fleet, the ROUTE does it and hands memory an already-validated value.** |
+
+A nonexistent reference is a **400** that names what was rejected, distinct from the 400 a malformed value gets. `default_window_days` and `report_style` name nothing outside themselves, so the service's schema is the whole of their validation. The check costs one `findUnique` on the vehicle dimension and an array membership test — no telemetry row is read and no portal call is made.
+
+#### What the prompt block may and may not do (Phase 4F)
+
+Phase 4E's block listed what was stored and stopped there, which left the model an **open world**. Asked about "my preferred battery" — not a preference this system has, can store, or will ever store — it had no rule to meet, so it answered from the nearest listed neighbour and reported the user's preferred *vehicle*. Retrieval was correct; the prompt simply never said the four kinds are all there are.
+
+`SYSTEM_PROMPT_VERSION` **1.5.0** closes it. The block now states that the vocabulary is CLOSED and exhaustive, that one preference may never be read as another, that a preference which is not listed must be reported as **not stored** rather than substituted, that no further preference may be inferred from the ones shown, and that every measurement still comes from the tool that produces it.
+
+`report_style` is also no longer rendered as a bare `Preferred answer style: detailed` line underneath a Style section that says "keep it brief" — two live instructions with no rule for choosing. It is rendered as an explicit amendment to that section instead, and the three cases are deterministic:
+
+| Stored | Effect |
+|---|---|
+| *(absent)* | The base Style section stands unchanged. No style block is emitted at all. |
+| `brief` | The block **confirms** the Style section: lead with the number, stop there. |
+| `detailed` | The block **replaces** "keep it brief" and says so. Every other rule in the Style section still holds. |
+
+The 1.2.0 guarantee is untouched: a run with neither context nor stored preferences still produces `SYSTEM_PROMPT` byte for byte, and `scripts/memory-check.ts` asserts it.
+
+#### Known limitation — `ownerId` is a mutable username
+
+`ownerId` is the `APP_USERS` record name, not a stable immutable id. Rows survive a user being removed from `APP_USERS`, so **re-minting a user with a name that was used before makes the new user inherit the old one's stored preferences.** Nothing in the type system prevents it: the brand guarantees the id came from a verified session, not that the id refers to the same person over time.
+
+Until application users move into a table, **an `APP_USERS` name must be treated as permanent and never reused.** The upgrade path is the one §10 already records — a `User` table replaces the parser in `users.ts`, `ownerId` becomes a surrogate key, and no query changes.
+
+#### Lifecycle
+
+| Stage | Behaviour |
+|---|---|
+| Created | Only by an authenticated user action via `/api/memory`. |
+| Retrieved | One owner-scoped query per authenticated chat request. |
+| Updated | Upsert on `(ownerId, kind)` — replaces, never accumulates. |
+| Stale | Validated on read; a value that no longer parses degrades to "no preference" rather than reaching a prompt. |
+| Deleted | Hard delete, idempotent: one kind via `?kind=`, or all of a user's entries. No soft delete — a soft-deleted preference that still matched a query would be a leak. |
+
+#### Security summary
+
+| Requirement | How |
+|---|---|
+| Authenticated principal required | `getAppPrincipal()`; 401 otherwise, on every verb |
+| `ownerId` server-derived only | Branded `OwnerId`, minted only in `principal.ts` from the sealed cookie |
+| Client cannot supply `ownerId` | No such request field; a `string` is not assignable to `OwnerId` |
+| Reads/updates/deletes scoped | `ownerId` in every `WHERE`, and in the upsert's compound key |
+| No anonymous persistence | No principal means no `OwnerId` means no call |
+| No model-generated writes | No memory tool exists; the agent has no path to the route |
+| No telemetry stored | Four preference kinds, `.strict()` values, no free text |
+| No cross-user retrieval | No function returns memory without an `OwnerId` argument |
+
+#### Migration and deployment
+
+Local migration `20260809162449_add_memory_entries` is purely additive: two `CREATE TYPE`, one `CREATE TABLE`, one `CREATE UNIQUE INDEX`. No existing table is altered and no data is moved, so applying it cannot change any existing answer.
+
+**Production migration on Railway remains a MANUAL step and was not performed.** `docker-entrypoint.sh` deliberately runs no migrations ("no migrations, no schema push"), so deploying this code without running the migration leaves the table absent — memory reads would then fail while every telemetry answer continues to work.
+
 ### Short-term memory (per conversation)
 
 | **Holds**                         | **Storage**                                              |
@@ -162,15 +310,17 @@ The Memory Manager separates two kinds of memory with different lifetimes, stora
 | Intermediate tool outputs         | In-process; large payloads truncated before re-prompting |
 | Temporary execution context       | In-process; discarded when the run completes             |
 
-### Long-term memory (per user)
+### Long-term memory (per user) — the ORIGINAL sketch, superseded
 
-| **Holds**                                     | **Storage**                                       |
-|-----------------------------------------------|---------------------------------------------------|
-| Preferred fleet and preferred dashboard       | UserMemory table, injected into the system prompt |
-| User preferences (units, report format, tone) | UserMemory / UserSettings tables                  |
-| Previous reports (index and summaries)        | Report table metadata                             |
-| Frequently asked questions                    | UserMemory table                                  |
-| Business context supplied by the user         | UserMemory table                                  |
+The table below was the v3.1 design target. Phase 4E built a deliberately smaller thing; what shipped is described in "Long-term memory — BUILT (Phase 4E)" above, and the differences are decisions rather than omissions.
+
+| **Holds**                                     | **Original storage**                              | **As built** |
+|-----------------------------------------------|---------------------------------------------------|---|
+| Preferred fleet and preferred dashboard       | UserMemory table, injected into the system prompt | **Dropped.** This deployment is single-fleet — Fleet Overview reports `fleet: null` — so a preferred fleet is a field with nothing to put in it. `preferred_vehicle` covers the real need. |
+| User preferences (units, report format, tone) | UserMemory / UserSettings tables                  | **Built**, as `report_style`, `preferred_metric` and `default_window_days`. |
+| Previous reports (index and summaries)        | Report table metadata                             | **Not built** — the Report Service does not exist yet. |
+| Frequently asked questions                    | UserMemory table                                  | **Dropped.** That is usage analytics, not memory. |
+| Business context supplied by the user         | UserMemory table                                  | **Deferred.** Free text is the prompt-injection carrier and the poisoning vector; v1 has no free-text kind. |
 
 ### What memory must never store
 
@@ -230,7 +380,40 @@ The Credential Manager is the only component that can read Intellicar credential
 
 ### Two authentication domains
 
-Tarang deliberately separates two unrelated concerns. Clerk answers 'who may use Tarang' — it protects the chat UI, Route Handlers and Server Actions via middleware, and its user ID keys all per-user data. The Credential Manager and Session Manager answer 'how Tarang reaches Intellicar'. The two never mix: Clerk knows nothing about Intellicar, and Intellicar credentials never touch the app-authentication layer.
+Tarang deliberately separates two unrelated concerns. The **application identity layer** (`src/services/identity/`) answers 'who may use Tarang', and its user id keys all per-user data. The Credential Manager and Session Manager answer 'how Tarang reaches Intellicar'. The two never mix, and `IDENTITY_ZONE` in `eslint.config.mjs` enforces it in both directions.
+
+**As built (Phase 4D) — this is NOT Clerk and NOT Auth.js.** Both were considered and rejected: neither was wanted as a dependency, and Auth.js additionally needs a user store, which would have dragged a Prisma model into a phase that deliberately has none. What exists instead is a small self-hosted session mechanism with **zero new dependencies**:
+
+| Piece | What it is |
+|---|---|
+| Session token | An **AES-256-GCM sealed** cookie — `tarang_session`, `HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` in production. Sealed rather than merely signed, so it is opaque to the client as well as tamper-evident. |
+| Crypto | The existing `src/services/credentials/crypto.ts`, unchanged. Its purpose-bound AAD (`tarang.app-session.v1`) means an application session can never be opened as a stored Intellicar session, or the reverse — the second caller that module's header was written for. |
+| Users | `APP_USERS`, as `name:scrypt.N.r.p.salt.hash` records separated by `;`. Verified with scrypt and `timingSafeEqual`; an unknown user still pays for one derivation against a decoy hash, so the endpoint is not a timing oracle. A plaintext secret is rejected at parse time, never compared. Mint a record with `npm run app:user -- <name>`; a hash cannot be written by hand. |
+| **Hash separator — `.`, not `$`** | The fields inside a hash are **dot-delimited**, which is deliberate and is the one place this format departs from every other scrypt/PHC string. `.env` files interpolate, and `@next/env` expanded each `$…` segment to nothing — a correct record on disk reached the application gutted, and every sign-in failed as "invalid username or password". `HASH_SEPARATOR` in `users.ts` carries the same warning. Do not "correct" it. |
+| Expiry | `exp` is sealed INSIDE the payload and checked server-side. The cookie's own `Max-Age` is advisory. |
+| Modules | `app-session.ts` (seal/read/clear), `principal.ts` (the only place an identity enters the system), `users.ts` (credential verification). |
+| Config | `APP_AUTH_ENABLED` (default **false**), `APP_SESSION_KEY` (deliberately separate from `CREDENTIAL_ENCRYPTION_KEY` — different blast radius), `APP_USERS`, `APP_SESSION_TTL_HOURS` (default 12). A fourth lazy env schema, so an unconfigured deployment still boots and answers telemetry questions. |
+| Enforcement | At the ROUTE, before the body is read. **There is no `middleware.ts`.** |
+
+Users in the environment is the same trade §19 already recorded for Intellicar credentials, with the same upgrade path: a `User` table replaces the parser in `users.ts` and no caller changes. The known limits are explicit — no self-service signup, no password reset, no MFA, adding a user needs a redeploy, and sessions are **stateless**, so signing out clears the browser's cookie but cannot revoke a copy of it before `exp`. A user id is also not permanent; see "Known limitation — `ownerId` is a mutable username" in §7.
+
+### Sign-in and sign-out in the UI (Phase 4F)
+
+Phase 4D shipped `/sign-in` and `POST /api/auth/logout` with **nothing linking to either**: a user had to type the path by hand, and once signed in had no way to sign out. Phase 4F adds the affordance and **no new authentication mechanism** — no endpoint, no client-side session state, no second source of identity.
+
+The obstacle is that the cookie is `HttpOnly`, so a Client Component cannot tell whether anyone is signed in. The fix is a split, not a new API:
+
+| Piece | Role |
+|---|---|
+| `src/app/page.tsx` | Now a **Server Component**. Calls the existing `isAppAuthEnabled()` and `getAppPrincipal()`, and passes down two props: `authEnabled` and `userId`. Nothing else crosses — not the cookie, not the sealed payload, not `issuedAt`/`expiresAt`. |
+| `src/components/chat/ChatSurface.tsx` | The former `page.tsx` body, **streaming logic unchanged**. Renders a `Sign in` link to `/sign-in` when signed out, and a `Logout` button when signed in. |
+
+- **`export const dynamic = "force-dynamic"` on the page is load-bearing.** `getAppPrincipal()` returns null *without touching cookies* when authentication is disabled, so Next has nothing to infer dynamism from on that path and would prerender the page at build time — baking the **builder's** `APP_AUTH_ENABLED` into the image, which on Railway is not the value the container runs with.
+- **Logout is a `POST` to the existing route, then a full navigation** to `/sign-in`. A router push would keep the old cookie on the next request; the sign-in page already documents the same reasoning for the opposite direction.
+- **`APP_AUTH_ENABLED=false` renders neither control.** That deployment is supported and is the default; `/api/auth/login` answers 503 in it, so a Sign in button would lead to a dead end and a Logout button would describe a session that does not exist.
+- **A 401 from `/api/chat` is reported as an ended session**, not as a failed answer. The route's semantics are unchanged — it still answers 401 with `{"error":"Authentication required."}` before reading the body — but the browser now shows *"Your session has ended. Please sign in to continue."* with a Sign in button, instead of rendering that JSON into the transcript. A session can expire inside a long-lived tab, so the client flag that records this also flips the header control from Logout to Sign in; it only ever moves toward "signed out" and never overrides the server the other way.
+
+Still **not built, deliberately**: a memory management UI. `/api/memory` remains the approved surface for reading and writing preferences.
 
 ### First login
 
@@ -300,7 +483,7 @@ PostgreSQL, accessed exclusively through Prisma, is the system of record for eve
 
 | **Model**              | **Purpose**                                                                               |
 |------------------------|-------------------------------------------------------------------------------------------|
-| User / UserSettings    | Application users (linked to the Clerk user ID) and their preferences                     |
+| User / UserSettings    | *Planned.* Application users live in APP_USERS today (§10); preferences are the MemoryEntry table below |
 | CredentialVault        | Encrypted Intellicar credentials: ciphertext, IV, auth tag, key version — never plaintext |
 | PortalSession          | Session metadata only: status, last validated time, storage reference — never raw cookies |
 | Vehicle                | Vehicle / device dimension; the shared join key for all three telemetry tables            |
@@ -308,9 +491,11 @@ PostgreSQL, accessed exclusively through Prisma, is the system of record for eve
 | GpsTelemetry           | Historical position and movement telemetry, typed to the GPS dataset                      |
 | CanTelemetry           | Historical CAN bus telemetry, typed to the CAN dataset                                    |
 | Conversation / Message | Chat threads; the persistence layer for short-term memory                                 |
-| UserMemory             | Long-term memory entries: preferred fleet, dashboard, FAQs, business context              |
+| MemoryEntry            | **BUILT (Phase 4E).** Long-term memory: four preference kinds, one row per (ownerId, kind). Supersedes the UserMemory sketch |
 | Report                 | Generated report metadata and file references                                             |
 | AuditLog               | Security-relevant events: credential and session operations, logins, report access        |
+
+**Built so far:** `Vehicle`, `BatteryTelemetry`, `GpsTelemetry`, `CanTelemetry` and — as of Phase 4E — `MemoryEntry` with its two enums. Every other model in the table above — `User`, `UserSettings`, `CredentialVault`, `PortalSession`, `Conversation`, `Message`, `UserMemory`, `Report`, `AuditLog` — is the target design and does not exist in `prisma/schema.prisma`. In particular there is no `Conversation`/`Message` persistence: short-term conversation state is held by the browser (§7, §15). Long-term memory **is** implemented — as `MemoryEntry`, which superseded the `UserMemory` sketch; see "Long-term memory — BUILT (Phase 4E)" in §7.
 
 Telemetry is modelled as three dataset-shaped tables rather than one generic reading table. The Battery, GPS and CAN datasets carry genuinely different columns, and a single wide table would be mostly nulls and would hide unit and precision differences behind a shared column name. They join through the Vehicle dimension on (vehicleId, recordedAt). Telemetry is loaded manually from files (see docs/DATA-IMPORT.md); there is no seed script.
 
@@ -338,13 +523,13 @@ The Report Service turns analysis results into business documents: executive sum
 
 - Generated files live in the reports/ volume; each report gets a Report row with metadata.
 
-- Downloads are served through /api/reports/\[id\] (Clerk-protected); chat replies link the artifact.
+- Downloads are served through /api/reports/\[id\] (session-protected, per §10); chat replies link the artifact.
 
 ## 15. End-to-End Workflow
 
 | **\#** | **Step**                                                                                                                               |
 |--------|----------------------------------------------------------------------------------------------------------------------------------------|
-| 1      | A Clerk-authenticated user asks a question in natural language in the chat UI                                                          |
+| 1      | A session-authenticated user asks a question in natural language in the chat UI (§10)                                                  |
 | 2      | /api/chat (Node runtime, streaming) validates the request and invokes the agent                                                        |
 | 3      | The Memory Manager loads the conversation thread and long-term user context                                                            |
 | 4      | The agent reasons about what the question needs and selects tools via the Tool Registry                                                |
@@ -448,6 +633,63 @@ Both return the same payload, so switching changes one URL and nothing else: no 
 
 > **Privacy.** Reverse geocoding sends vehicle positions to whatever endpoint is configured. That is inherent to the feature rather than a property of this provider. `GEOCODING_ENABLED=false` removes it, and the UI then shows exactly the coordinates it showed before Phase 3.
 
+### Short-term run context (Phase 4A)
+
+A conversation's durable part is WHAT IT ASKED ABOUT; its disposable part is the prose. Phase 4A separates the two, so that "that vehicle", "its temperature", "the same metric" and "that period" resolve to something specific instead of depending on whether the model happened to write a 20-character identifier into its own answer.
+
+**Derived from executed tool calls, never from prose.** `TurnContext` is built only from `ToolEnvelope.source` of tool calls that actually ran — the same construction that makes the Sources block impossible to fabricate, applied to references instead of citations. `src/lib/turn-context.ts` reads `source.params` (the input a tool was called with, after Zod validation) and `source.method` (the resolved absolute window). **It never opens `envelope.data`.** An envelope carrying `error` is skipped: a failed call establishes nothing, so a rejected vehicle cannot become the next question's default subject.
+
+| Field | Source | Resolves |
+|---|---|---|
+| `subjects[]` | `params.vehicleNo` (analysis) / `params.target` (portal); absent → `{kind:"fleet"}` | "that vehicle", "the other one" |
+| `metrics[]` | `params.metric` (analysis only — a portal module is a source, not a metric) | "the same metric" |
+| `window` | `method.windowFrom` / `method.windowTo`, present only when a derivation ran | "that period" |
+| `now` | added by `/api/chat` from the instant the run already measures from | gives a period reference a referent |
+
+Both lists are MOST-RECENT-FIRST and capped at 3 distinct entries, so element 0 is "the last one" and there is no separate `lastSubject` field — one value with two homes is a second thing to keep in step, the judgement §19 already records for the `population` field beside an `Aggregation`.
+
+**THE CONTEXT NEVER CONTAINS TELEMETRY.** There is no state of charge, state of health, temperature, location, speed, fleet count, tool result payload or portal reading in it, and there is no field one could occupy. This is enforced by what is read rather than by a rule a caller must remember: measurements live in `envelope.data`, and no code path reads it. A value reaching the model without an envelope behind it would be a number the Sources block cannot account for.
+
+**It resolves references; it never answers.** The prompt block states four rules: there are no measurements here · RESOLVE, THEN CALL THE TOOL · the current message always wins · if a reference is ambiguous, ask. A figure reported earlier in a conversation is never a figure that may be reported now — telemetry changes, and the grounding contract admits no exception for a number the model remembers.
+
+**How it reaches the agent, and what it does not touch:**
+
+```
+browser derives from the tool_result envelopes it already holds
+   │  request body `turnContext`   (client → server; NOT the stream protocol)
+   ▼
+/api/chat  ── Zod re-validation ──► adds `now` ──► streamEvents(..., { configurable: { runContext } })
+   ▼
+createReactAgent prompt FUNCTION → [SystemMessage(SYSTEM_PROMPT + block), ...state.messages]
+```
+
+The agent is a process-wide singleton, so nothing per-conversation may be baked in at construction; `prompt` therefore became a function of `(state, config)` and is the ONLY reader of the `configurable` key. The graph, the Tool Registry, every tool, the Analysis Engine, the Planner and every service neither read it nor know it exists. The function returns exactly the shape LangGraph builds for a string prompt, and `withRunContext(undefined)` returns `SYSTEM_PROMPT` itself — so **a run with no context is byte-identical to a pre-Phase-4A run.**
+
+**THE STREAMING PROTOCOL IS UNCHANGED.** `ChatStreamFrame` gained no member and no frame was added. `tool_result` already carried the complete envelope to the browser, and the client already retained every one in `UiMessage.results`, so the context is derived client-side and travels UP the wire in the request body. The server → client NDJSON contract of §15 is untouched, and so is the ignore-unknown-frames rule.
+
+**It is untrusted input**, because the browser sends it. Validation is on SHAPE and CHARACTERS, not membership: an identifier must match `/^[A-Za-z0-9._-]{1,64}$/` and a metric `/^[a-z0-9_]{1,64}$/`, both of which exclude whitespace and punctuation — so an injected sentence cannot be represented as a subject or a metric. Membership is deliberately not checked, because the Analysis Tool's own enum rejects an unknown metric and `requireVehicle` rejects an unknown vehicle; the worst a surviving value can do is make the model ask about the wrong REAL thing, visibly, in an answer that always names its subject. A malformed context DEGRADES to none (`.catch(undefined)`) rather than failing the question — the posture Phase 3 took for geocoding.
+
+`SYSTEM_PROMPT_VERSION` is **1.3.0** as of this phase. The block is appended rather than woven in, and rendered from typed fields in a fixed order, so it is deterministic and two LangSmith traces of the same conversation state stay comparable.
+
+### History bounding (Phase 4B)
+
+A run was bounded in steps (`AGENT_RECURSION_LIMIT`) and in duration (`TOOL_TIMEOUT_MS`) and in NEITHER dimension of size. The whole transcript was resent on every turn, and `content: z.string().min(1)` set no upper bound on a single message. Phase 4B is the third bound, and it closes two independent dimensions.
+
+| Bound | Value | Over the limit |
+|---|---|---|
+| `MAX_HISTORY_MESSAGES` | **20 messages** (ten exchanges) | **TRIMMED** — oldest turns dropped |
+| `MAX_MESSAGE_CHARS` | **16,000 characters** per message | **REJECTED** — HTTP 400 |
+
+**The two responses differ because the failures differ.** An over-long history means only that a conversation got long, which is not a mistake and must never 400 a perfectly good question. An over-long message means the caller sent something this system will not answer — and truncating it would answer a question the user did not ask, which is the same judgement the insufficiency contract already makes when it reports a gap rather than substituting for it.
+
+`boundHistory` (`src/lib/history.ts`, pure) keeps the newest messages and trims the window to START ON A QUESTION, so a retained answer never appears as a reply to a question that is no longer present. It returns its input unchanged below the ceiling, so every short conversation puts byte-identical bytes on the wire. It is applied by the client to the complete array and again by `/api/chat` to the same array with the same function — which makes the route's pass a provable no-op for the Tarang UI and a real ceiling for anything else (a cached bundle, a script, a future consumer). The run log records `historyDropped`, a COUNT and never content, so a non-zero value identifies a consumer that did not apply the bound.
+
+**A window, and deliberately not a summary.** Summarising dropped turns would put MODEL PROSE into the next run's context, where it is indistinguishable from a tool result: "SoH was 87%" would arrive as a fact with no envelope behind it — exactly the fabricated citation §6 exists to prevent. A window drops old turns; it never restates them.
+
+**Phase 4A is what makes 4B safe.** What a dropped turn used to carry that mattered was its SUBJECT, and it carried it only as prose. That is now structured, and derived from every envelope the conversation ever produced rather than from the retained window — so a vehicle asked about forty turns ago still resolves after its prose has been discarded. The two phases are one design: 4A makes the durable part of a conversation structured, and 4B is what lets the disposable part actually be disposed of.
+
+Neither phase adds a dependency, a table, a migration, a tool or a stream frame.
+
 ## 16. Observability, Logging & Configuration
 
 ### LangSmith
@@ -522,13 +764,18 @@ tarang-agent/
 
 │ │ ├── prompts.ts \# System & tool prompts
 
-│ │ ├── tool-registry.ts \# Zod-typed tool catalogue
+│ │ └── tool-registry.ts \# Zod-typed tool catalogue
 
-│ │ └── memory/
+\# NOTE: the memory/ directory below is NOT built. Short-term context lives in
+\# src/lib/turn-context.ts and src/lib/history.ts (Phase 4A/4B) — pure modules,
+\# because src/agent/\*\* may not import src/services/\*\* and the browser needs
+\# them too. Long-term memory is not implemented at all (§7).
+
+│ │ (└── memory/ \# planned; not created
 
 │ │ ├── short-term.ts
 
-│ │ └── long-term.ts
+│ │ └── long-term.ts)
 
 │ ├── tools/
 
@@ -638,6 +885,10 @@ tarang-agent/
 
 │ │ ├── facts.ts \# Tool envelopes -> the fact rows the report renders
 
+│ │ ├── turn-context.ts \# Tool envelopes -> the run's references (Phase 4A); pure
+
+│ │ ├── history.ts \# Conversation window + message ceiling (Phase 4B); pure
+
 │ │ └── langsmith.ts
 
 │ └── types/
@@ -650,7 +901,7 @@ tarang-agent/
 
 ├── reports/ \# Generated output (volume)
 
-├── middleware.ts \# Clerk auth middleware
+\# NOTE: there is NO middleware.ts. Phase 4D protects routes at the route itself.
 
 ├── Dockerfile
 
@@ -667,7 +918,13 @@ tarang-agent/
 | Streaming chat endpoint              | app/api/chat/route.ts                |
 | AI Agent Service                     | src/agent/agent.ts                   |
 | Tool Registry                        | src/agent/tool-registry.ts           |
-| Memory Manager                       | src/agent/memory/                    |
+| Short-term run context (Phase 4A)    | src/lib/turn-context.ts              |
+| Application identity (Phase 4D)      | src/services/identity/               |
+| Memory Service (Phase 4E)            | src/services/memory/memory.service.ts |
+| History bounding (Phase 4B)          | src/lib/history.ts                   |
+| Memory management route (Phase 4E)   | src/app/api/memory/route.ts          |
+| Chat surface / auth controls (4F)    | src/components/chat/ChatSurface.tsx  |
+| Memory verification runner (4F)      | scripts/memory-check.ts              |
 | Portal Service                       | src/services/portal/                 |
 | Session Manager / Playwright Manager | src/services/session/                |
 | Credential Manager                   | src/services/credentials/            |
@@ -686,7 +943,7 @@ tarang-agent/
 
 - Agent isolated from authentication and browsers. Credentials, cookies and storageState are handled by dedicated services the agent cannot reach; a misbehaving or prompt-injected agent cannot leak what it never sees.
 
-- Clerk for application authentication. Fastest production-grade path in the App Router (middleware, prebuilt components, organisation support) with a free tier that comfortably covers an internal team. Auth.js remains the documented alternative if a zero-external-dependency, fully self-hosted setup becomes a requirement — the boundary is one middleware file.
+- ~~Clerk for application authentication.~~ **SUPERSEDED at Phase 4D.** Neither Clerk nor Auth.js was adopted: no external authentication provider was wanted, and Auth.js additionally requires a user store, which would have pulled a Prisma model into a phase built to have none. The review that settled it found the ingredients already present — `crypto.ts` seals and opens with a purpose-bound AAD written for a second caller, Next ships `cookies()`, and Node ships `scrypt` — so a self-hosted sealed-cookie session cost ZERO new dependencies where a provider cost one plus an external service and a paid tier. What was given up is real and recorded in §10: no self-service signup, no password reset, no MFA, and no per-session revocation. For an internal analyst tool with a handful of users that is the right trade; if self-service or revocation becomes a requirement, a `User` table is the next step and the `OwnerId` contract does not change.
 
 - SQL-first analytics in TypeScript replaces Pandas. Battery analytics at Level 1 — degradation trends, cycle counts, utilisation — is aggregation, which PostgreSQL does natively; TypeScript finishes the last mile. A Python analytics worker is deliberately deferred until a genuinely statistical workload appears.
 
@@ -895,6 +1152,30 @@ tarang-agent/
 - Plugin-style tool packaging deferred. Four tools do not justify a plugin framework; the Tool Registry already centralises capability definitions. The packaging question is revisited at Level 2 if the tool count grows.
 
 - Prisma as the data layer. Schema-as-code, generated types shared by tools and services, and migration discipline from day one.
+
+- Short-term context is derived from ENVELOPES, never from prose (Phase 4A). The alternative was to let the model re-read the previous turn's answer for the vehicle it mentioned, which is what it did before this phase — and it works only when the model happened to restate a 20-character identifier. Measured over four A/B trials on a transcript whose first answer did not restate it, the unresolved case called NO tool at all in half of them and stated a fabricated temperature with a fabricated provenance claim; with the context present the tool ran in all four. Deriving from `source.params` of calls that actually executed is the same construction that makes the Sources block impossible to fabricate, and it is why the context carries what a turn ASKED and never what it MEASURED: `envelope.data` is never read, so a measurement has no path into it. The trials are indicative rather than a measured rate — the model is non-deterministic and four is a small sample — and the fabrication itself is pre-existing behaviour under an unresolvable reference, which this phase reduces but does not fix.
+
+- No new stream frame for the run context (Phase 4A). The obvious design emits the context to the browser as a frame. It was not needed: `tool_result` already carries the complete envelope, and the client already retains every one in `UiMessage.results`, so the browser could derive the context itself. The context therefore travels UP the wire in the request body and `ChatStreamFrame` gained no member — which keeps the forward-compatibility rule untested by this phase rather than exercised by it, and leaves every existing consumer byte-identical. A frame would have been the second home for data the protocol already delivers.
+
+- The prompt became a FUNCTION so a singleton agent can carry per-run context (Phase 4A). The agent is built once per process, so a per-conversation value cannot be baked into it at construction; `createReactAgent` accepts `(state, config) => BaseMessageLike[]`, and the route passes the context through `configurable`. The function returns exactly the shape LangGraph builds for a string prompt, and the renderer returns SYSTEM_PROMPT unchanged when there is no context, so a run without one is byte-identical to a pre-4A run. This also keeps the context out of `state.messages`, where it would have been persisted into graph state and replayed as though the user had said it. Nothing between the route and that function reads the key: no tool, no service, no registry.
+
+- A history WINDOW, never a summary (Phase 4B). Summarising dropped turns is the standard move and is rejected on grounding rather than cost: a summary is model prose, and prose re-read on a later turn is indistinguishable from a tool result, so a remembered "87%" would enter the next run's context as a fact with no envelope behind it. A window drops old turns and never restates them. Dropping them is only safe because Phase 4A moved the durable part of a turn — its subject — out of prose and into structured context derived from every envelope the conversation produced, not from the retained window.
+
+- An over-long history is trimmed; an over-long message is refused (Phase 4B). The two failures are not the same failure. A long conversation is not a mistake and must never turn a good question into a 400, so the 20-message window trims silently and idempotently, in the client and again in the route. A 16,000-character message is a caller sending something this system will not answer, and truncating it would answer a question the user did not ask — the same judgement the insufficiency contract already makes when it reports a gap rather than substituting for one. Both ceilings are named constants rather than environment variables, for the reason TOOL_TIMEOUT_MS is: they are architectural budgets, not per-deployment knobs.
+
+- Memory ownership is enforced by the TYPE SYSTEM, not by a code review rule (Phase 4E). Every memory function takes a branded `OwnerId` as its first parameter, and the only constructor lives in `principal.ts`, reached only after a sealed session cookie has been opened and found current. The properties that buys are worth more than the two lines it costs: there is no zero-argument "list all memory" to call by accident, `setMemory(req.body.userId, …)` does not compile because a `string` is not assignable to `OwnerId`, and a run with no principal cannot obtain one — so anonymous persistence is unreachable rather than merely forbidden. The `WHERE ownerId` on every query is the second lock, not the first.
+
+- No feature flag for memory (Phase 4E). §14's earlier sketch put retrieval behind `MEMORY_ENABLED`. It was dropped once the shape was clear: with no rows the prompt block renders nothing and the prompt is byte-identical to Phase 4A's, and with no authenticated principal the query is never issued. AN EMPTY TABLE IS THE OFF SWITCH. Adding a variable that duplicates a state the data already expresses would be the "meaningless flag" this section already refused for the reserved `artifact` frame — one more thing to set, to forget, and to disagree with reality.
+
+- A memory write is an HTTP route, never a tool (Phase 4E). The alternative — a fifth tool letting the model save what it inferred — was rejected twice over: it breaks §6's four-tool ceiling, and it would hand prompt injection a write primitive aimed at the one store that is read back into a future prompt. With writes confined to `/api/memory` on an authenticated request, and no prompt text describing that route, an injected model has no memory write path AT ALL. That is the same argument this section already makes for why authentication is an internal service and never a tool, and it is why memory poisoning is closed by construction rather than by validation.
+
+- Memory value schemas are `.strict()` (Phase 4E). Zod strips unknown keys by default, which is safe — the extra field never reaches a row — but it answers 200 to a request that tried to store something this system does not keep. `{ vehicleNo: "TK-1", soh: 87.5 }` succeeding while silently discarding the reading teaches a caller the wrong thing about what memory is for. Strict mode refuses it instead: a measurement is not merely ignored here, it is rejected.
+
+- The memory BOUNDARY ships before the memory CODE (Phase 4C). Phase 4C adds `MEMORY_ZONE` to eslint.config.mjs and nothing else — no model, no migration, no service, no flag, no directory. A rule whose `files` pattern matches nothing is unusual, and it is the point: this is the one part of the memory design that can be enforced BEFORE the code it constrains exists, so the first line of that code is written against a boundary that already refuses the wrong dependencies rather than one added afterwards, once something has already crossed it. It also costs nothing and can break nothing, which is why it is safe to land years ahead of its subject. The alternative considered was shipping the schema and service behind `MEMORY_ENABLED=false`; it was rejected on this section's own precedent — "a declaration that nothing can reach is not a head start, it is a claim the code does not honour", the judgement already recorded for the reserved `artifact` frame. A dormant table is that claim in the database: a migration to maintain, a flag to remember, and an unreachable path that a later reader may wire up without ever learning why it was dormant. `MEMORY_ENABLED` remains the right ROLLOUT control, in the phase that actually ships memory, rather than a substitute for the identity that is missing.
+
+- An unverifiable identifier is not an owner (Phase 4C). The tempting shortcut is a `localStorage` UUID: it gives every browser a stable id, it needs no login, and memory could ship this week. It is refused because the client SENDS it, so it is an unauthenticated bearer that anyone can copy or forge — `where: { ownerId }` built on it would look like isolation and enforce nothing, which is worse than no memory, because the next reader will believe the boundary is real. `requestId` is not a candidate either: it is minted per request. The consequence is accepted deliberately — memory waits for authentication rather than shipping on a fiction — and it avoids a second trap, because rows written under a browser id would later have to be either claimed by whoever first signs in from that browser (a cross-user leak by construction) or discarded (in which case the feature never worked).
+
+- ~~Long-term memory is deferred until application authentication exists.~~ **RESOLVED at Phase 4E.** The blocker was never effort, it was identity: an owner the server cannot verify is a query parameter rather than an owner, and rows written under a browser id would later have to be either claimed by whoever first signed in from that browser (a cross-user leak by construction) or discarded (in which case the feature never worked). Phase 4D supplied a verified principal — not via Clerk, which was rejected, but via a self-hosted sealed-cookie session (§10) — and Phase 4E then built `MemoryEntry` on top of it with no further identity work. The sequencing is what made the memory slice small: by the time it was written, `OwnerId` already existed and was already unforgeable.
 
 - Long-lived process as a deployment constraint. The browser singleton, session reuse and streaming all assume a persistent Node.js process; Docker (or PM2) keeps that guarantee explicit.
 

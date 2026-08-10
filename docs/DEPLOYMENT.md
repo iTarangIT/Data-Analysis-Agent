@@ -78,6 +78,41 @@ touches a build stage.
 `PORT`, `NODE_ENV` and `HOSTNAME` are handled by Railway and the image. Do not
 set them manually.
 
+### Application authentication (Phase 4D) and long-term memory (Phase 4E)
+
+These four are the **application identity** domain — "who may use Tarang". They
+are not the Intellicar variables above, which answer "how Tarang reaches
+Intellicar"; the two never mix, use different keys, and are validated by
+different schemas (SAD §10).
+
+**Long-term memory depends on all of them.** Memory is read only for an
+authenticated principal, so with `APP_AUTH_ENABLED` unset the feature is inert
+in production no matter what has shipped: `/api/memory` answers 401 to
+everything and `/api/chat` performs no memory read at all.
+
+| Variable | Value | Secret | Notes |
+|---|---|---|---|
+| `APP_AUTH_ENABLED` | `true` | | **Defaults to `false`.** Off means `/api/chat` is unauthenticated and open, `/api/memory` always answers 401, and the UI shows no Sign in or Logout control. |
+| `APP_SESSION_KEY` | `openssl rand -hex 32` | ✅ | Seals the `tarang_session` cookie. **Deliberately NOT `CREDENTIAL_ENCRYPTION_KEY`** — different blast radius, different party protected. Rotating it invalidates every live session (users sign in again; nothing else breaks). |
+| `APP_USERS` | `alice:scrypt.N.r.p.salt.hash;bob:…` | ✅ | `name:hash` records separated by `;`. Mint each one with `npm run app:user -- <name>` and paste the printed record. A plaintext password is rejected at parse time, never compared. |
+| `APP_SESSION_TTL_HOURS` | `12` | | Optional; this is the default. Max 720. |
+
+> **The hash separator is `.`, not `$`, and that is deliberate.** `.env` files
+> interpolate and `@next/env` expands each `$…` segment to nothing, so a
+> `$`-delimited record reaches the application gutted and **every sign-in fails
+> as "invalid username or password"**. If you are debugging exactly that
+> symptom, check this first. Do not "correct" the separator.
+
+**Enabling authentication with a variable missing degrades rather than crashes:**
+the schema refuses the configuration, `readSession()` swallows the error, and
+every request is treated as unauthenticated — so the symptom is "nobody can sign
+in", not a boot failure. Set all three of `APP_AUTH_ENABLED`, `APP_SESSION_KEY`
+and `APP_USERS` together.
+
+**`ownerId` is the `APP_USERS` name.** Memory rows survive a user being removed
+from `APP_USERS`, so **never reuse a name**: a re-minted `alice` inherits the
+previous `alice`'s stored preferences. See SAD §7, "Known limitation".
+
 ### Reverse geocoding (Phase 3) — every variable is optional
 
 Location cards show a human-readable address above the coordinate. **Set nothing
@@ -151,8 +186,26 @@ DATABASE_URL="postgresql://postgres:...@<public-host>:<port>/railway" npx prisma
 DATABASE_URL="postgresql://postgres:...@<public-host>:<port>/railway" npx prisma migrate status
 ```
 
-`migrate status` should report the `20260729163900_init_telemetry` migration as
-applied.
+`migrate status` should report **both** migrations as applied:
+
+| Migration | Adds |
+|---|---|
+| `20260729163900_init_telemetry` | `vehicles`, `battery_telemetry`, `gps_telemetry`, `can_telemetry` |
+| `20260809162449_add_memory_entries` | `memory_entries` and the `memory_kind` / `memory_source` enums (Phase 4E long-term memory) |
+
+> **The memory migration is a MANUAL step, and it gates the feature.**
+> `docker-entrypoint.sh` runs no migrations by design — startup stays boring and
+> fast — so deploying the image does not create `memory_entries`. Until
+> `migrate deploy` has been run, `/api/memory` and every authenticated chat
+> request fail on a missing relation, because `/api/chat` reads preferences on
+> each authenticated run. **Order matters: run the migration before enabling
+> `APP_AUTH_ENABLED`.**
+>
+> `20260809162449_add_memory_entries` is **purely additive** — two `CREATE TYPE`,
+> one `CREATE TABLE`, one `CREATE UNIQUE INDEX`. No existing table is altered,
+> no column dropped, no backfill runs, and nothing in the telemetry path
+> references these objects, so applying it cannot change any existing answer.
+> `migrate deploy` is idempotent and safe to re-run.
 
 > The database will be **empty** after this. Telemetry is imported manually —
 > follow `docs/DATA-IMPORT.md`, pointing it at the same public URL.

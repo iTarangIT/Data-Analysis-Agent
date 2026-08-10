@@ -9,6 +9,8 @@
     "lint": "eslint",
     "auth:login": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/auth-login.ts",
     "portal:fetch": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/portal-fetch.ts",
+    "app:user": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/app-user.ts",
+    "memory:check": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/memory-check.ts",
     "postinstall": "prisma generate",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev && prisma generate",

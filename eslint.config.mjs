@@ -71,6 +71,76 @@ const GEOCODING_ZONE = {
 };
 
 /**
+ * Long-term memory, forbidden to everything that produces an answer (Phase 4C).
+ *
+ * NOTHING IS IMPLEMENTED BEHIND THIS RULE YET, and that is the point.
+ * `src/services/memory/` does not exist: long-term memory is planned for Phase
+ * 4E and blocked on the authenticated identity Phase 4D adds, because an owner
+ * the server cannot verify is a query parameter rather than an owner (SAD §7).
+ *
+ * The boundary is declared FIRST, deliberately. It is the one part of the
+ * memory design that can be enforced before the code it constrains is written,
+ * so the first line of that code cannot be put in the wrong layer — by a later
+ * milestone, or by someone who never read §7. A rule whose `files` pattern
+ * matches nothing costs nothing and breaks nothing; it simply waits.
+ *
+ * Added to each existing zone's own pattern list rather than declared as a zone
+ * object of its own, exactly as GEOCODING_ZONE is, and for the same
+ * load-bearing reason: flat config does not merge rules across matching objects
+ * — the last match wins outright — so a later object listing these same paths
+ * would silently REPLACE their whole restriction set and disable every
+ * authentication and browser rule in this file.
+ *
+ * The agent zone needs no entry: it already bans `@/services/*` wholesale.
+ */
+const MEMORY_ZONE = {
+  group: ["@/services/memory/*", "@/services/memory/**"],
+  message:
+    "Long-term memory is user-owned data, read BESIDE the agent and never " +
+    "beneath it (Phase 4C, SAD §7). The Analysis Engine, Planner, Tool " +
+    "Registry, tools, Portal Service, Session Manager and telemetry services " +
+    "must not know it exists: a stored preference must never be able to change " +
+    "a computation, and no layer the model can reach may gain a path that " +
+    "could WRITE one. Memory is retrieved by the Route Handler and reaches the " +
+    "model through the prompt seam, exactly as the Phase 4A run context does.",
+};
+
+/**
+ * Application identity, forbidden to everything beneath the route layer
+ * (SAD §10, Phase 4D).
+ *
+ * `src/services/identity/` answers "WHO MAY USE TARANG". It is not
+ * `src/services/session/`, which answers "how does Tarang reach Intellicar" —
+ * SAD §10 keeps those two domains apart, and this rule is part of how that
+ * separation is enforced rather than merely described.
+ *
+ * Nothing that produces an ANSWER may read the current user. A telemetry
+ * figure, a reconciliation and a report must be identical whoever asked for
+ * them, and a layer that could see the principal is a layer that could start
+ * varying by it. Identity is read once, by the Route Handler, and never
+ * consulted again.
+ *
+ * Added to each existing zone's pattern list rather than declared as its own
+ * object, for the reason GEOCODING_ZONE and MEMORY_ZONE already are: flat
+ * config does not merge rules across matching objects.
+ *
+ * The agent zone needs no entry — it bans `@/services/**` wholesale. The memory
+ * zone deliberately gets none either: Phase 4E's memory service takes an
+ * `OwnerId`, which is DEFINED here, so memory depends on identity and not the
+ * reverse. That one-way arrow is the intended shape.
+ */
+const IDENTITY_ZONE = {
+  group: ["@/services/identity/*", "@/services/identity/**"],
+  message:
+    "Application identity is read by the Route Handler and by nothing beneath " +
+    "it (SAD §10, Phase 4D). The Analysis Engine, Planner, Tool Registry, " +
+    "tools, Portal Service, Session Manager and telemetry services must not " +
+    "know who is asking: an answer must not be able to vary by user. Note also " +
+    "that this is NOT the Intellicar session — that is @/services/session, a " +
+    "different domain with a different key and a different subject.",
+};
+
+/**
  * What a PROVIDER may not reach (Milestone 5B).
  *
  * The Analysis Engine sits ABOVE the Portal Service and the Database Service and
@@ -117,6 +187,9 @@ const authIsolation = [
                 "it consumes none of them.",
             },
             GEOCODING_ZONE,
+            MEMORY_ZONE,
+
+            IDENTITY_ZONE,
           ],
         },
       ],
@@ -146,6 +219,9 @@ const authIsolation = [
                 "nothing of the portal, the tools or the agent (SAD §4, §12).",
             },
             GEOCODING_ZONE,
+            MEMORY_ZONE,
+
+            IDENTITY_ZONE,
           ],
         },
       ],
@@ -157,7 +233,10 @@ const authIsolation = [
     // browser.
     files: ["src/tools/**"],
     rules: {
-      "no-restricted-imports": ["error", { patterns: [AUTH_ZONE, BROWSER_ZONE, GEOCODING_ZONE] }],
+      "no-restricted-imports": [
+        "error",
+        { patterns: [AUTH_ZONE, BROWSER_ZONE, GEOCODING_ZONE, MEMORY_ZONE, IDENTITY_ZONE] },
+      ],
     },
   },
   {
@@ -167,6 +246,12 @@ const authIsolation = [
      * service reached from here would put infrastructure behind the one wrapper
      * every tool passes through, and the registry's job is to be the place that
      * cannot be skipped — not the place that does the work.
+     *
+     * This zone needs no MEMORY_ZONE entry: the wholesale `@/services/**` ban
+     * below already covers `@/services/memory/**`, which is exactly why
+     * GEOCODING_ZONE is absent here too. The agent reads long-term memory the
+     * same way it reads the Phase 4A run context — as a value the Route Handler
+     * hands it through `configurable`, never as a module it imports.
      */
     files: ["src/agent/**"],
     rules: {
@@ -231,6 +316,9 @@ const portalIsolation = [
             },
             DATA_ZONE,
             GEOCODING_ZONE,
+            MEMORY_ZONE,
+
+            IDENTITY_ZONE,
           ],
         },
       ],
@@ -240,7 +328,10 @@ const portalIsolation = [
     // The Portal Service: authentication IS its dependency; the data path is not.
     files: [PORTAL_SERVICE],
     rules: {
-      "no-restricted-imports": ["error", { patterns: [DATA_ZONE, GEOCODING_ZONE] }],
+      "no-restricted-imports": [
+        "error",
+        { patterns: [DATA_ZONE, GEOCODING_ZONE, MEMORY_ZONE, IDENTITY_ZONE] },
+      ],
     },
   },
   {
@@ -261,6 +352,9 @@ const portalIsolation = [
             },
             DATA_ZONE,
             GEOCODING_ZONE,
+            MEMORY_ZONE,
+
+            IDENTITY_ZONE,
           ],
         },
       ],
@@ -336,6 +430,9 @@ const analyticsIsolation = [
                 "Prisma caller (SAD §12). The engine reads telemetry, not rows.",
             },
             GEOCODING_ZONE,
+            MEMORY_ZONE,
+
+            IDENTITY_ZONE,
           ],
         },
       ],
@@ -382,6 +479,9 @@ const analyticsIsolation = [
                 "portal — the same boundary normalizers.ts holds.",
             },
             GEOCODING_ZONE,
+            MEMORY_ZONE,
+
+            IDENTITY_ZONE,
           ],
         },
       ],
@@ -435,8 +535,170 @@ const geocodingIsolation = [
                 "receives two numbers and returns a label; it reads no vehicle, " +
                 "no session and no row.",
             },
+            MEMORY_ZONE,
+
+            IDENTITY_ZONE,
             // Deliberately no GEOCODING_ZONE here: this IS the geocoding module,
             // and its own files must be able to import each other.
+          ],
+        },
+      ],
+    },
+  },
+];
+
+/* -------------------------------------------------------------------------- */
+/*  Long-term memory (SAD §7, Phase 4C)                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * THE BOUNDARY EXISTS BEFORE THE CODE DOES.
+ *
+ * `src/services/memory/` is NOT IMPLEMENTED. This object matches no file today
+ * and is expected to: long-term memory is blocked on the authenticated identity
+ * Phase 4D adds, and lands in Phase 4E. Declaring the zone now is the whole
+ * deliverable of Phase 4C — the first line of memory code will be written
+ * against a boundary that already refuses the wrong dependencies, instead of a
+ * boundary added afterwards once something already crossed it.
+ *
+ * The restriction runs in BOTH directions, as every other zone in this file
+ * does. MEMORY_ZONE above is the inward half — nothing that produces an answer
+ * may import memory. This is the outward half: memory reads a table and returns
+ * typed preferences, and reaches for nothing else.
+ *
+ *   - NOT authentication or a browser. Memory is user-owned data, not a
+ *     credential and not a session (CLAUDE.md rule 1 is unaffected by it).
+ *   - NOT the Analysis Engine, the Portal Service or the Database Service. A
+ *     preference must never be able to reach a computation or a live read; if
+ *     a stored value needs checking against the fleet, the ROUTE does it and
+ *     hands memory an already-validated value, exactly as the route already
+ *     owns validation for the Phase 4A run context.
+ *   - NOT the tool or agent layer. Memory is consumed BY the Route Handler and
+ *     consumes none of them; it does not know the result envelope exists.
+ *   - NOT geocoding, which is presentation and has no business reading a user's
+ *     stored preferences.
+ *
+ * `@/lib/prisma` is DELIBERATELY NOT BANNED, and it is the one place this zone
+ * differs from the analytics zone beside it. SAD §12's "the Database Service is
+ * the only Prisma caller" is a statement about the TELEMETRY path; memory is a
+ * different domain with its own table, and routing its reads through a
+ * telemetry service would make that service know what a preference is. The rule
+ * that will matter instead is narrower and belongs to Phase 4E: `memoryEntry`
+ * may be referenced in exactly one file.
+ */
+const memoryIsolation = [
+  {
+    files: ["src/services/memory/**"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            AUTH_ZONE,
+            BROWSER_ZONE,
+            AGENT_ZONE,
+            ANALYTICS_ZONE,
+            {
+              group: [
+                "@/services/portal/*",
+                "@/services/portal/**",
+                "@/services/database/*",
+                "@/services/database/**",
+              ],
+              message:
+                "Long-term memory stores what a user PREFERS, never what the " +
+                "fleet MEASURES (SAD §7, Phase 4C). It reads no vehicle, no " +
+                "telemetry row and no dashboard: PostgreSQL and Intellicar " +
+                "remain the authoritative sources, and a preference that could " +
+                "read them would be the first step toward one that caches them.",
+            },
+            GEOCODING_ZONE,
+            // Deliberately no MEMORY_ZONE here: this IS the memory module, and
+            // its own files must be able to import each other — the same
+            // exemption the geocoding zone above carries for the same reason.
+          ],
+        },
+      ],
+    },
+  },
+];
+
+/* -------------------------------------------------------------------------- */
+/*  Application identity (SAD §10, Phase 4D)                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The outward half of IDENTITY_ZONE.
+ *
+ * `src/services/identity/` proves A PERSON to TARANG. It reads a cookie, opens
+ * a sealed blob and returns a user id. That is all it does, and this rule is
+ * what keeps it that small.
+ *
+ * THE MOST IMPORTANT BAN HERE IS `@/services/session/*`. The two modules have
+ * confusingly similar names and completely different subjects: the Session
+ * Manager holds a Playwright storageState proving TARANG to INTELLICAR — one
+ * blob for the whole deployment, never sent to a browser, not a person. SAD §10
+ * says the two domains never mix; an import between them would be the first
+ * step to treating an Intellicar session as an application login, which is
+ * precisely the confusion Phase 4D exists to prevent.
+ *
+ * `@/services/credentials/crypto` is DELIBERATELY PERMITTED while
+ * `credential-manager` is banned, and the split is exact rather than
+ * convenient. The crypto module's own header states it "has no idea what it is
+ * protecting" and that its purpose-bound AAD exists so a sealed session cannot
+ * be opened as a sealed credential "once this module has two callers" — this is
+ * that second caller, and it is the use the module was written for. The
+ * Credential Manager, by contrast, is Intellicar's and is banned with the rest
+ * of that domain.
+ *
+ * Everything else follows the shape every other zone has: identity consumes no
+ * provider, no tool and no agent. It is consumed BY a Route Handler.
+ */
+const identityIsolation = [
+  {
+    files: ["src/services/identity/**"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            BROWSER_ZONE,
+            AGENT_ZONE,
+            ANALYTICS_ZONE,
+            {
+              group: [
+                "@/services/session/*",
+                "@/services/session/**",
+                "@/services/credentials/credential-manager",
+              ],
+              message:
+                "Application identity is NOT the Intellicar session (SAD §10, " +
+                "Phase 4D). @/services/session proves Tarang to Intellicar with " +
+                "a Playwright storageState; this module proves a person to " +
+                "Tarang with a sealed cookie. Different subject, different key, " +
+                "different lifetime — and they never mix. Only the generic " +
+                "@/services/credentials/crypto is shared, which is the second " +
+                "caller its purpose-bound AAD was written for.",
+            },
+            {
+              group: [
+                "@/services/portal/*",
+                "@/services/portal/**",
+                "@/services/database/*",
+                "@/services/database/**",
+                "@/lib/prisma",
+              ],
+              message:
+                "Identity reads a cookie and returns a user id (Phase 4D). It " +
+                "touches no vehicle, no telemetry row, no dashboard and no " +
+                "database — Phase 4D deliberately has ZERO Prisma dependency, " +
+                "exactly as Milestone 3 authentication did.",
+            },
+            GEOCODING_ZONE,
+            MEMORY_ZONE,
+            // Deliberately no IDENTITY_ZONE: this IS the identity module, and
+            // its own files must import each other — the same exemption the
+            // geocoding and memory zones carry, for the same reason.
           ],
         },
       ],
@@ -451,6 +713,8 @@ const eslintConfig = defineConfig([
   ...portalIsolation,
   ...analyticsIsolation,
   ...geocodingIsolation,
+  ...memoryIsolation,
+  ...identityIsolation,
   // Override default ignores of eslint-config-next.
   globalIgnores([
     // Default ignores of eslint-config-next:

@@ -189,6 +189,134 @@ export function isAuthEnvConfigured(): boolean {
 }
 
 /**
+ * Application authentication configuration (SAD §10, Phase 4D).
+ *
+ * ## A FOURTH schema, lazy for the reason `authEnv()` is
+ *
+ * This is the OTHER authentication domain, and the separation is the point.
+ * `authEnv()` above answers "how does Tarang reach Intellicar" — a machine
+ * credential, one per deployment. This answers "who may use Tarang" — a person,
+ * with their own session. SAD §10: the two never mix, and keeping them in two
+ * schemas is where that starts.
+ *
+ * Lazy, so a deployment that has not configured app authentication still boots,
+ * still builds, and still answers a telemetry question. Eager validation here
+ * would make the whole application depend on configuration that only the login
+ * path reads — the exact coupling Milestone 3 created `authEnv()` to avoid.
+ *
+ * ## APP_SESSION_KEY is DELIBERATELY NOT CREDENTIAL_ENCRYPTION_KEY
+ *
+ * Reusing one key would mean the key that seals a stored Intellicar session
+ * also mints application sessions, so a compromise of either would be a
+ * compromise of both. They protect different things for different parties and
+ * have different blast radii, so they are different keys. The sealed payloads
+ * are additionally bound to different AAD purposes, which makes a blob from one
+ * domain unopenable as the other even under a shared key — belt and braces,
+ * because this is the pair a future refactor is most likely to conflate.
+ */
+const appAuthEnvSchema = z
+  .object({
+    /**
+     * OFF by default, and that is a migration decision rather than a security
+     * posture. Phase 4D lands the whole mechanism with enforcement disabled so
+     * the running application behaves exactly as it did before; enabling it is
+     * a deliberate act once a key and users are configured.
+     */
+    APP_AUTH_ENABLED: z
+      .enum(["true", "false"])
+      .default("false")
+      .transform((value) => value === "true"),
+    /**
+     * AES-256-GCM key for sealing the session cookie. Format is validated where
+     * the key is decoded — `parseKeyMaterial` in the crypto module — so that one
+     * module owns what a valid key is and no branch of this schema handles key
+     * bytes.
+     */
+    APP_SESSION_KEY: z.string().min(1).optional(),
+    /**
+     * Application users, as `name:hash` records separated by `;`.
+     *
+     * The hash is scrypt, produced by `npm run app:user`. A PLAINTEXT PASSWORD
+     * IS NEVER ACCEPTED HERE — the parser rejects any record whose secret is not
+     * a recognised hash, so a misconfiguration cannot silently downgrade to
+     * plaintext comparison.
+     *
+     * Users in the environment rather than a table is the same trade SAD §19
+     * already recorded for Intellicar credentials ("credentials come from the
+     * environment, deferring the vault"), with the same upgrade path: a User
+     * table replaces the parser and no caller changes.
+     */
+    APP_USERS: z.string().optional(),
+    /** How long a session lasts. Validated server-side on every read. */
+    APP_SESSION_TTL_HOURS: z.coerce.number().int().positive().max(720).default(12),
+  })
+  /**
+   * Enforcement turned on without a key or without users is the failure worth
+   * catching: the application would start, claim to be protected, and reject
+   * every login — or, worse, be unable to seal a cookie at all. The same shape
+   * of check `envSchema` applies to LANGSMITH_TRACING, for the same reason.
+   */
+  .superRefine((value, ctx) => {
+    if (!value.APP_AUTH_ENABLED) return;
+
+    if (value.APP_SESSION_KEY === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["APP_SESSION_KEY"],
+        message: 'APP_SESSION_KEY is required when APP_AUTH_ENABLED is "true"',
+      });
+    }
+
+    if (value.APP_USERS === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["APP_USERS"],
+        message: 'APP_USERS is required when APP_AUTH_ENABLED is "true"',
+      });
+    }
+  });
+
+export type AppAuthEnv = z.infer<typeof appAuthEnvSchema>;
+
+let cachedAppAuthEnv: AppAuthEnv | undefined;
+
+/**
+ * Validated application-authentication configuration.
+ *
+ * Throws only when enforcement is ON and the configuration cannot support it.
+ * With `APP_AUTH_ENABLED` unset — the default — every field is optional or
+ * defaulted, so this cannot fail and the identity module stays inert.
+ */
+export function appAuthEnv(): AppAuthEnv {
+  if (cachedAppAuthEnv === undefined) {
+    const parsed = appAuthEnvSchema.safeParse(process.env);
+
+    if (!parsed.success) {
+      throw new Error(
+        `Invalid application authentication configuration:\n` +
+          `${describeIssues(parsed.error)}\n\n` +
+          `Set these variables in .env.local — see docs/ARCHITECTURE.md §10.`
+      );
+    }
+
+    cachedAppAuthEnv = Object.freeze(parsed.data);
+  }
+
+  return cachedAppAuthEnv;
+}
+
+/**
+ * Whether application authentication is ENFORCED.
+ *
+ * Read without validating anything else, so the disabled path never touches the
+ * rest of the schema and never throws. This is the single switch every caller
+ * branches on.
+ */
+export function isAppAuthEnabled(): boolean {
+  return process.env.APP_AUTH_ENABLED === "true";
+}
+
+/**
  * Reverse geocoding configuration (Phase 3).
  *
  * A THIRD schema, lazy for exactly the reason `authEnv()` is: only the geocoding
