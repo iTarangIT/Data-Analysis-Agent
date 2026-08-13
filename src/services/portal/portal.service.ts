@@ -87,7 +87,7 @@ const PORTAL_READY_TIMEOUT_MS = 20_000;
 
 /**
  * How long a TARGETED module's resolution phase may take in total
- * (Milestone 4C).
+ * (Milestone 4C; re-budgeted for the P1 retrieval fix).
  *
  * Bounds the whole phase, not a step inside it: a resolver opens a view and may
  * page a table, and capping only the individual actions would let a pager with
@@ -95,14 +95,104 @@ const PORTAL_READY_TIMEOUT_MS = 20_000;
  * stricter per-step budgets of its own — the Vehicle Summary module does — which
  * is the internal-SLA case SAD §19 keeps separate from an outer ceiling.
  *
- * The three phase budgets are sized to fit inside PORTAL_TOOL_TIMEOUT_MS (90s)
- * with room to spare: 30s navigation + 35s resolution + 20s readiness = 85s. A
- * COLD run that must also sign in can still exceed the tool budget; that is
- * accepted rather than designed away, because the Session Manager persists the
- * session before running this work, so the login a timed-out first request paid
- * for is saved and the retry takes the reuse path.
+ * RAISED from 35s to 135s on 2026-08-11, from measurement rather than by
+ * guessing. `npm run portal:discover` timed the Intellicar dashboard's shell
+ * arriving between 12s and 67s after `domcontentloaded` across three samples in
+ * one hour — the account-wide fleet status over 320 vehicles is the slow part,
+ * and Vehicle Summary now allows 90s for it. A phase budget smaller than the
+ * work inside it turns a slow portal into MODULE_CHANGED, which is precisely the
+ * failure this whole change exists to remove, so the phase has to contain it:
+ *
+ *     90s application boot + 15s open the table + 15s page + 15s settle = 135s
+ *
+ * The phase budgets fit inside PORTAL_READ_BUDGET_MS: 30s navigation + 135s
+ * resolution + 20s readiness = 185s worst case for ONE attempt. These are
+ * ceilings that are never all reached together — a healthy read completes in
+ * roughly 40-70s, most of that the portal's own cold boot.
  */
-const PORTAL_RESOLVE_TIMEOUT_MS = 35_000;
+const PORTAL_RESOLVE_TIMEOUT_MS = 135_000;
+
+/**
+ * How many times a failing read is attempted before the failure is reported.
+ *
+ * TWO — one retry, no more (P1). The failure this exists for is a portal that
+ * renders too slowly on one attempt and normally on the next, which was
+ * measured: the same `goto` took 6.7s on one run and 22.3s on another. A second
+ * attempt converts most of that variance into a correct answer.
+ *
+ * ## Why the retry lives HERE and not in the tool or the agent
+ *
+ * A retry above the Tool Registry costs an OpenRouter call per attempt, because
+ * the model has to decide to call the tool again. A retry inside this function
+ * costs none. The model is also told NOT to retry a timed-out tool
+ * (`ToolTimeoutError`), so leaving recovery to it means no recovery happens.
+ *
+ * ## What is NOT retried
+ *
+ * `isRetryable` below is the whole policy. Two classes are excluded for
+ * different reasons: an ANSWER (TARGET_NOT_FOUND, MODULE_UNAVAILABLE,
+ * TARGET_REQUIRED) would return identically, and re-running it would only make
+ * the user wait longer to hear the same true thing; and an AUTHENTICATION
+ * failure must never be retried at all, because every attempt is a real sign-in
+ * against a customer's Intellicar account and three consecutive failures latch
+ * the Session Manager off for the life of the process.
+ */
+const PORTAL_READ_ATTEMPTS = 2;
+
+/**
+ * The total this service plans a read against, across every attempt.
+ *
+ * Exported, and the Portal Tool derives its own ceiling FROM it rather than
+ * declaring a second number beside it. The direction matters: a tool depends on
+ * a service and never the reverse (the Portal zone in eslint.config.mjs enforces
+ * it), so the budget has to live here, where the phases it is spent on are
+ * declared. Two independently-maintained numbers would drift, and the failure
+ * mode of drifting apart is silent — the registry's generic timeout message
+ * would replace this service's carefully worded one.
+ *
+ *     one attempt, worst case: 30s navigation + 135s resolution + 20s readiness
+ *     a second attempt only if PORTAL_RETRY_MIN_BUDGET_MS is still left
+ *
+ * 240s is not what a read COSTS — a healthy Vehicle Summary read completes in
+ * roughly 40-70s, most of it the portal's own cold SPA boot. It is what a read
+ * is allowed to cost before the answer stops being worth waiting for, and it is
+ * sized so that a first attempt which merely ran into a SLOW portal gets to
+ * finish, while one that failed FAST still leaves room to try again.
+ *
+ * It deliberately does not stretch to two worst-case attempts. That would be
+ * over six minutes, and it would buy nothing: an attempt that exhausted a 90s
+ * boot budget was not unlucky, and repeating it would only make the user wait
+ * twice for the same answer.
+ */
+export const PORTAL_READ_BUDGET_MS = 240_000;
+
+/**
+ * How long to wait between attempts.
+ *
+ * Short and fixed, with no jitter: at two attempts there is no thundering herd
+ * to spread, and the Session Manager already serialises every browser run, so
+ * this is a pause for the portal's benefit, not for ours.
+ */
+const PORTAL_RETRY_BACKOFF_MS = 1_000;
+
+/**
+ * The least time a retry needs to be worth starting.
+ *
+ * The retry is DEADLINE-AWARE: the Tool Registry's budget is the real ceiling
+ * and it stops WAITING for the work, not the work itself, so a second attempt
+ * begun with seconds left would run on after its result had already been
+ * discarded — holding the browser and the Session Manager's queue for a
+ * response nobody will read. Checking a floor first is what keeps a retry from
+ * costing the NEXT request.
+ *
+ * Sized as a HEALTHY read end to end (40-70s measured), not a worst-case one:
+ * below that, a second attempt cannot reach the point where the first one
+ * failed. It is also what makes the retry self-limiting in the right way — an
+ * attempt that failed because the portal was slow has already spent most of the
+ * budget and correctly gets no second try, while one that failed fast (a
+ * navigation error, a context that went away) gets one.
+ */
+const PORTAL_RETRY_MIN_BUDGET_MS = 90_000;
 
 /* -------------------------------------------------------------------------- */
 /*  Public contract                                                           */
@@ -484,53 +574,168 @@ export async function fetchPortalModule(
     : request;
 
   const startedAt = Date.now();
+  const deadline = startedAt + PORTAL_READ_BUDGET_MS;
 
-  try {
-    const data = await withAuthenticatedContext(
-      (context) => readModule(capability, resolved, context, signal),
-      { signal }
-    );
+  let lastFailure: unknown;
 
-    // The module and the duration; never the data, and never a selector. The
-    // same policy /api/chat applies to tool spans, for the same reason.
-    log.info(
-      { module: capability.module, durationMs: Date.now() - startedAt },
-      "Portal module read."
-    );
-
-    return data;
-  } catch (error) {
-    // Decided on the SIGNAL, not on the error's shape — the throw can come from
-    // the navigation, the readiness wait, the extractor or the Session Manager,
-    // each with its own error type, while "was this run cancelled" has exactly
-    // one answer. This is the same rule /api/chat uses to keep a client
-    // disconnect from reading as an incident.
-    if (signal?.aborted) {
-      throw new PortalError(
-        "CANCELLED",
-        "The portal request was cancelled before it finished."
+  for (let attempt = 1; attempt <= PORTAL_READ_ATTEMPTS; attempt += 1) {
+    try {
+      const data = await withAuthenticatedContext(
+        (context) => readModule(capability, resolved, context, signal),
+        { signal }
       );
+
+      // The module, the duration and which attempt answered; never the data,
+      // and never a selector. The same policy /api/chat applies to tool spans,
+      // for the same reason. `attempt` is here because a read that succeeded
+      // only on the retry is the signal that the portal is degrading, and
+      // without it that looks identical to a healthy deployment.
+      log.info(
+        { module: capability.module, durationMs: Date.now() - startedAt, attempt },
+        "Portal module read."
+      );
+
+      return data;
+    } catch (error) {
+      lastFailure = error;
+
+      // Decided on the SIGNAL, not on the error's shape — the throw can come
+      // from the navigation, the readiness wait, the extractor or the Session
+      // Manager, each with its own error type, while "was this run cancelled"
+      // has exactly one answer. This is the same rule /api/chat uses to keep a
+      // client disconnect from reading as an incident, and it runs FIRST so a
+      // cancelled run is never retried.
+      if (signal?.aborted) {
+        throw new PortalError(
+          "CANCELLED",
+          "The portal request was cancelled before it finished."
+        );
+      }
+
+      // Logged BEFORE the classified failures are rethrown, which is the fix
+      // for a real blind spot: this warn used to sit below the rethrow on the
+      // next line, so TARGET_NOT_FOUND, MODULE_CHANGED, MODULE_UNAVAILABLE and
+      // every SessionError produced no portal log line at all. `code` is
+      // carried because "the vehicle was not listed" and "the dashboard never
+      // rendered" need different responses from whoever reads this.
+      log.warn(
+        {
+          module: capability.module,
+          code: portalFailureCode(error),
+          attempt,
+          attempts: PORTAL_READ_ATTEMPTS,
+          durationMs: Date.now() - startedAt,
+          err: error,
+        },
+        "Portal module read failed."
+      );
+
+      const retryable =
+        attempt < PORTAL_READ_ATTEMPTS &&
+        isRetryable(error) &&
+        deadline - Date.now() >= PORTAL_RETRY_MIN_BUDGET_MS;
+
+      if (!retryable) break;
+
+      log.info(
+        { module: capability.module, attempt, backoffMs: PORTAL_RETRY_BACKOFF_MS },
+        "Retrying the portal read."
+      );
+
+      await delay(PORTAL_RETRY_BACKOFF_MS);
     }
-
-    // Already in the outward vocabulary. A SessionError passes through
-    // UNCHANGED rather than being flattened into a portal code: its message is
-    // already written to be safe for the model, and its code carries recovery
-    // information ("credentials rejected", "not configured") that this layer
-    // would destroy by re-wrapping.
-    if (error instanceof PortalError || error instanceof SessionError) throw error;
-
-    log.warn(
-      { module: capability.module, err: error },
-      "Portal module read failed."
-    );
-
-    // Anything left is Playwright failing to reach or render the module.
-    throw new PortalError(
-      "PORTAL_UNREACHABLE",
-      `The ${capability.module} dashboard could not be read from the Intellicar portal.`,
-      { cause: error }
-    );
   }
+
+  // Every attempt is spent. Cancellation was ruled out inside the loop, so what
+  // is left is a genuine failure to read.
+  //
+  // A SessionError passes through UNCHANGED rather than being flattened into a
+  // portal code: its message is already written to be safe for the model, and
+  // its code carries recovery information ("credentials rejected", "not
+  // configured") that this layer would destroy by re-wrapping.
+  if (lastFailure instanceof SessionError) throw lastFailure;
+
+  // A PortalError raised underneath is already in the outward vocabulary and
+  // already says what happened, so it is passed through too — including
+  // TARGET_NOT_FOUND, which is an ANSWER and must never be dressed up as a
+  // retrieval failure.
+  if (lastFailure instanceof PortalError) throw lastFailure;
+
+  /**
+   * Anything left is Playwright failing to reach or render the module.
+   *
+   * The message states what this IS and, explicitly, what it is not. The old
+   * wording — "could not be read from the Intellicar portal" — was true but
+   * incomplete, and the model read it together with the Database Service's
+   * "no vehicle is registered" and concluded that a vehicle visibly present in
+   * the portal did not exist. A retrieval failure and an absent vehicle are
+   * different findings; only the resolver, having listed the fleet, may report
+   * the second (TARGET_NOT_FOUND).
+   */
+  throw new PortalError(
+    "PORTAL_UNREACHABLE",
+    `The ${capability.module} dashboard could not be read from the Intellicar ` +
+      `portal after ${PORTAL_READ_ATTEMPTS} attempts. This is a failure to ` +
+      `RETRIEVE the data, not a finding about the vehicle or the fleet — ` +
+      `nothing here says whether the requested vehicle exists.`,
+    { cause: lastFailure }
+  );
+}
+
+/** Pause between attempts. */
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** The outward code of a failure, for logging. `null` when it carries none. */
+function portalFailureCode(error: unknown): string | null {
+  if (error instanceof PortalError || error instanceof SessionError) {
+    return error.code;
+  }
+
+  return null;
+}
+
+/**
+ * Whether attempting this read again could plausibly produce a different
+ * outcome.
+ *
+ * The whole retry policy, in one place, expressed as an ALLOW-LIST. A default
+ * of "retry unless known otherwise" would eventually retry a new error code
+ * nobody considered — and the codes that must never be retried are exactly the
+ * ones with a cost attached.
+ *
+ *   - PORTAL_UNREACHABLE and MODULE_CHANGED are the transient pair. Both are
+ *     produced by a portal that was slow rather than wrong, which is the P1
+ *     failure: the shell arrived ~14s after `domcontentloaded` on one run while
+ *     the same navigation varied by more than 3x across runs.
+ *   - MALFORMED_DATA is deterministic. The dashboard rendered and Zod rejected
+ *     what it said; a second scrape reads the same changed markup.
+ *   - TARGET_NOT_FOUND, MODULE_UNAVAILABLE and TARGET_REQUIRED are ANSWERS.
+ *     Repeating them only makes the user wait longer for the same true thing.
+ *   - CANCELLED never reaches here; the caller rules it out first.
+ *   - Every SessionError is excluded, and this is the important exclusion.
+ *     CREDENTIALS_REJECTED and CHALLENGE_REQUIRED cannot be fixed by trying
+ *     again, and a retry of either is a REAL SIGN-IN against a customer's
+ *     Intellicar account — three consecutive failures latch authentication off
+ *     for the life of the process, which is the single most damaging thing this
+ *     system could do. A session-level PORTAL_UNREACHABLE is excluded for a
+ *     quieter reason: the Session Manager already reruns the probe on the next
+ *     call and deliberately leaves the stored session intact, so a retry here
+ *     would add a login attempt to an outage rather than a page load.
+ *
+ * A raw Playwright failure — the timeout that started all of this — has not
+ * been classified yet at the point it is thrown, so it is retryable by falling
+ * through to the last line.
+ */
+function isRetryable(error: unknown): boolean {
+  if (error instanceof SessionError) return false;
+
+  if (error instanceof PortalError) {
+    return error.code === "PORTAL_UNREACHABLE" || error.code === "MODULE_CHANGED";
+  }
+
+  return true;
 }
 
 /**
@@ -711,26 +916,50 @@ async function withPhaseBudget<T>(
 }
 
 /**
+ * Wait until ONE of `selectors` is visible, and report which.
+ *
+ * Raced with `Promise.any`, so the first candidate to appear wins and a stale
+ * candidate costs only itself. Candidates are raced separately rather than
+ * joined into one CSS union because Playwright's `text=` and `xpath=` are
+ * distinct selector engines and a joined string would be invalid as a whole.
+ *
+ * Exported because a RESOLVER needs the same primitive before this service's
+ * own readiness wait can run: for a targeted module the data-bearing element
+ * does not exist until the entity has been reached, so the resolver has to
+ * establish that the application is up on its own. Sharing this is what keeps
+ * "wait for any of these" from being reimplemented — slightly differently, and
+ * therefore wrongly — inside each extractor. Rejects with the underlying
+ * AggregateError; deciding what a timeout MEANS stays with the caller, because
+ * the same silence is MODULE_CHANGED here and a stalled application there.
+ */
+export async function waitForAnySelector(
+  page: Page,
+  selectors: readonly string[],
+  timeoutMs: number
+): Promise<void> {
+  await Promise.any(
+    selectors.map((selector) =>
+      page.locator(selector).first().waitFor({ state: "visible", timeout: timeoutMs })
+    )
+  );
+}
+
+/**
  * Wait until one of the capability's readiness selectors is visible.
  *
- * Raced with `Promise.any`, so the FIRST candidate to appear wins and a stale
- * candidate costs only itself. If every one times out, the page loaded but did
- * not render what this module expects — which is a changed dashboard, not an
- * unreachable portal, and the two need different responses from whoever reads
- * the log.
+ * If every one times out, the page loaded but did not render what this module
+ * expects — which is a changed dashboard, not an unreachable portal, and the
+ * two need different responses from whoever reads the log.
  */
 async function waitForReady(
   page: Page,
   capability: PortalCapability
 ): Promise<void> {
   try {
-    await Promise.any(
-      capability.readySelector.map((selector) =>
-        page
-          .locator(selector)
-          .first()
-          .waitFor({ state: "visible", timeout: PORTAL_READY_TIMEOUT_MS })
-      )
+    await waitForAnySelector(
+      page,
+      capability.readySelector,
+      PORTAL_READY_TIMEOUT_MS
     );
   } catch (error) {
     throw new PortalError(

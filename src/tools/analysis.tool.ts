@@ -68,14 +68,27 @@ import type { ContributingSource } from "@/types/chat";
  * and for the same reason the Portal Tool has one: this tool's work is now a
  * genuinely different shape from an in-process read. A latest-value request for
  * a quantity the dashboard can answer may open a browser context, wait on a
- * client-rendered SPA, and page a 320-row table — work the Portal Tool already
- * budgets 90 seconds for — and the database leg runs alongside it.
+ * client-rendered SPA, and page a 320-row table — work the Portal Service
+ * budgets PORTAL_READ_BUDGET_MS for — and the database leg runs alongside it.
  *
- * 120s is that 90 plus room for the historical read and the engine's own work.
- * It is a CEILING, not a delay: a request with no live provider still returns in
- * milliseconds, and a derivation makes no portal call at all.
+ * RAISED from 120s to 270s (P1), because that portal budget was raised to 240s:
+ * the Vehicle Summary resolver now allows a measured 90s for the dashboard's
+ * cold boot, and the Portal Service allows itself one deadline-gated retry.
+ * 270s is that 240 plus room for the historical read and the engine's own work.
+ *
+ * The constant is a LITERAL rather than an import of the Portal Service's
+ * budget, deliberately. This file's whole contract is the paragraph above —
+ * it knows one service, and reaching into the Portal Service for a number would
+ * make it know two. The coupling is real but one-directional and stated: this
+ * ceiling must stay ABOVE PORTAL_READ_BUDGET_MS in portal.service.ts, because a
+ * ceiling below it would cut a live read off partway and report a timeout where
+ * the service was about to report something more useful. Change one, check the
+ * other.
+ *
+ * It is a CEILING, not a delay — a request with no live provider still returns
+ * in milliseconds, and a derivation makes no portal call at all.
  */
-export const ANALYSIS_TOOL_TIMEOUT_MS = 120_000;
+export const ANALYSIS_TOOL_TIMEOUT_MS = 270_000;
 
 /** Ceiling on a relative window, so a runaway request cannot ask for decades. */
 const MAX_WINDOW_DAYS = 3650;

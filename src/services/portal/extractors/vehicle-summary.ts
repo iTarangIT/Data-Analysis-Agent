@@ -3,6 +3,7 @@ import type { Page } from "playwright";
 import {
   PortalError,
   defineCapability,
+  waitForAnySelector,
   type Extractor,
   type IdentityAssertion,
   type Resolver,
@@ -59,9 +60,10 @@ import {
 /* -------------------------------------------------------------------------- */
 
 /**
- * VERIFIED against the live portal on 2026-08-03 (docs/AUTH-SETUP.md §4
- * procedure, applied to a dashboard module). None of these is a guess — each was
- * read off the rendered DOM.
+ * VERIFIED against the live portal on 2026-08-03, and the readiness signals
+ * RE-VERIFIED AND TIMED on 2026-08-11 (`npm run portal:discover`, after the P1
+ * intermittent-retrieval failure). None of these is a guess — each was read off
+ * the rendered DOM, and every budget below is measured rather than chosen.
  *
  * The rendered structure this depends on:
  *
@@ -88,10 +90,34 @@ const VEHICLE_SUMMARY = {
 
   /**
    * Proof that the APPLICATION has booted, waited for before any control is
-   * touched. The fleet status counts are the same data-bearing signal the Fleet
-   * Overview capability waits on, and they exist long before the table does.
+   * touched.
+   *
+   * A LIST, raced candidate by candidate, for the same reason the Portal
+   * Service races `readySelector` and the authenticator races its indicators:
+   * portal markup is discovered rather than specified, and a single selector
+   * makes readiness all-or-nothing — one stale guess reports a working
+   * dashboard as unreachable. That is not hypothetical here; it is what this
+   * module was doing.
+   *
+   * The LeftPane entries lead, because they are what this resolver is about to
+   * CLICK. The header counts follow as corroboration: they are an API-driven
+   * number, so they prove the application talked to the server, and they are
+   * the signal Fleet Overview waits on. Both families were measured arriving
+   * together (below), so leading with the control costs nothing and means
+   * readiness is about the thing that has to be actionable.
+   *
+   * `#pac-input` is deliberately NOT here even though it appears at 1.1s. It is
+   * the map's search box; it renders long before the LeftPane exists, so
+   * waiting on it would return to a page whose table control cannot yet be
+   * clicked — the same class of mistake as waiting on `.im-tableView` while it
+   * still holds "No Data".
    */
-  APP_READY: ".h-controls .hci-count",
+  APP_READY: [
+    ".LeftPane .lp-button i.fa-list",
+    ".LeftPane .lp-button",
+    ".h-controls .hci-count",
+    ".Header .h-controls .hc-item .hci-count",
+  ],
 
   /**
    * Readiness for THIS module: a populated table cell.
@@ -121,6 +147,45 @@ const VEHICLE_SUMMARY = {
   PAGE_ACTIVE: ".active",
 
   /**
+   * How long to wait for the APPLICATION to boot, before any control is touched.
+   *
+   * Separate from STEP_TIMEOUT_MS, and much larger, because it bounds a
+   * different thing: a cold client-rendered SPA fetching its own shell, rather
+   * than an in-page interaction on an application that is already running.
+   * Sharing one number was the P1 defect — the resolver was giving a cold boot
+   * the same budget as a table click.
+   *
+   * MEASURED against the live portal on 2026-08-11 (`npm run portal:discover`,
+   * on the second page load of a run, which is the one this resolver sees).
+   * THREE samples within one hour, reported as the interval AFTER `goto`
+   * resolves, because that is the interval this budget actually bounds:
+   *
+   *     sample   goto      LeftPane button     shell after goto
+   *     1        6,735 ms   20,828 ms            14,093 ms
+   *     2      ~21,800 ms   89,346 ms          ~67,500 ms
+   *     3       13,974 ms   26,001 ms            12,027 ms
+   *
+   * The old budget was 15s, so sample 1 cleared it by about one second and
+   * sample 2 missed it more than fourfold — which is exactly the reported
+   * symptom: the same vehicle read correctly in one request and "did not exist"
+   * in the next.
+   *
+   * WHAT IS SLOW IS THE PORTAL, not the navigation and not the markup. The map
+   * (`#pac-input`) and the empty table container render 1-2s after `goto` in
+   * every sample; the LeftPane, the header counts and the header search all
+   * arrive together, tens of seconds later. They share a dependency the map does
+   * not have — the account-wide fleet status over 320 vehicles — and that call
+   * is what varies by a factor of five. No selector can be chosen to avoid it:
+   * the table this module reads is populated by the same data.
+   *
+   * 90s is ~1.3x the worst observation. Sized from the WORST rather than the
+   * median deliberately — the median already worked, and it is the tail that
+   * produced a wrong answer. It is a CEILING and not a delay: samples 1 and 3
+   * resolve in twelve to fourteen seconds and pay nothing for the headroom.
+   */
+  APP_READY_TIMEOUT_MS: 90_000,
+
+  /**
    * How long to wait for the table to populate after opening it or paging.
    *
    * Its own budget rather than the service's readiness budget: this is a
@@ -128,6 +193,10 @@ const VEHICLE_SUMMARY = {
    * still governs the module's overall readiness afterwards. A stricter internal
    * SLA over an operation the module understands is exactly what SAD §19 allows
    * a service to keep alongside the outer ceiling.
+   *
+   * Unchanged at 15s: it bounds an interaction with an application that is
+   * already running, which the discovery pass above shows is a different scale
+   * of wait from the boot APP_READY_TIMEOUT_MS covers.
    */
   STEP_TIMEOUT_MS: 15_000,
 
@@ -181,11 +250,28 @@ const resolveVehicle: Resolver = async (page, request) => {
   const target = normalizeVehicleNo(request.target ?? "");
 
   // The application has to be up before any control can be clicked. Waiting on
-  // the fleet counts is what separates "the shell arrived" from "the app ran".
-  await page
-    .locator(VEHICLE_SUMMARY.APP_READY)
-    .first()
-    .waitFor({ state: "visible", timeout: VEHICLE_SUMMARY.STEP_TIMEOUT_MS });
+  // the shell is what separates "the document arrived" from "the app ran".
+  //
+  // Raced through the service's own primitive rather than a single `waitFor`,
+  // so a candidate that Intellicar renames costs only itself. A timeout here
+  // means the application did not finish booting — which is NOT a statement
+  // about the vehicle, and the message says so, because this used to surface as
+  // an unreachable portal and then as "the vehicle does not exist".
+  try {
+    await waitForAnySelector(
+      page,
+      VEHICLE_SUMMARY.APP_READY,
+      VEHICLE_SUMMARY.APP_READY_TIMEOUT_MS
+    );
+  } catch (error) {
+    throw new PortalError(
+      "MODULE_CHANGED",
+      `The Intellicar dashboard did not finish loading in time, so ` +
+        `${request.target} could not be looked up. The vehicle's status is ` +
+        `unknown; this is not a finding about the vehicle.`,
+      { cause: error }
+    );
+  }
 
   // Open the table only if it is not already showing data.
   if (!(await tableHasRows(page))) {

@@ -3,6 +3,7 @@ import { z } from "zod";
 import type { ToolSpec } from "@/agent/tool-registry";
 import {
   PORTAL_MODULES,
+  PORTAL_READ_BUDGET_MS,
   fetchPortalModule,
 } from "@/services/portal/portal.service";
 
@@ -44,11 +45,27 @@ import {
  * for. It is raised HERE rather than raising TOOL_TIMEOUT_MS for everyone,
  * which is exactly what the per-spec field exists for.
  *
- * This is the outer bound whose only job is to guarantee the agent run ends.
- * The Portal Service may enforce stricter internal budgets over sub-operations
- * it understands; that is a different concern, and neither replaces the other.
+ * DERIVED from the Portal Service's own budget rather than stated independently
+ * (P1). The service plans its phases and its one retry against
+ * PORTAL_READ_BUDGET_MS; restating that number here would let the two drift,
+ * and the drift is silent in the direction that matters — a tool ceiling below
+ * the service's would fire first and replace the service's carefully worded
+ * failure ("this is a failure to RETRIEVE the data, not a finding about the
+ * vehicle") with the registry's generic timeout text, which is exactly the
+ * confusion this whole fix exists to remove.
+ *
+ * The MARGIN is what guarantees that ordering. It is small on purpose: enough
+ * for the service to classify and throw, not enough to meaningfully extend how
+ * long a user waits.
+ *
+ * This remains the outer bound whose only job is to guarantee the agent run
+ * ends. The Portal Service enforces stricter budgets over sub-operations it
+ * understands; neither replaces the other.
  */
-export const PORTAL_TOOL_TIMEOUT_MS = 90_000;
+const PORTAL_TOOL_MARGIN_MS = 10_000;
+
+export const PORTAL_TOOL_TIMEOUT_MS =
+  PORTAL_READ_BUDGET_MS + PORTAL_TOOL_MARGIN_MS;
 
 const schema = z.object({
   module: z

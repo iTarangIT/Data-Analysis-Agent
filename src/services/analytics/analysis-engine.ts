@@ -892,16 +892,24 @@ export async function runAnalysis(
 
   // 2/3 — Resolve the subject, then acquire every distinct source once.
   //
-  // Subject resolution comes first and is allowed to throw: an unregistered
-  // vehicle is a real fault, and distinguishing it from "no data" is the whole
-  // reason it is resolved before anything is read.
+  // Subject resolution comes first and is still allowed to throw: an
+  // unregistered vehicle with nothing live to answer for it is a real fault, and
+  // distinguishing it from "no data" is the whole reason it is resolved before
+  // anything is read.
+  //
+  // It takes the WHOLE PLAN rather than just the subject (P1). The database's
+  // vehicle registry is smaller than the portal's — 70 against 320 — so gating
+  // every run on it meant a question the live dashboard could answer was refused
+  // before the dashboard was ever asked. The plan is what says whether a live
+  // source is in play, so the plan is what the gate needs; `resolveSubject`
+  // documents the rule it applies.
   //
   // From Milestone 5E it also RETURNS something. A fleet's population is not
   // recoverable downstream — it has to be read — and every aggregate's
   // denominator is that set, so it is resolved once here and carried into both
   // the reads and the observations. That single resolution is what guarantees the
   // numerator and the denominator describe the same fleet.
-  const resolution = await resolveSubject(plan.subject);
+  const resolution = await resolveSubject(plan);
 
   const acquisitions = await acquire(plan, resolution, options);
 

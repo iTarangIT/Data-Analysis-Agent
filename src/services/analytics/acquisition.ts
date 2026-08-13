@@ -10,6 +10,7 @@ import {
   fetchLatestCanReadingsForFleet,
   fetchLatestGpsReading,
   fetchLatestGpsReadingsForFleet,
+  fetchVehicle,
   requireVehicle,
 } from "@/services/database/telemetry.reader";
 import type {
@@ -30,7 +31,7 @@ import { isAuthEnvConfigured } from "@/lib/env";
 import { reportStage } from "@/lib/run-progress";
 
 import type { AnalysisWindow } from "./observations";
-import type { AnalysisPlan, AnalysisSubject, CandidateSource } from "./planner";
+import type { AnalysisPlan, CandidateSource } from "./planner";
 import { QUANTITY_REGISTRY, type HistoricalFeed } from "./quantity-registry";
 
 /**
@@ -253,29 +254,74 @@ export type SubjectResolution =
     };
 
 /**
+ * Whether any source that could answer this plan is a LIVE one.
+ *
+ * The input to the gate below, and computed from the plan rather than from the
+ * request, so it reflects what the planner actually chose. P1 has already run
+ * by this point: a `current` question carries a live candidate wherever the
+ * registry declares a live provider, and a windowed question is historical-only
+ * by construction.
+ */
+function hasLiveCandidate(plan: AnalysisPlan): boolean {
+  return plan.requirements.some((requirement) =>
+    requirement.candidates.some((candidate) => candidate.sourceClass === "live")
+  );
+}
+
+/**
  * Prove the subject exists before reading anything about it.
  *
  * Without this, a mistyped fleet identifier and a vehicle that genuinely has no
  * telemetry are indistinguishable — both return empty — and the agent would
- * report "no data" for what is really a typo. An unregistered vehicle is a real
- * fault and still throws; everything downstream of it reports absence instead.
+ * report "no data" for what is really a typo. Everything downstream of a
+ * resolved subject reports absence instead.
  *
  * Resolved ONCE per run rather than once per quantity, which is the first thing
  * the deduplication rule buys: an eight-quantity request costs one vehicle
  * lookup, not eight. The fleet arm is the same bargain at a larger scale — one
  * population read serves every fleet quantity in the request.
  *
+ * ## The vehicle registry that gates this is the DATABASE'S, and it is smaller
+ *
+ * `requireVehicle` asks Postgres. The portal's registry is a different and
+ * LARGER set — 320 vehicles against 70 — and SAD §19 records that gap as a
+ * genuinely disputed `fleet_size` rather than a fault. So "not in `vehicles`"
+ * has never meant "does not exist"; it means "no recorded telemetry".
+ *
+ * Gating every run on it was a real defect (P1). A question about a vehicle's
+ * CURRENT speed is answered by the live dashboard, which can see all 320 — but
+ * resolution ran before acquisition and threw, so the portal was never asked,
+ * and the model was handed "no vehicle is registered" for a vehicle sitting on
+ * the user's screen.
+ *
+ * The gate is therefore SCOPED TO WHAT THE PLAN NEEDS:
+ *
+ *   - No live candidate — a windowed question, or a quantity with no live
+ *     provider — and an unknown vehicle still THROWS, exactly as before. There
+ *     is genuinely nothing to read, and a typo must not come back as "no data".
+ *   - A live candidate exists, and the vehicle is unknown to Postgres: resolve
+ *     anyway. Every historical candidate then acquires empty and becomes an
+ *     unavailable Observation through the existing INSUFFICIENCY CONTRACT, and
+ *     P5 substitutes the live reading and NAMES the substitution — so the answer
+ *     still says which source spoke and which one could not.
+ *
+ * Nothing about P1, P4, `sourceClass` or `Derivation` changes. This decides
+ * whether a run may PROCEED, not which source answers.
+ *
  * ## An EMPTY fleet is resolved, not refused
  *
  * A deployment with no vehicles registered resolves to a population of zero
  * rather than throwing. That is the deliberate asymmetry with the vehicle arm: an
- * unknown vehicle identifier is a MISTAKE a caller made, while an empty fleet is
- * a true statement about the deployment. It becomes an unavailable observation
- * carrying "no vehicles are registered", which is an answer someone can act on.
+ * unknown vehicle identifier with nothing live to fall back on is a MISTAKE a
+ * caller made, while an empty fleet is a true statement about the deployment. It
+ * becomes an unavailable observation carrying "no vehicles are registered",
+ * which is an answer someone can act on.
  */
 export async function resolveSubject(
-  subject: AnalysisSubject
+  plan: AnalysisPlan
 ): Promise<SubjectResolution> {
+  const subject = plan.subject;
+
   if (subject.kind === "fleet") {
     const { vehicleNos, truncated } = await fetchFleetPopulation();
 
@@ -298,12 +344,21 @@ export async function resolveSubject(
     };
   }
 
-  await requireVehicle({ vehicleNo: subject.vehicleNo });
+  const recorded = await fetchVehicle({ vehicleNo: subject.vehicleNo });
 
-  // Only reached when the vehicle EXISTS — `requireVehicle` throws otherwise —
-  // so this reports a proven fact rather than an attempt. The identifier is the
-  // caller's own input travelling back to the caller's own browser; it is not a
-  // tool parameter being logged.
+  if (recorded === null && !hasLiveCandidate(plan)) {
+    // Nothing live can answer, and the database has never heard of this
+    // vehicle, so there is genuinely no source. Raised through `requireVehicle`
+    // rather than by rebuilding the error here, so the message the model reads
+    // has exactly one author — and that message now names the registry it
+    // speaks for instead of claiming the vehicle does not exist.
+    await requireVehicle({ vehicleNo: subject.vehicleNo });
+  }
+
+  // Reached either because the vehicle is recorded, or because a live source
+  // can still answer for it. The identifier is the caller's own input
+  // travelling back to the caller's own browser; it is not a tool parameter
+  // being logged.
   reportStage({
     id: "subject",
     kind: "vehicle_resolved",

@@ -72,6 +72,20 @@ export function fetchVehicle(
  * An unknown vehicle and a known vehicle with no readings both return empty
  * from the service. Callers that would otherwise report "no data" for what is
  * really a typo in a fleet identifier resolve the vehicle through this first.
+ *
+ * ## The message says WHICH registry, and that is the whole point of it (P1)
+ *
+ * It used to read "No vehicle is registered under the fleet identifier X". That
+ * sentence is scoped to this database, but nothing in it said so, and it lands
+ * verbatim in the model's context — so a vehicle visibly present in the
+ * Intellicar portal was reported to a user as not existing.
+ *
+ * The two registries are genuinely different sets and are MEASURED to differ:
+ * the portal lists 320 vehicles, `vehicles` holds 70, and SAD §19 records that
+ * gap as a genuinely disputed `fleet_size` rather than a fault to be reconciled
+ * away. Absence here is therefore evidence about recorded telemetry and nothing
+ * else, and the message now says which registry answered and where the question
+ * can still be answered.
  */
 export async function requireVehicle(
   request: VehicleRequest
@@ -81,7 +95,11 @@ export async function requireVehicle(
   if (vehicle === null) {
     throw new TelemetryReadError(
       "VEHICLE_NOT_FOUND",
-      `No vehicle is registered under the fleet identifier "${request.vehicleNo}".`
+      `"${request.vehicleNo}" is not present in Tarang's recorded telemetry ` +
+        `database, so no historical data is held for it. This is NOT a ` +
+        `statement that the vehicle does not exist: the Intellicar portal ` +
+        `lists more vehicles than the telemetry database holds, so use the ` +
+        `portal tool to read its current state.`
     );
   }
 

@@ -30,11 +30,28 @@ import {
  *     for choosing. The preference is now rendered as an explicit, deterministic
  *     amendment to that section instead of as a bare fact beside it.
  *
+ * 1.6.0 (P1) adds ABSENCE VS FAILURE to the base prompt — the first change to
+ * SYSTEM_PROMPT itself since 1.2.0, rather than another appended block.
+ *
+ * A vehicle that was visibly present in the Intellicar portal was reported to
+ * the user as not existing. Two tools had failed in the same turn: the portal
+ * read timed out ("the vehicle_summary dashboard could not be read"), and the
+ * Analysis Tool refused a vehicle absent from the telemetry database ("no
+ * vehicle is registered under the fleet identifier"). Neither sentence is a
+ * claim about the vehicle. Both were true. The conclusion drawn from them was
+ * false, and nothing in 1.5.0 forbade it — "tell the user what failed" says how
+ * to report a failure, not what may be INFERRED from one.
+ *
+ * Both messages were also rewritten at their source, and the retry that makes
+ * the portal failure rare lives in the Portal Service. This block is the last
+ * line of defence rather than the fix: a model that reasons from tool failures
+ * to facts about the world will do it again with different wording.
+ *
  * The 1.2.0 guarantee is untouched: a run with neither context nor stored
  * preferences still produces SYSTEM_PROMPT byte for byte.
  */
 
-export const SYSTEM_PROMPT_VERSION = "1.5.0";
+export const SYSTEM_PROMPT_VERSION = "1.6.0";
 
 export const SYSTEM_PROMPT = `You are Tarang, an AI data analyst for an electric-vehicle battery fleet.
 
@@ -62,6 +79,30 @@ repeat it verbatim.
 
 If a result contains an "error" field, the tool failed. Tell the user what
 failed; never fill the gap with a guessed value.
+
+## A tool failure is not a finding — this is not optional either
+
+An "error" describes the TOOL. It is never evidence about the vehicle, the
+fleet, or the world.
+
+1. NEVER conclude that a vehicle does not exist because a tool failed. A portal
+   read that timed out, a dashboard that did not finish loading, and a scrape
+   that could not complete all leave the vehicle's status UNKNOWN. Say the data
+   could not be retrieved, and say that is what happened.
+2. Tarang has TWO separate vehicle registries and they hold different sets. The
+   Intellicar portal lists every vehicle in the account; the telemetry database
+   holds only those whose history has been imported, and there are far fewer of
+   them. So "not present in Tarang's recorded telemetry database" means NO
+   HISTORY IS HELD — nothing more. The vehicle may be live in the portal right
+   now.
+3. There is exactly one statement that a vehicle does not exist: the portal
+   reporting that it listed the fleet and the identifier was not in it. It says
+   so explicitly — "the Intellicar portal does not list a vehicle with the
+   identifier". Nothing else licenses that conclusion.
+4. Two failures are not corroboration. A failed portal read beside a database
+   miss is two tools that could not answer, not two witnesses agreeing.
+5. When the database has no history for a vehicle but the question is about its
+   CURRENT state, the portal tool can still answer it. Ask.
 
 ## When a result was reconciled across sources
 
