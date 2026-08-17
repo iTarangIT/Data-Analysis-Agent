@@ -317,6 +317,114 @@ export function isAppAuthEnabled(): boolean {
 }
 
 /**
+ * IoT database configuration (IoT integration, SAD §12, §16).
+ *
+ * ## A FIFTH schema, lazy — and here laziness is not merely tidy
+ *
+ * `authEnv()` is lazy so a developer with no Intellicar credentials can still
+ * boot, build and ask a telemetry question. This one is lazy for that reason and
+ * a sharper one: in development the IoT database is reached through an SSH
+ * TUNNEL. An eager entry in `envSchema` would mean a developer with no tunnel
+ * could not run `npm run build`, could not start the app, and could not ask a
+ * question that has nothing to do with the fleet — and it would make `next
+ * build` depend on a network path that exists only on a workstation.
+ *
+ * `isIotDbConfigured()` reports the unconfigured state WITHOUT throwing, which
+ * is what lets the Database Tool answer "not configured" as a STATE rather than
+ * as a crash. That is also what makes deploying this code to an environment with
+ * no IoT access completely safe: production simply has no such variable and
+ * behaves exactly as it did before (docs/IOT-DATABASE.md §7).
+ *
+ * ## THIS IS NOT `DATABASE_URL`, AND THE TWO MAY NEVER BE SWAPPED
+ *
+ * `DATABASE_URL` is the APPLICATION database: Prisma manages it, migrations
+ * ship with this repo, and `memory_entries` is written there. This is the IoT
+ * platform's database: another team owns the schema, Tarang is a read-only
+ * guest, and no migration of ours may ever point at it. They have different
+ * owners, different lifecycles and different blast radii — the same argument
+ * that keeps `APP_SESSION_KEY` separate from `CREDENTIAL_ENCRYPTION_KEY`.
+ *
+ * The credential is validated for SHAPE only. It is never logged, never
+ * returned, never interpolated into a message, and `describeIssues` reports only
+ * the variable NAME and the rule it broke — never the received value.
+ */
+const iotDbEnvSchema = z.object({
+  IOT_AGENT_DATABASE_URL: z
+    .string()
+    .min(1, "IOT_AGENT_DATABASE_URL must not be empty")
+    .refine(
+      (url) => url.startsWith("postgresql://") || url.startsWith("postgres://"),
+      "IOT_AGENT_DATABASE_URL must be a PostgreSQL connection string"
+    ),
+  /**
+   * Pool ceiling. The `iot_agent_ro` role carries `rolconnlimit = 5`, so 3
+   * leaves two connections of deliberate headroom: an operator running `psql`
+   * never contends with the app, and a leaked connection shows up as slowness
+   * rather than as a hard outage. Capped at 4 here so a misconfiguration cannot
+   * consume the role's entire budget.
+   */
+  IOT_DB_POOL_MAX: z.coerce.number().int().positive().max(4).default(3),
+  /** Short, so a missing SSH tunnel fails fast instead of hanging a request. */
+  IOT_DB_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(5_000),
+  /**
+   * Client-side query ceiling, matching the server's `statement_timeout`.
+   *
+   * NEVER RAISE THIS. 20s is a property of the role we are a guest under, not a
+   * tuning knob — queries are shaped to fit it (docs/IOT-DATABASE.md §6). The
+   * max below makes that non-negotiable from the environment.
+   */
+  IOT_DB_QUERY_TIMEOUT_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .max(20_000, "IOT_DB_QUERY_TIMEOUT_MS may never exceed the server's 20s statement_timeout")
+    .default(20_000),
+});
+
+export type IotDbEnv = z.infer<typeof iotDbEnvSchema>;
+
+let cachedIotDbEnv: IotDbEnv | undefined;
+
+/**
+ * Validated IoT database configuration. Throws on first use if it is missing or
+ * malformed; the result is cached, so the message is produced once.
+ *
+ * Callers that must not throw ask `isIotDbConfigured()` first.
+ */
+export function iotDbEnv(): IotDbEnv {
+  if (cachedIotDbEnv === undefined) {
+    const parsed = iotDbEnvSchema.safeParse(process.env);
+
+    if (!parsed.success) {
+      throw new Error(
+        `Invalid IoT database configuration:\n${describeIssues(parsed.error)}\n\n` +
+          `Set these variables in .env.local — see docs/IOT-DATABASE.md.`
+      );
+    }
+
+    cachedIotDbEnv = Object.freeze(parsed.data);
+  }
+
+  return cachedIotDbEnv;
+}
+
+/**
+ * Whether the IoT database is configured at all, without throwing.
+ *
+ * The switch the Database Tool branches on, so an unconfigured deployment
+ * reports a state instead of raising. Only the URL is checked: every other
+ * field is defaulted, so their absence is never what makes a deployment
+ * unconfigured.
+ */
+export function isIotDbConfigured(): boolean {
+  const url = process.env.IOT_AGENT_DATABASE_URL;
+  return (
+    url !== undefined &&
+    (url.startsWith("postgresql://") || url.startsWith("postgres://"))
+  );
+}
+
+/**
  * Reverse geocoding configuration (Phase 3).
  *
  * A THIRD schema, lazy for exactly the reason `authEnv()` is: only the geocoding

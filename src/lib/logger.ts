@@ -66,6 +66,19 @@ const SECRET_FIELDS = [
   "encryptionKey",
   "ciphertext",
   "authTag",
+  // Connection strings. A PostgreSQL DSN carries its password inline
+  // (`postgres://user:PASSWORD@host/db`), so a logged connection string is a
+  // logged credential — and `pg` errors can carry DSN fragments in structured
+  // fields. Added with the IoT database, which is reached by DSN rather than
+  // through Prisma. Note rule 1 above still governs: this is the backstop, and
+  // the actual guarantee is that `iot.pool.ts` is the only module that ever
+  // holds the DSN and never passes it outward.
+  "connectionString",
+  "connection_string",
+  "databaseUrl",
+  "DATABASE_URL",
+  "IOT_AGENT_DATABASE_URL",
+  "dsn",
 ] as const;
 
 const redactPaths = SECRET_FIELDS.flatMap((field) => [

@@ -218,10 +218,92 @@ const authIsolation = [
                 "The Database Service is the bottom of the data path. It knows " +
                 "nothing of the portal, the tools or the agent (SAD §4, §12).",
             },
+            {
+              /**
+               * The APPLICATION half reaches PostgreSQL only through Prisma
+               * (SAD §12). A raw driver here would be a second, unmanaged path
+               * to the same database, bypassing the singleton client of rule 4
+               * and the migration history that defines its schema.
+               *
+               * The IoT half is exempt — see the `iot.*.ts` block below, which
+               * replaces this rule for those files. The exemption is the whole
+               * point: one client each, and neither crosses.
+               */
+              group: ["pg", "pg-pool", "postgres", "knex", "drizzle-orm"],
+              message:
+                "The application database is reached ONLY through Prisma " +
+                "(SAD §12, CLAUDE.md rule 4). A raw driver belongs to the IoT " +
+                "half, in iot.pool.ts, which is exempt from this rule.",
+            },
             GEOCODING_ZONE,
             MEMORY_ZONE,
 
             IDENTITY_ZONE,
+          ],
+        },
+      ],
+    },
+  },
+  {
+    /**
+     * The IoT half of the Database Service — KEPT APART FROM PRISMA IN BOTH
+     * DIRECTIONS (IoT integration, SAD §12).
+     *
+     * These files read a database another team owns, under a read-only role,
+     * with no Prisma model and no migration. Importing Prisma here would be the
+     * first step toward modelling their schema in ours, which §19 rejects
+     * outright; and it would put a client that CAN write inside the one module
+     * whose whole guarantee is that it cannot.
+     *
+     * The reverse ban is in the block above: no other file under
+     * `src/services/database/**` may import `pg`. So the application database is
+     * reached only through Prisma and the IoT database only through the pool —
+     * one client each, no crossing.
+     *
+     * THE BASE ZONES ARE REPEATED BELOW ON PURPOSE. Flat config REPLACES a rule
+     * rather than merging it, so a block that listed only the two new patterns
+     * would silently drop AUTH_ZONE, BROWSER_ZONE and the rest for exactly the
+     * files that handle a database credential — the opposite of what this block
+     * is for.
+     */
+    files: ["src/services/database/iot.*.ts"],
+    rules: {
+      "no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            AUTH_ZONE,
+            BROWSER_ZONE,
+            ANALYTICS_ZONE,
+            {
+              group: ["@/services/portal/*", "@/tools/*", "@/agent/*"],
+              message:
+                "The Database Service is the bottom of the data path. It knows " +
+                "nothing of the portal, the tools or the agent (SAD §4, §12).",
+            },
+            GEOCODING_ZONE,
+            MEMORY_ZONE,
+            IDENTITY_ZONE,
+            {
+              group: ["@prisma/client", "@/lib/prisma", "@/generated/prisma/*"],
+              message:
+                "The IoT Database Service must never touch Prisma (SAD §12, " +
+                "§19). It reads a database the IoT platform team owns, under a " +
+                "read-only role, with no model and no migration of ours — and a " +
+                "Prisma client is one that can write. The two databases share a " +
+                "folder and nothing else.",
+            },
+            {
+              group: [
+                "@/services/database/telemetry.service",
+                "@/services/database/telemetry.reader",
+              ],
+              message:
+                "The IoT reads and the application-database reads are separate " +
+                "sources that disagree about which vehicles exist (SAD §19). " +
+                "Reconciling them is the Analysis Engine's job, not a shortcut " +
+                "taken inside one of them.",
+            },
           ],
         },
       ],
@@ -470,7 +552,24 @@ const analyticsIsolation = [
                 "@/services/portal/extractors/*",
                 "@/services/database/telemetry.service",
                 "@/services/database/telemetry.reader",
+                /**
+                 * The IoT halves that perform I/O, banned for exactly the
+                 * reason their Prisma counterparts above are — and by the same
+                 * test, which is whether importing the module can open a
+                 * connection rather than which directory it sits in.
+                 *
+                 * `iot.records` and `iot.queries` are deliberately NOT here.
+                 * The first is shapes and conversions, the second is SQL text;
+                 * neither imports anything that performs I/O, so a pure
+                 * analytics file may take an IoT record type without gaining a
+                 * way to reach the database. That is the same split
+                 * telemetry.records/telemetry.reader hold, and the same one
+                 * normalizers.ts holds on the portal side.
+                 */
+                "@/services/database/iot.pool",
+                "@/services/database/iot.reader",
                 "@/lib/prisma",
+                "pg",
               ],
               message:
                 "These modules are pure functions over data already in memory " +

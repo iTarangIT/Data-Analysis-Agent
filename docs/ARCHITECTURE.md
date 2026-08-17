@@ -85,7 +85,7 @@ The application is organised as a modular service layer inside the Next.js codeb
 | Session Manager    | Browser session lifecycle: storageState persistence, validation, silent refresh, expiry detection and invalidation.                                                  |
 | Credential Manager | Encrypted storage and retrieval of Intellicar credentials; update and revocation; never returns secrets to the agent.                                                |
 | Playwright Manager | Singleton Chromium lifecycle, browser context creation and crash recovery. Pure infrastructure — contains no business or AI logic.                                   |
-| Database Service   | Typed telemetry queries plus a guarded read-only SQL path; the Prisma access layer.                                                                                  |
+| Database Service   | Two access layers in one folder: `telemetry.*` is the Prisma layer over the application database, `iot.*` is the read-only `pg` layer over the IoT database. Both expose typed reads only; neither accepts SQL from a caller. |
 | Analysis Engine    | Deterministic reasoning over grounded sources: plans what to acquire, deduplicates the reads, reconciles live against historical by declared precedence, computes metrics, and assembles findings that carry their own provenance. Calls no LLM. |
 | Memory Manager     | Short-term conversation state and long-term user preferences; enforces the memory storage exclusions in Section 7.                                                   |
 | Report Service     | Markdown assembly, PDF rendering, report persistence and download links.                                                                                             |
@@ -123,11 +123,17 @@ Four LangChain tools are registered at Level 1. Each tool is a thin, Zod-validat
 | **Tool**      | **Backed by**         | **Input (Zod-validated)**                 | **Output**                                                      |
 |---------------|-----------------------|-------------------------------------------|-----------------------------------------------------------------|
 | Portal Tool   | Portal Service        | Dashboard module + battery / fleet target | Live normalised JSON from Intellicar                            |
-| Database Tool | Database Service      | Typed query intent or read-only SQL       | Rows of historical telemetry                                    |
-| Analysis Tool | Analysis Engine (src/services/analytics/) | Subject + quantities (+ window, from 5C)  | Findings, each carrying the source that answered it |
+| Database Tool | IoT Database Service (src/services/database/iot.*) | A named query INTENT plus typed parameters | Rows of live and historical IoT telemetry                   |
+| Analysis Tool | Analysis Engine (src/services/analytics/) | Subject + quantities (+ window, from 5C)  | Findings over the DEVELOPMENT SAMPLE, each carrying the source that answered it |
 | Report Tool   | Report Service        | Results + report template                 | Markdown / PDF report with download link                        |
 
+**A TOOL DECLARES ITS OWN STANDING, in its description AND its envelope `origin`.** The Analysis Tool reads a manually imported development sample — 70 vehicles of about 335, with readings weeks old — and its origin said only `postgres:tarang_dev`. That is accurate and was read by a model as an authoritative database: a fleet-wide "right now" question was answered from seven-week-old sample rows and presented as a current finding. Both surfaces now say what the dataset is, because the description is what the model reads when CHOOSING a tool and the origin is what travels with every answer it produces. Precedence in the system prompt is necessary and was not sufficient.
+
 The Tool Registry (src/agent/tool-registry.ts) is the single catalogue of capabilities. Each entry pairs a Zod input schema, a description the LLM reasons over, and the service call it wraps. Adding a capability at Level 2 means adding a service, a thin tool adapter and one registry entry — the agent core does not change.
+
+**The Database Tool takes an INTENT, never SQL.** The earlier sketch of this row read "typed query intent or read-only SQL", leaving open a free-text SQL parameter guarded by a validator. That option is now closed: the tool's Zod schema exposes `intent: z.enum([...])` and typed parameters, every statement is a module-level constant with `$n` placeholders in `iot.queries.ts`, and no string supplied by the model ever becomes SQL. A validator can only reject the write attempts it anticipates; an enum makes a write attempt *unrepresentable*, which is the stronger guarantee and costs only the flexibility of asking an un-anticipated question without a code change. The read-only database role and its session settings (§12) remain in force underneath as defence in depth, not as the primary control.
+
+**Three registries answer "which vehicles exist", and they genuinely differ.** The Intellicar portal lists the whole account, the IoT database holds what the IoT platform has registered, and the local Prisma telemetry tables hold only what was manually imported for development. §19 already records the first gap as a genuinely DISPUTED `fleet_size` rather than a fault to reconcile away; the IoT database is a third member of that disagreement, not a resolution of it. Source precedence is stated in §12 and enforced in the system prompt, never inferred by the model.
 
 Note: the v2.0 Script Runner tool (LLM-generated Python executed in a container) is intentionally deferred to Level 2 as a sandboxed capability. Its analytical duties are covered by the SQL-first Database Tool and the TypeScript Analysis Tool; the rationale is recorded in Section 19.
 
@@ -479,6 +485,19 @@ Three of the nine are implemented: Fleet Overview (Milestone 4B), Vehicle Summar
 
 ## 12. Database Architecture
 
+Tarang reads **two** PostgreSQL databases. They are separate systems with separate clients, separate schemas, separate credentials and separate lifecycles, and neither knows the other exists.
+
+| | **Application database** | **IoT database** |
+|---|---|---|
+| Variable | `DATABASE_URL` | `IOT_AGENT_DATABASE_URL` |
+| Client | Prisma + `@prisma/adapter-pg`, `src/lib/prisma.ts` | `pg.Pool`, `src/services/database/iot.pool.ts` |
+| Owned by | Tarang — migrations ship with the repo | The IoT platform — Tarang is a guest, never a migrator |
+| Access | read/write (`memory_entries`) | **read-only, enforced by the server** |
+| Holds | `memory_entries` + the manually imported development telemetry | the live fleet: `vehicle_state`, `vehicles`, `alerts`, `distance_rollup`, `telemetry_battery/gps/can` |
+| Reached by | Analysis Engine, Memory Service | Database Tool only |
+
+Everything in this section below this table describes the **application database** unless it says otherwise. The IoT database has no Prisma model, no migration and no generated client, and it must never acquire one: its schema belongs to another team, and a Prisma model would turn their DDL into our build failure. See docs/IOT-DATABASE.md for its schema, its measured quirks and its operational limits.
+
 PostgreSQL, accessed exclusively through Prisma, is the system of record for everything except secrets-in-plaintext. A singleton PrismaClient (globalThis pattern) serves the whole process; schema changes ship as Prisma migrations.
 
 | **Model**              | **Purpose**                                                                               |
@@ -501,7 +520,101 @@ Telemetry is modelled as three dataset-shaped tables rather than one generic rea
 
 Prisma 7 note: the client has no built-in database driver — a WASM query compiler builds query plans and a driver adapter (@prisma/adapter-pg) executes them. The adapter is constructed from the same DATABASE_URL and is confined to src/lib/prisma.ts; nothing else in the system observes it.
 
-Two rules are absolute: raw credentials and browser cookies never enter the database, and the agent's raw-SQL escape hatch is SELECT-only, executed under a read-only database role.
+Two rules are absolute: raw credentials and browser cookies never enter the database, and the agent's SQL path is SELECT-only, executed under a read-only database role. As of the IoT integration the second rule is discharged more strongly than "escape hatch" implied — there is no escape hatch, because there is no free-text SQL parameter anywhere in the system (§6).
+
+### The IoT database — read-only, and enforced where it cannot be argued with
+
+The role `iot_agent_ro` carries no INSERT, UPDATE or DELETE grant on any table and no CREATE on the schema. It additionally carries role-level session settings, so the guarantee does not rest on the grant matrix alone:
+
+```
+default_transaction_read_only = on      -- every session starts read-only
+statement_timeout             = 20s
+lock_timeout                  = 3s
+idle_in_transaction_session_timeout = 30s
+search_path                   = public
+rolconnlimit                  = 5
+```
+
+A write is therefore rejected twice — once because the transaction is read-only, once because the grant is absent — and neither rejection depends on application code being correct. `iot.pool.ts` adds a third layer by issuing `BEGIN TRANSACTION READ ONLY` explicitly, and caps the pool at 3 of the 5 permitted connections so an operator's `psql` never contends with the running app.
+
+**`statement_timeout` is 20 s and is never raised.** It is a property of the role we are a guest under, not a tuning knob. Queries are shaped to fit it.
+
+### A dead pooled connection is a connectivity failure, and is retried once
+
+The application is a long-lived process holding a `globalThis` pool, so a socket that dies between checkouts — a tunnel blip, or the server closing an idle backend — is not an edge case but the normal appearance of a stale pool. `pg` reports it as a bare `Error` reading "Connection terminated unexpectedly" carrying **no `code`**, so it fell through every branch of the error classifier and surfaced as a generic `QUERY_FAILED`: a message telling the model the read failed for unknown reasons, when the remedy was simply a new connection.
+
+`isConnectionFailure()` now recognises both socket codes and those codeless messages, and `iotQuery` retries on an **allow-list of `TUNNEL_UNREACHABLE` only** — the same shape as `isRetryable` in `portal.service.ts`, and for the same reason: everything else returns identically on a second attempt. Two attempts. A socket-level failure **destroys** the client instead of releasing it, which is the whole mechanism — releasing a dead client back would hand attempt two the same dead socket. `ROLLBACK` is skipped on a dead connection, because it raises a second error that masks the first.
+
+Retrying is safe by construction here in a way it would not be elsewhere: every statement in the catalogue is a `SELECT` inside a read-only transaction, so re-running one cannot double an effect.
+
+### Source precedence — which database answers what
+
+1. **Intellicar portal** — preferred for live/current questions *when the portal can answer them*.
+2. **IoT database** — the authoritative source for IoT telemetry, and the source for every current question the portal cannot serve.
+3. **Local Prisma telemetry** — an incomplete development dataset. It is **never** a source of truth for current telemetry, and an answer drawn from it says so.
+
+This ordering is stated in the system prompt rather than inferred. A model left to choose between three registries that disagree will choose the one that answers fastest.
+
+### The 20-second boundary, measured
+
+A fleet-wide `DISTINCT ON (vehicleno)` over `telemetry_battery` does not reliably fail and does not reliably succeed — it STRADDLES the ceiling, and which side it lands on depends on the buffer cache and the window:
+
+| Window | Cache | Result |
+|---|---|---|
+| 1 day | cold | cancelled at 20,295 ms |
+| 1 day | warm | ~4.0 s |
+| 7 days | warm | ~9.3 s |
+| 30 days | warm | cancelled at 20,479 ms |
+
+The cause is structural rather than incidental: pg_partman's daily partitions stop at `p20260704`, so all current rows land in `telemetry_*_default` and partition pruning buys nothing, while the only index is `(vehicleno, time DESC)` — which a time-only predicate cannot use. The query full-scans the default partition, so cost grows with both the window and the table.
+
+An intermittently-succeeding query is worse than a reliably failing one, and this project has already paid for that lesson: the Vehicle Summary resolver's 15 s readiness budget met a portal rendering in 12 s, 14 s and ~67 s, so the same vehicle read correctly in one request and "did not exist" in the next. The rule adopted there applies unchanged — **size from the worst observation, never the median**.
+
+**Therefore no fleet-scope read may SCAN a raw telemetry table by time.** Fleet questions are answered from `vehicle_state` (334 rows, pre-materialised, ~150–360 ms) or `distance_rollup`. Every raw-telemetry intent binds a `vehicleNo` and a bounded window, which together drive `idx_*_vehicle_time` and stay comfortably inside the ceiling.
+
+### The one fleet-scope raw-telemetry read, and why its shape makes it safe
+
+One question cannot be answered any other way: **how many assets communicated over a past window.** `fleet_communication_window` answers it, and it is the only fleet-scope intent that reads a `telemetry_*` table.
+
+It is permitted because of its SHAPE, not as an exception. Instead of filtering by `time` across the fleet — the pattern measured at 20,273 ms and cancelled — it performs a **loose index scan**: it walks the 335-row registry and issues one index-only `EXISTS` seek per vehicle, so `vehicleno` is always the bound leading column.
+
+```
+Nested Loop Semi Join
+  -> Index Only Scan using vehicles_pkey on vehicles v
+  -> Append
+       Subplans Removed: 19
+       -> Index Only Scan using telemetry_gps_default_vehicleno_time_idx
+            Index Cond: (vehicleno = v.vehicleno) AND (time >= $1) AND (time <= $2)
+```
+
+VERIFIED 2026-08-13. Both sides are index-only, there is **no `Seq Scan`**, and `Subplans Removed: 19` shows partition pruning working — pruning contributes nothing to a time-only predicate but everything once `vehicleno` is bound. The query plan is the safety property here, so it is asserted by `EXPLAIN` in the test suite rather than assumed.
+
+Answers are stable; timings are not:
+
+| Window | Communicating | Registered | Warm (3 runs) | Observed worst |
+|---|---|---|---|---|
+| 30 days | 313 | 335 | 91 / 106 / 100 ms | 406 ms |
+| 60 days | 319 | 335 | 210 / 108 / 102 ms | **cancelled at 20 s** |
+| 90 days | 320 | 335 | 408 / 111 / 113 ms | 2,515 ms |
+
+**The 90-day cap is a cost ceiling, not a safety guarantee, and it buys no headroom.** A 60-day window was cancelled by `statement_timeout` during a full suite run while 90 days completed in 2.5 s in the same run, and all three finish in roughly 100 ms warm. Cost is dominated by **cold-cache random I/O across 335 index seeks**, not by window length, so no cap of any size removes the risk — the second time on this integration that a measurement taken once proved to be the wrong end of a wide distribution.
+
+What protects the caller is classification rather than avoidance: a timeout surfaces as `TIMEOUT` with a message telling the model to report it and not to retry in-turn, and the retry allow-list deliberately excludes it, because retrying a query that exhausted the budget spends it twice. The intent degrades to an honest "could not be read", never to a wrong number. The cap is still enforced twice — refused at the schema (naming the number, so the model learns it) and clamped in the reader (so the bound holds even if the schema is bypassed) — because bounding requested work is worth doing even when it cannot bound elapsed time.
+
+`windowDays` is **required** for this intent. "How many assets communicated" is not a question until it says over what period, and a default would hand back an answer over a window nobody chose.
+
+### What "communicated" means, and what it does not
+
+The count is measured from **`telemetry_gps` alone**. An asset reporting battery or CAN data without GPS is not counted, so the figure is a **floor**, not a total for every form of communication. Every result carries `feed` and a `feedNote` saying exactly that, because "313 assets communicated" and "313 assets reported GPS telemetry" are different claims and only the second is what was measured.
+
+Two sources are **deliberately not used**, and the test suite re-measures both reasons rather than trusting this note:
+
+- **`vehicle_state.last_seen` cannot answer it.** Its `last_seen` and `updated_at` are written within 1.3 ms of each other and the table's whole history begins 2026-08-11 — a two-day horizon. It returns 334 for 30, 60 and 90 days alike. That is not a fleet that has been fully active for three months; it is a table that cannot see that far back.
+- **`distance_rollup` cannot answer it.** It holds zero rows with `distance_km = 0` or null across all 25,163, so it records only days a vehicle *moved*. An asset reporting from a depot all month is absent. It agrees with GPS on this fleet (313/320), but that is a property of these vehicles, and "moved" is not "communicated".
+
+### Current state and a historical window are different questions
+
+`fleet_current_state` and `vehicles_offline` describe the fleet **now**; `fleet_communication_window` describes a period that has **passed**. Conflating them is not a hypothetical: asked "how many assets communicated within the last month?", the agent called `fleet_current_state` and returned 200 current rows, which establishes nothing about the preceding thirty days. That was not model error — the catalogue held no intent for the question and the schema rejected `windowDays` on every fleet intent except `distance_fleet`, so it was unaskable. The fix is an intent that exists and a description that names the wrong answers explicitly.
 
 ## 13. Workflow Orchestration — Inngest
 
@@ -706,7 +819,10 @@ All configuration comes from environment variables, validated by a Zod schema in
 
 | **Variable**                                        | **Purpose**                                                          |
 |-----------------------------------------------------|----------------------------------------------------------------------|
-| DATABASE_URL                                        | PostgreSQL connection string (Prisma)                                |
+| DATABASE_URL                                        | Application PostgreSQL connection string (Prisma)                    |
+| IOT_AGENT_DATABASE_URL                              | IoT PostgreSQL connection string, `iot_agent_ro` role. Validated lazily; absent means the Database Tool reports itself unconfigured rather than failing the app |
+| IOT_DB_POOL_MAX, IOT_DB_CONNECT_TIMEOUT_MS, IOT_DB_QUERY_TIMEOUT_MS | IoT pool bounds. Defaults 3 / 5,000 / 20,000. The last matches the server's `statement_timeout` and is never raised |
+| IOT_BASTION_HOST, IOT_BASTION_USER, IOT_BASTION_KEY, IOT_RDS_ENDPOINT | Read by `scripts/tunnel.mjs` only. **The application never reads these and never spawns ssh** |
 | OPENAI_API_KEY / OPENROUTER_API_KEY                 | LLM provider access                                                  |
 | LANGSMITH_TRACING, LANGSMITH_API_KEY, LANGSMITH_PROJECT | Tracing configuration. All optional; tracing is OFF unless LANGSMITH_TRACING is "true", and a key is then required (§19, Milestone 3.5) |
 | CREDENTIAL_ENCRYPTION_KEY                           | AES-256-GCM key for the credential vault (rotatable via key version) |
@@ -718,7 +834,7 @@ All configuration comes from environment variables, validated by a Zod schema in
 | PLAYWRIGHT_HEADLESS, AUTH_TIMEOUT_MS                | Browser mode and the ceiling for one login attempt                   |
 | LOG_LEVEL                                           | Pino log verbosity                                                   |
 
-The Intellicar variables in this table are validated lazily, on first authentication use, rather than at boot — see §19 (Milestone 3) for why.
+The Intellicar variables in this table are validated lazily, on first authentication use, rather than at boot — see §19 (Milestone 3) for why. The IoT variables are lazy for the same reason and a sharper one: the IoT database is reached through an SSH tunnel in development, so an eager schema would mean a developer with no tunnel could not run `npm run build`, could not start the app, and could not ask a question that has nothing to do with the fleet. `isIotDbConfigured()` reports the unconfigured state without throwing, which is what lets the Database Tool answer "not configured" as a *state* rather than as a crash — and what makes deploying this code to an environment that has no IoT access completely safe.
 
 ## 17. Deployment
 
@@ -813,11 +929,19 @@ tarang-agent/
 
 │ │ ├── database/
 
-│ │ │ ├── telemetry.service.ts \# Prisma access layer
+│ │ │ ├── telemetry.service.ts \# Prisma access layer (application DB)
 
 │ │ │ ├── telemetry.records.ts \# JSON-safe shapes + conversions; no I/O
 
-│ │ │ └── telemetry.reader.ts \# Typed reads returning those records
+│ │ │ ├── telemetry.reader.ts \# Typed reads returning those records
+
+│ │ │ ├── iot.pool.ts \# IoT DB: pg.Pool singleton, READ ONLY txns. The only file holding the DSN
+
+│ │ │ ├── iot.queries.ts \# IoT DB: the named SQL catalogue. $n placeholders only, no interpolation
+
+│ │ │ ├── iot.records.ts \# IoT DB: JSON-safe shapes + IotReadError; no I/O
+
+│ │ │ └── iot.reader.ts \# IoT DB: intent dispatch, clamping, signal suppression
 
 │ │ ├── analytics/ \# Analysis Engine (Milestone 5B)
 
@@ -1150,6 +1274,30 @@ tarang-agent/
 - Subject resolution is now LIVE-AWARE, and it gates on the plan rather than the subject (P1). `resolveSubject` proved a vehicle existed in `postgres:vehicles` before anything was read — including before a live portal read that P1 had already ranked first for a "current" question. Since that registry holds 70 of 320 vehicles, a question the dashboard could answer was refused before the dashboard was asked. The gate is now scoped to what the plan needs: with NO live candidate an unknown vehicle still throws, because a windowed question over a vehicle with no history is a caller's mistake and must not come back as "no data"; with a live candidate it resolves, every historical candidate becomes an unavailable Observation through the existing insufficiency contract, and P5 substitutes the live reading and NAMES the substitution. Nothing about P1, P4, `sourceClass` or `Derivation` changes — this decides whether a run may PROCEED, not which source answers.
 
 - `ContributingSource.coverage` was designed and then NOT added (Milestone 5E). It was meant for a fleet quantity answered by both an aggregated database source and a live counterpart, where two entries would otherwise read as rival measurements of one population when they are readings of two. No such quantity exists: fleet aggregates have no live counterpart, so they produce a single candidate and no `contributingSources` at all, and the only two-source fleet quantity is `fleet_size`, whose entries are counts rather than aggregates. Adding the field would have been a declaration nothing populates — the judgement already recorded for TARGET_AMBIGUOUS. Coverage instead travels in `source.method`, which is where the windowed path already puts `samples` and `readings`.
+
+- The IoT database is a SECOND database, not a replacement, and it is not modelled in Prisma (IoT integration). Repointing `DATABASE_URL` was rejected outright: it holds `memory_entries`, which Tarang owns and writes, so repointing it would aim the migration history at a database another team owns. A second Prisma schema was rejected too. The two schemas are structurally incompatible — the IoT tables key on a bare `vehicleno` text column with no surrogate id and no foreign key, name their timestamp `time` rather than `recorded_at`, use `real`/`double precision` where ours use `Decimal`, and are partitioned — so modelling them would mean a second generated client for tables we may not migrate and whose DDL can change without our knowing. A `pg.Pool` behind a named-query catalogue costs one dependency we already had transitively and leaves their schema entirely theirs. The consequence accepted with it: two clients, two pools, and no join across the boundary. Nothing needs one.
+
+- The Database Tool takes an INTENT, and that closes the raw-SQL question rather than answering it (IoT integration). §6 had allowed "typed query intent or read-only SQL", and a validator was the obvious implementation: reject anything not a single SELECT, ban the DDL and DML keywords, force a LIMIT. It was rejected because a validator's guarantee is only as complete as the list of attacks its author thought of, and it must be re-audited every time PostgreSQL grows syntax. An enum of named queries has no such surface: there is no string supplied by the model that becomes SQL, so a write is unrepresentable rather than filtered. The price is real and accepted — an un-anticipated question needs a code change, not a cleverer prompt — and it buys a second property that matters as much: every statement is written once, EXPLAINed once, and timed against the 20 s ceiling once, instead of being composed afresh by a model that cannot measure it.
+
+- No fleet-scope query may touch a raw telemetry table, and the reason is VARIANCE rather than slowness (IoT integration). The first measurement of a fleet-wide `DISTINCT ON (vehicleno)` over `telemetry_battery` was a cancellation at 20,295 ms for a ONE-DAY window, which read as a simple "too slow". Re-measurement corrected that and made the case stronger: warm, the same query takes ~4.0 s at one day and ~9.3 s at seven; cold it times out at one day; and warm it times out again at thirty. It STRADDLES the ceiling, and which side it lands on depends on the buffer cache and the window — neither of which a caller controls. That is the failure mode this project has already paid for once, when a 15 s readiness budget met a portal rendering in 12 s, 14 s and ~67 s and the same vehicle was reported present and then absent; the rule adopted there, SIZE FROM THE WORST OBSERVATION, is what governs here. It is not fixable from our side: pg_partman stopped creating partitions at `p20260704`, so every current row is in `telemetry_*_default` and pruning contributes nothing, the sole index `(vehicleno, time DESC)` cannot serve a predicate naming only `time`, and the timeout belongs to a role we are a guest under. The answer is that `vehicle_state` already holds the result as 334 pre-materialised rows. So fleet questions read `vehicle_state` or `distance_rollup`, per-vehicle raw reads require a `vehicleNo` and a bounded window, and the catalogue contains no fleet intent mapping to a `telemetry_*` table — the boundary is unreachable rather than merely discouraged. A corollary for whoever tests this: asserting that the bad query TIMES OUT is asserting the database's cache state, not our design. The assertion that means something is that no such query exists in the catalogue.
+
+- A third registry joined the fleet-size disagreement, and it does not settle it (IoT integration). The portal lists 320, the local Prisma import holds 70, and the IoT database holds 335. The DISPUTED `fleet_size` decision above is unchanged and now has three members rather than two; the IoT figure is not a tiebreak, because all three count different sets. What is new is an explicit PRECEDENCE — portal first for live questions it can answer, IoT database for IoT telemetry and for current questions the portal cannot serve, local Prisma never a source of truth for current telemetry — stated in the system prompt rather than left to the model. Three sources that disagree with no stated ordering is worse than two, because the model's tiebreak becomes whichever tool answered first.
+
+- A QUANTITY'S MEANING can be fabricated even when its VALUE cannot (SYSTEM_PROMPT 1.8.0). Asked "are any vehicles showing over-temperature or cell-imbalance problems?", the model requested `fleet_pack_temperature` with a maximum aggregation, received a real temperature from a real tool, and reported it as a CELL IMBALANCE in a named vehicle — then supplied a threshold ("~20-30°C is typical for cell balance spreads") that came from nowhere, and recommended an inspection on the strength of it. The source row refutes the finding outright: 8 mV across 16 cells, `cell_over_deviation_occurence_count` 0, every BMS imbalance alarm 0, and the 47.15 °C is `cell_temperature_01` on a pack whose `no_of_temperature_sensors` is 1 — sensors 06-12 read -273.15, the placeholder for a disconnected probe. EVERY NUMBER IN THE ANSWER WAS REAL, which is exactly why the grounding contract did not catch it: rule 1 forbids stating a value no tool produced, and no such value was stated. The gap is that provenance says where a number came from and says nothing about what it MEANS. So 1.8.0 governs identity rather than provenance — a temperature is not imbalance, health or degradation; cell imbalance is a difference in cell VOLTAGE; a threshold you were not given is not one you know; a maximum is not an anomaly; an unanswerable question is not answered with a different metric; and no maintenance is recommended on a number with no threshold. As with 1.6.0, the prompt is the last line of defence and not the fix — the two structural changes below are.
+
+- `cell_balance` and `cell_temp_spread` are WITHDRAWN from advertisement, not deleted (SYSTEM_PROMPT 1.8.0). Both are derived from the development CAN sample, both describe a condition nothing available can corroborate, and both sit one word away from a clinical claim about a battery — advertising a capability whose only source is a sample file is what made the answer above reachable. Withdrawal rather than deletion because the registry entries, providers and derivations are all sound and the data is what is missing: restoring them when a trustworthy feed exists is a one-line change to `WITHDRAWN_QUANTITIES` rather than a re-derivation. `QUANTITIES` is deliberately left whole, so nothing outside the analytics module — including memory's `preferred_metric` validation — changes behaviour. THE ADVERTISED SET MUST BE A SINGLE SOURCE, and this is the part worth remembering: the catalogue text and the Zod enum were repointed at it, but `DERIVABLE_QUANTITIES` was missed and went on advertising both metrics through the description's "Derivations work for: …" line. A withdrawal applied per render site is a withdrawal that leaks.
+
+- A CAPABILITY GAP READS AS A ROUTING FAILURE, and the fix is the intent rather than the prompt (fleet communication window). Asked "how many assets communicated within the last three months?" the agent reached for the portal and reported it unavailable; asked the same about one month it called `fleet_current_state` and returned 200 current-state rows, which establishes nothing about a past window. Neither was a reasoning error. The catalogue had no intent for a historical communication window, `superRefine` rejected `windowDays` on every fleet intent except `distance_fleet`, and the description contained none of the words the question used — "communicated", "reporting", "active", "month". The model played the only moves on the board. The lesson generalises past this case: when a model routes badly, check whether the question was ASKABLE before treating it as a prompt problem, because a prompt cannot conjure a capability and a well-described absent intent is still absent. The fourteenth intent closes it, `windowDays` is required on it, and the description names the three wrong answers — current state, current offline status, and distance — by name.
+
+- The loose index scan is what makes ONE fleet-scope raw-telemetry read safe (fleet communication window). The rule that no fleet question may touch a `telemetry_*` table was never about the table; it was about the ACCESS SHAPE. A predicate naming only `time` cannot use `(vehicleno, time DESC)` and full-scans the default partition — 20,273 ms, cancelled. Binding `vehicleno` per vehicle and seeking the index 335 times answers the same question in 406 ms at 30 days, and partition pruning starts working (`Subplans Removed: 19`) precisely because the leading column is bound. So the boundary is drawn at the shape rather than at the table, and the plan is asserted by `EXPLAIN` in the suite — `Nested Loop Semi Join`, two `Index Only Scan`s, no `Seq Scan` — because a future index change would silently turn a safe query into the forbidden one and only the plan would show it. The window is capped at 90 days rather than the usual 180, but the cap is a COST CEILING and not a safety guarantee — a 60-day window was cancelled at 20 s in one suite run while 90 days completed in 2.5 s in the same run, and all three finish in ~100 ms warm. Cost tracks cold-cache random I/O across 335 index seeks far more than window length, so no cap removes the risk; what does is classification, and a timeout is reported as one rather than guessed around. That is the SECOND time on this integration that a single measurement proved to be the wrong end of a wide distribution — the first was the fleet-scan timeout initially recorded as "always" — and the general lesson is to sample a query more than once before writing its cost into a bound.
+
+- A count states its denominator and names its feed (fleet communication window). "313 assets communicated" is unfalsifiable; "313 of 335 registered assets reported GPS telemetry between 14 July and 13 August" can be checked, and it is what was actually measured. The result therefore carries numerator, denominator, complement, feed and the RESOLVED window — resolved, not requested, because a clamped window must not be reported as the one the caller asked for. The feed matters most: the count comes from `telemetry_gps` alone, so an asset reporting battery or CAN without GPS is invisible to it and the figure is a FLOOR rather than a total. Saying so is the same discipline as `soh_pct` suppression and the alerts vocabulary note — the payload states the limit of its own evidence rather than leaving the model to infer it.
+
+- Verification of grounding behaviour is OFFLINE; prose is read by a human (IoT integration). `npm run iot:check` is the regression gate at 106 checks and never calls OpenRouter — it asserts structure: that a payload cannot carry a figure, that a schema rejects a metric, that a prompt contains a rule. Model PROSE is checked by reading two `/api/chat` responses. An automated matcher was tried twice and failed in both directions: under-matched on the first pass, reporting false PASSES on an answer that really did fabricate a cell-imbalance finding; over-matched on the second, reporting false FAILURES on correct refusals because "I can't identify any vehicle as over-temperature" contains the phrase it was scanning for. Regex cannot distinguish asserting a claim from denying one, so it is not the gate — the structural suppressions are, and they hold regardless of what the model says.
+
+- `soh_pct` is present, populated, and deliberately not reported (IoT integration). 321 of 335 vehicles carry a non-null value and `count(distinct soh_pct)` is 1: every one reads exactly 100. That is a column with a default in it, not a measurement of battery health, and it is the most dangerous field in the schema precisely because it looks like the answer to the question users most want to ask. The reader replaces it with an explicit unavailability and a reason rather than passing it through, because a null the model cannot explain invites a guess while a stated reason does not. `alerts` gets the same treatment for the same reason: 297,156 rows that are 100% `alert_type = 'offline'` would otherwise let "the alerts table" be read as evidence about temperature, current or cell balance. Suppression happens in the reader, not the prompt — a prompt rule is advice, and this needs to be a property of the data that reaches the model.
+
+- The unavailability SENTENCE is stated once per result; the NULL is stated once per row (IoT integration). Attaching both to every record cost 51,600 characters on a 200-vehicle read — 258 characters repeated 200 times, 34% of a 150,181-character payload — and alongside other tool results in the same turn it left the model no room to generate an answer at all: a fleet question returned empty. The repetition bought nothing, because the reason is a property of the COLUMN rather than of any vehicle, so one copy says exactly what two hundred said. What is genuinely per-row is `sohPct: null`, and it stays: a field that is present and null says "this was looked for and is not measured", where an absent field says nothing, and it costs thirteen characters. The general rule this records: a constant explanation belongs beside the rows, never inside them. `fleet_current_state` remains the most expensive intent at ~94k characters even after the fix, and `fleet_summary` answers a counting question for a fraction of it.
 
 - Script Runner deferred to Level 2. Arbitrary LLM-generated code execution is the highest-risk, lowest-value tool at this stage and overlaps the Analysis Tool. It returns at Level 2 as a properly sandboxed capability (isolated process or ephemeral container).
 

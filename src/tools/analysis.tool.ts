@@ -16,9 +16,9 @@ import {
   type SourceClass,
 } from "@/services/analytics/observations";
 import {
+  ADVERTISED_QUANTITIES,
   DERIVABLE_QUANTITIES,
   FLEET_QUANTITY_CATALOGUE_TEXT,
-  QUANTITIES,
   QUANTITY_CATALOGUE_TEXT,
   QUANTITY_REGISTRY,
 } from "@/services/analytics/quantity-registry";
@@ -348,7 +348,7 @@ const analysisInputSchema = z
           "be omitted for a fleet_* metric, which reports the whole fleet."
       ),
     metric: z
-      .enum(QUANTITIES)
+      .enum(ADVERTISED_QUANTITIES)
       .default("battery_health")
       .describe(
         `The metric to report. Per-vehicle metrics: ${QUANTITY_CATALOGUE_TEXT}. ` +
@@ -526,13 +526,29 @@ const DERIVABLE_TEXT = DERIVABLE_QUANTITIES.join(", ");
 export const analysisToolSpec: ToolSpec<typeof analysisInputSchema> = {
   name: "analysis",
   description:
+    "SOURCE WARNING — READ FIRST: this tool reads a SMALL IMPORTED DEVELOPMENT " +
+    "SAMPLE, not the live fleet. It holds 70 vehicles out of roughly 335, and " +
+    "its newest readings are WEEKS OLD. It is NOT a source of truth for any " +
+    "current value. For anything happening NOW — charge, speed, position, " +
+    "voltage, temperature, online status, how many vehicles there are — use the " +
+    "portal tool, or the database tool which reads the live IoT database. Use " +
+    "this tool for historical trends over the imported sample, and when you " +
+    "report one of its figures, SAY that it comes from recorded sample data and " +
+    "give its measurement date. Never present a figure from this tool as the " +
+    "current state of a vehicle or of the fleet. " +
     "Report telemetry for ONE VEHICLE or for the WHOLE FLEET. The metric decides " +
     "which: a fleet_* metric reports the fleet and takes no vehicleNo, and every " +
     "other metric reports one vehicle and requires its fleet identifier (format " +
     "TK-#####-##@@-######). " +
     "Use the per-vehicle metrics whenever the user asks about a specific " +
     "vehicle's battery condition, charge, voltage, current, temperature, charge " +
-    `cycles, cell balance, speed or location: ${QUANTITY_CATALOGUE_TEXT}. ` +
+    `cycles, speed or location: ${QUANTITY_CATALOGUE_TEXT}. ` +
+    "CELL BALANCE AND CELL TEMPERATURE SPREAD ARE NOT AVAILABLE from this tool " +
+    "or from any other. If asked about cell imbalance, thermal stress, " +
+    "over-temperature or battery degradation, report that the data to support " +
+    "such a finding is not held — do NOT answer it with a temperature metric. A " +
+    "pack temperature is not a cell imbalance and is not a measure of battery " +
+    "health. " +
     "By default it reports one latest value with the time it was measured. " +
     "To answer a question about a PERIOD — an average, a high or low, how much " +
     "something changed, or whether it is rising or falling — add a derivation " +
@@ -566,7 +582,17 @@ export const analysisToolSpec: ToolSpec<typeof analysisInputSchema> = {
   timeoutMs: ANALYSIS_TOOL_TIMEOUT_MS,
   // Per-result origin names the table actually read; this is the fallback the
   // registry uses when the handler throws before a source answers.
-  origin: "postgres:tarang_dev",
+  /**
+   * The origin NAMES THE DATASET'S STANDING, not just its host.
+   *
+   * It read `postgres:tarang_dev` — accurate, and read by a model as an
+   * authoritative database. A live run answered a fleet-wide "right now"
+   * question from seven-week-old sample rows carrying this origin and presented
+   * the result as a current finding. The envelope is the one place every answer
+   * is guaranteed to pass through, so the qualifier belongs here as well as in
+   * the description.
+   */
+  origin: "postgres:tarang_dev (DEVELOPMENT SAMPLE — 70 of ~335 vehicles, not the live fleet)",
   handler: async (input, context) => {
     const { vehicleNo, metric, derivation, aggregation } = input;
 

@@ -2,6 +2,7 @@ import { tool, type ToolRunnableConfig } from "@langchain/core/tools";
 import type { z } from "zod";
 
 import { analysisToolSpec } from "@/tools/analysis.tool";
+import { databaseToolSpec } from "@/tools/iot-database.tool";
 import { portalToolSpec } from "@/tools/portal.tool";
 import type { ContributingSource, ToolEnvelope } from "@/types/chat";
 
@@ -358,18 +359,34 @@ export function parseToolEnvelope(output: unknown): ToolEnvelope | null {
 /**
  * Level 1 registers exactly four tools: portal, database, analysis, report.
  * Milestone 1 implemented analysis; Milestone 4B adds portal, once a live
- * capability existed to put behind it. Report follows the same way — a service,
- * a thin adapter, and one line here, with no change to the agent core.
+ * capability existed to put behind it. The IoT integration adds DATABASE — the
+ * third — and it is worth being precise about what that did and did not change:
+ * the tool was already a named element of SAD §6 and of CLAUDE.md rule 6, and
+ * `src/tools/database.tool.ts` had existed unregistered since Milestone 5B. What
+ * was missing was a database worth exposing. Nothing here breaches the cap of
+ * four; it fills one of the four. Report follows the same way — a service, a
+ * thin adapter, and one line here, with no change to the agent core.
+ *
+ * ORDER MATTERS, mildly. The list is the order the model sees the tools in, and
+ * `database` sits between the two so that neither the live-portal reader nor the
+ * historical analyser is what a model reaches for first by position alone.
+ * Selection is driven by the descriptions and by SYSTEM_PROMPT's precedence
+ * block, not by this array — but there is no reason to make position argue
+ * against them.
  *
  * Each spec is wrapped by its own `defineTool` call rather than mapped over an
- * array of them. Two tools have two different Zod schemas, so an array of specs
+ * array of them. The tools have different Zod schemas, so an array of specs
  * infers a UNION, and a union cannot satisfy one `TSchema` — the handler's input
  * type is contravariant, so the array form stopped compiling the moment a second
  * tool existed. Binding each spec at its own type is what keeps every tool
  * end-to-end typed, instead of erasing the schemas with a cast to get the map
  * back.
  */
-const tools = [defineTool(analysisToolSpec), defineTool(portalToolSpec)];
+const tools = [
+  defineTool(portalToolSpec),
+  defineTool(databaseToolSpec),
+  defineTool(analysisToolSpec),
+];
 
 export function getTools() {
   return tools;

@@ -17,7 +17,9 @@
     "db:migrate": "prisma migrate dev && prisma generate",
     "db:deploy": "prisma migrate deploy",
     "db:status": "prisma migrate status",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "tunnel": "node scripts/tunnel.mjs",
+    "iot:check": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/iot-check.ts"
   },
   "dependencies": {
     "@langchain/core": "^1.2.3",
@@ -30,6 +32,7 @@
     "langsmith": "^0.8.7",
     "next": "16.2.12",
     "openai": "^7.1.0",
+    "pg": "^8.22.0",
     "pino": "^10.3.1",
     "playwright": "^1.62.0",
     "react": "19.2.4",
@@ -39,6 +42,7 @@
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
     "@types/node": "^20",
+    "@types/pg": "^8.15.6",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "babel-plugin-react-compiler": "1.0.0",

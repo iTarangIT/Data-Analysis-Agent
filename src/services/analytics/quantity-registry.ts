@@ -169,6 +169,73 @@ export const QUANTITIES = [
 
 export type QuantityKey = VehicleQuantityKey | FleetQuantityKey;
 
+/* -------------------------------------------------------------------------- */
+/*  Withdrawn from advertisement                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Quantities the engine can still COMPUTE but no longer OFFERS to the model.
+ *
+ * ## Why these two, and why withdrawal rather than deletion
+ *
+ * A live-model run was asked "are any vehicles showing over-temperature or
+ * cell-imbalance problems?". It selected `fleet_pack_temperature` with a maximum
+ * aggregation, received a temperature, and reported it as a CELL IMBALANCE in a
+ * named vehicle — then invented a threshold ("~20-30°C is typical for cell
+ * balance spreads") that came from no tool at all.
+ *
+ * The source row contradicts the claim outright: that pack's cell voltages span
+ * 8 mV across 16 cells, its `cell_over_deviation_occurence_count` is 0, and
+ * every BMS imbalance alarm reads 0. The 47.15 °C figure is `cell_temperature_01`
+ * on a pack whose `no_of_temperature_sensors` is 1 — sensors 06 through 12 read
+ * -273.15, the placeholder for a disconnected probe.
+ *
+ * `cell_balance` and `cell_temp_spread` are what made that reachable. Both are
+ * derived from the DEVELOPMENT CAN sample, both describe a condition nobody can
+ * currently corroborate, and both sit one word away from a clinical claim about
+ * a battery. Advertising a capability whose only data source is a sample file
+ * invites exactly the answer above.
+ *
+ * They are WITHDRAWN, not deleted: the registry entries, the providers and the
+ * derivations all remain, so restoring them when a trustworthy feed exists is a
+ * one-line change to the list below rather than a re-derivation. `QUANTITIES`
+ * is deliberately left whole so nothing outside this module — including the
+ * memory route's `preferred_metric` validation — changes behaviour.
+ */
+export const WITHDRAWN_QUANTITIES = [
+  "cell_balance",
+  "cell_temp_spread",
+] as const satisfies readonly VehicleQuantityKey[];
+
+export type WithdrawnQuantityKey = (typeof WITHDRAWN_QUANTITIES)[number];
+
+/**
+ * The per-vehicle quantities actually offered to the model.
+ *
+ * `VEHICLE_QUANTITIES` minus `WITHDRAWN_QUANTITIES`, written out rather than
+ * computed so the literal types survive into the tool's Zod enum — a `.filter()`
+ * would widen every member to `string` and the schema would stop constraining
+ * anything. Catalogue order is otherwise untouched.
+ */
+export const ADVERTISED_VEHICLE_QUANTITIES = [
+  "battery_health",
+  "state_of_charge",
+  "pack_voltage",
+  "pack_current",
+  "pack_temperature",
+  "cycle_count",
+  "speed",
+  "last_known_location",
+] as const satisfies readonly VehicleQuantityKey[];
+
+/** The whole offered vocabulary. This is what the Analysis Tool accepts. */
+export const ADVERTISED_QUANTITIES = [
+  ...ADVERTISED_VEHICLE_QUANTITIES,
+  ...FLEET_QUANTITIES,
+] as const;
+
+export type AdvertisedQuantityKey = (typeof ADVERTISED_QUANTITIES)[number];
+
 /** Which historical telemetry feed a provider reads. */
 export type HistoricalFeed = "battery" | "can" | "gps";
 
@@ -960,8 +1027,15 @@ export const QUANTITY_REGISTRY: {
  * subject, and no fleet quantity has ever been one. Fleet questions over a
  * window are refused wholesale in the planner, so a fleet key appearing in this
  * list would advertise something the engine declines to do.
+ *
+ * Now filtered from `ADVERTISED_VEHICLE_QUANTITIES` rather than
+ * `VEHICLE_QUANTITIES`. This list is rendered into the Analysis Tool's
+ * description as "Derivations work for: …", so a withdrawn quantity reaching it
+ * would go on advertising itself in the one place the model actually reads —
+ * a leak the withdrawal's own test caught, and the reason the advertised set is
+ * a single source rather than a filter applied at each render site.
  */
-export const DERIVABLE_QUANTITIES = VEHICLE_QUANTITIES.filter(
+export const DERIVABLE_QUANTITIES = ADVERTISED_VEHICLE_QUANTITIES.filter(
   (key) => QUANTITY_REGISTRY[key].derivable
 );
 
@@ -1028,7 +1102,7 @@ export function provenanceOf(
  * apart in the registry: a model choosing between them is choosing what the
  * answer is ABOUT, which is a different decision from choosing a metric.
  */
-export const QUANTITY_CATALOGUE_TEXT = VEHICLE_QUANTITIES.map((key) => {
+export const QUANTITY_CATALOGUE_TEXT = ADVERTISED_VEHICLE_QUANTITIES.map((key) => {
   const { label, unit } = QUANTITY_REGISTRY[key];
   return unit === null ? `${key} (${label})` : `${key} (${label}, ${unit})`;
 }).join("; ");
